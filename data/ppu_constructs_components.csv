@@ -16,7 +16,7 @@ PALM_ICE,"['Palm oil', 'Pyrolysis', 'Biooil', 'Cracking', 'Refining', 'ICE']",Pr
 BIO_WOOD,"['Wood', 'Pyrolysis', 'Biooil', 'Steam reforming', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
 WD_OFF,"['Wind (offshore)', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production
 IMP_BIOG,"['Biogas (50% CH4)', 'Pipeline', 'Biogas purification', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
-HY_LE,"['Hydro pump', 'Lake']",Storage
+NH3_P,"['Ammonia cracking', 'H2 Storage UG 200bar', 'Hydrogen Transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
 H2_G,"['Electrolyzer', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage
 H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage
 H2_L,"['Electrolyzer', 'Liquifaction', 'Liquid storage']",Storage
