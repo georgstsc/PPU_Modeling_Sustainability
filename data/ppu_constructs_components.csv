@@ -1,0 +1,27 @@
+PPU,Components,Category
+HYD_S,"['Lake', 'Hydro Turb', 'Electricity', 'Grid']",Production
+HYD_R,"['River', 'Hydro Turb', 'Electricity', 'Grid']",Production
+THERM,"['Fuel Tank', 'Fuel Transport', 'Pipeline', 'Ship transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+PV,"['PV', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production
+WD_ON,"['Wind (onshore)', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production
+WD_OFF,"['Wind (offshore)', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production
+THERM_G,"['Biogas', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+THERM_M,"['Biomass', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+H2P_G,"['H2 Storage UG 200bar', 'Hydrogen Transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+H2P_L,"['Liquid storage', 'Hydrogen Transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+SOL_SALT,"['Solar concentrator salt', 'Steam generator', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+SOL_STEAM,"['Solar concentrator steam', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+BIO_OIL_ICE,"['Biooil', 'Refining', 'Fuel Tank', 'ICE', 'Electricity', 'Grid']",Production
+PALM_ICE,"['Palm oil', 'Pyrolysis', 'Biooil', 'Cracking', 'Refining', 'ICE']",Production
+BIO_WOOD,"['Wood', 'Pyrolysis', 'Biooil', 'Steam reforming', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+WD_OFF,"['Wind (offshore)', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production
+IMP_BIOG,"['Biogas (50% CH4)', 'Pipeline', 'Biogas purification', 'Combined cycle power plant', 'Electricity', 'Grid']",Production
+HY_LE,"['Hydro pump', 'Lake']",Storage
+H2_G,"['Electrolyzer', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage
+H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage
+H2_L,"['Electrolyzer', 'Liquifaction', 'Liquid storage']",Storage
+SYN_FT,"['Electrolyzer', 'CO2 Capture 400 ppm', 'H2, CO2 compression', 'FT-Synthesis', 'Refining', 'Fuel Tank']",Storage
+SYN_METH,"['Electrolyzer', 'CO2 Capture 400 ppm', 'Sabatier reaction', 'Methane compression', 'CH4 storage 200bar']",Storage
+NH3_FULL,"['Electrolyzer', 'N2 separation', 'N2,H2 compression', 'NH3 synthesis', 'Ammonia liquifaction', 'Ammonia storage']",Storage
+SYN_CRACK,"['Electrolyzer', 'Palm oil', 'H2, CO2 compression', 'Cracking', 'Refining', 'Fuel Tank']",Storage
+CH4_BIO,"['Electrolyzer', 'Biogas purification', 'Sabatier reaction', 'Methane compression', 'Biogas (50% CH4)']",Storage

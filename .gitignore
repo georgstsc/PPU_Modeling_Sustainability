@@ -1,0 +1,22 @@
+# Large data files - use Git LFS or upload separately
+data/wind_incidence_hourly_2024.csv
+data/solar_incidence_hourly_2024.csv
+data/monthly_hourly_load_values_2024.csv
+
+# All GRIB files (very large)
+data/wind_incidence/*.grib
+data/wind_incidence/*.idx
+data/solar_incidence/*.grib
+data/solar_incidence/*.idx
+
+# Large incidence directories
+data/wind_incidence/
+data/solar_incidence/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+data/.DS_Store

@@ -1,0 +1,66 @@
+key,category,default_value,unit,lower_bound,upper_bound,notes
+demand_base_twh_per_year,demand,62.0,TWh/year,,,Swiss electricity demand in 2019
+demand_target_twh_per_year,demand,113.0,TWh/year,,,Electrified demand incl. nuclear replacement (2050)
+demand_additional_twh_per_year,demand,74.0,TWh/year,,,Increment vs. 2019 needed from renewables
+demand_electrification_addition_twh_per_year,demand,53.0,TWh/year,,,Added demand from electrification of uses
+demand_nuclear_replacement_twh_per_year,demand,21.0,TWh/year,,,Added demand to replace nuclear output
+buildout_cadence_twh_per_year,deployment,2.4,TWh/year,,,Average annual new production to 2050
+day_night_storage_share_of_annual,storage_rules,0.0025,fraction of annual demand,0.0025,0.0025,Rule of thumb: 0.25% of annual electricity demand
+seasonal_storage_share_of_annual,storage_rules,0.25,fraction of annual demand,0.25,0.25,Rule of thumb: 25% of annual electricity demand
+seasonal_storage_absolute_twh,storage_rules,20.0,TWh,,,Seasonal storage energy target for winter shift
+seasonal_intake_power_required_gw,storage_rules,20.0,GW,,,Summer absorption power to fill seasonal storage
+pv_peak_power_expected_gw,supply_profile,90.0,GW,,,Expected PV noon peak for +50 TWh/y PV
+battery_power_cap_target_gw,supply_profile,32.0,GW,,,Target capped grid peak after local batteries
+ppu_output_electricity_twh_per_year,ppu,8.76,TWh/year,,,Energy delivered per PPU (on demand)
+ppu_required_count_core,planning,6.0,count,,,PPUs to supply missing band electricity (53 TWh/y)
+ppu_required_count_redundancy,planning,2.0,count,,,Additional PPUs for redundancy (≈33%)
+dam_height_increase_pct,planning,26.0,%,,,Dam raise to double lake storage capacity
+storage_shift_from_summer_to_winter_twh,planning,9.0,TWh/year,,,Shift enabled by higher dams
+biomass_for_heating_current_twh_per_year,planning,15.0,TWh/year,,,Current biomass allocated to heating
+biomass_for_heating_additional_twh_per_year,planning,5.0,TWh/year,,,Additional biomass to heating
+rooftop_pv_potential_twh_per_year,planning,24.0,TWh/year,,,All feasible roof areas covered with PV
+grid_cost_adder_chf_per_kwh,costing,0.09,CHF/kWh,,,Adder to production cost for grid
+finance_interest_rate_per_year,costing,0.02,1/year,,,Interest rate Z in annuity formula
+pv_future_capex_chf_per_kwp,future_costs,200.0,CHF/kWp,,,Assumed future PV CAPEX
+battery_future_capex_chf_per_kwh,future_costs,55.0,CHF/kWh,,,Assumed future battery CAPEX
+electrolyser_future_capex_chf_per_kw,future_costs,500.0,CHF/kW,,,Assumed future electrolyser CAPEX
+electrolyser_future_efficiency,future_costs,0.9,fraction,,,Assumed future electrolyser efficiency
+power_electronics_future_capex_chf_per_kw,future_costs,200.0,CHF/kW,,,Converters/inverters assumed future CAPEX
+dac_future_cost_chf_per_ton_co2,future_costs,200.0,CHF/tCO2,,,Assumed future DAC cost
+h2_liquefaction_future_cost_chf_per_kg,future_costs,2000.0,CHF/kg,,,Assumed future LH2 liquefaction cost
+h2_future_cost_chf_per_kg_default,future_costs,6.0,CHF/kg,5.0,7.0,Implied future H2 cost (range 5–7)
+syn_oil_future_cost_chf_per_kg_default,future_costs,2.5,CHF/kg,2.3,2.7,Implied future synthetic oil cost (range)
+pv_hyd_pv_active_area_km2_per_ppu,ppu_params,51.0,km^2,,,Active PV area per PV-HYD PPU
+pv_h2_pv_active_area_km2_per_ppu,ppu_params,83.0,km^2,,,Active PV area per PV-H2 PPU
+bio_sf_pv_active_area_km2_per_ppu,ppu_params,89.0,km^2,,,Active PV area per Bio-SF PPU
+imp_sf_pv_active_area_km2_per_ppu,ppu_params,62.0,km^2,,,Active PV area per Imp-SF PPU (abroad)
+imp_psf_pv_active_area_km2_per_ppu,ppu_params,5.6,km^2,,,Active PV area per Imp-PSF PPU (abroad)
+imp_h2_pv_active_area_km2_per_ppu,ppu_params,113.0,km^2,,,Active PV area per Imp-H2 PPU (abroad)
+bio_sf_biomass_mass_mt_per_year,ppu_params,1.5,Mt/year,,,Dry biomass input per Bio-SF PPU
+bio_sf_plantation_area_km2,ppu_params,7500.0,km^2,,,Local plantation area for Bio-SF PPU
+imp_psf_plantation_area_km2,ppu_params,2350.0,km^2,,,Plantation area for Imp-PSF PPU
+imp_sf_dac_co2_mt_per_year,ppu_params,2.3,Mt/year,,,CO2 captured per Imp-SF PPU via DAC
+imp_h2_h2_cost_today_chf_per_kg,ppu_params,19.4,CHF/kg,,,Reference current cost of imported H2
+imp_h2_annual_h2_mass_for_1gw_tonnes,ppu_params,448000.0,t/year,,,H2 consumption for 1 GW CCPP continuous
+h2_reserve_storage_mass_tonnes,ppu_params,112000.0,t,,,Reserve LH2 storage mass (≈3 months)
+h2_liquid_vs_200bar_volume_ratio,ppu_params,4.0,dimensionless,,,Liquid storage is 4× more compact than 200 bar
+pv_field_to_active_area_factor,ppu_params,2.25,ratio,2.0,2.5,Field area ≈2–2.5× active PV area
+hydrolake_storage_density_kwh_per_m3_mid,storage_phys,2.5,kWh/m^3,1.0,4.0,Electricity storage density for 500–1800 m head
+excavation_energy_kwh_per_m3,storage_phys,30.0,kWh/m^3,,,Energy to excavate valley (order of magnitude)
+lcoe_nuc_chf_per_kwh_ex_grid,lcoe,0.08,CHF/kWh,,,Electricity LCOE at PPU (ex-grid)
+lcoe_pv_hyd_chf_per_kwh_ex_grid,lcoe,0.24,CHF/kWh,,,Electricity LCOE at PPU (ex-grid)
+lcoe_pv_h2_chf_per_kwh_ex_grid,lcoe,0.44,CHF/kWh,,,Electricity LCOE at PPU (ex-grid)
+lcoe_bio_sf_to_power_chf_per_kwh_ex_grid,lcoe,0.47,CHF/kWh,,,Electricity LCOE if synthetic fuel used for power
+lcoe_imp_h2_chf_per_kwh_ex_grid,lcoe,1.02,CHF/kWh,,,Electricity LCOE at PPU (ex-grid)
+lcoe_imp_sf_to_power_chf_per_kwh_ex_grid,lcoe,2.2,CHF/kWh,,,Electricity LCOE if synfuel (PV+DAC) used for power
+lcoe_imp_psf_to_power_chf_per_kwh_ex_grid,lcoe,0.35,CHF/kWh,,,Electricity LCOE if palm synfuel used for power
+capex_nuc_bchf,capex,10.0,BCHF,8,12,Initial CAPEX range
+capex_pv_hyd_bchf,capex,32.0,BCHF,,,Initial CAPEX
+capex_pv_h2_bchf,capex,84.0,BCHF,,,Initial CAPEX
+capex_bio_sf_bchf,capex,60.0,BCHF,,,Initial CAPEX
+capex_imp_h2_bchf_local,capex,7.0,BCHF,,,Local CAPEX (excl. abroad infra)
+capex_imp_h2_bchf_abroad,capex,106.0,BCHF,,,Abroad CAPEX
+capex_imp_sf_bchf_local,capex,5.0,BCHF,,,Local CAPEX
+capex_imp_sf_bchf_abroad,capex,57.0,BCHF,,,Abroad CAPEX
+capex_imp_psf_bchf_local,capex,4.0,BCHF,,,Local CAPEX
+capex_imp_psf_bchf_abroad,capex,10.0,BCHF,,,Abroad CAPEX

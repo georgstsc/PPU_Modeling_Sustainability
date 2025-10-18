@@ -1,0 +1,84 @@
+section,item,component,efficiency,w,cost,investment_chf_per_kw,capex,opex,lifetime,cycle_no,power,capacity,pavg_per_pp,reference
+Electrical components,PV,production,1.0,0.0,0.023509062652146532,535.7990675208356,400.0,8.0,30.0,,1.0,,0.12557077625570776,https://www.solarchoice.net.au/blog/solar-power-system-prices
+Electrical components,Wind (offshore),production,1.0,0.0,0.04770542622835819,4018.493006406267,3000.0,75.0,30.0,,1.0,,0.5,"I. Tsiropoulos, D. Tarvydas and A. Zucker, Cost development of low carbon energy technologies, Jrc, european commission technical report, 2018."
+Electrical components,Wind (onshore),production,1.0,0.0,0.01908217049134328,1607.397202562507,1200.0,30.0,30.0,,1.0,,0.5,"I. Tsiropoulos, D. Tarvydas and A. Zucker, Cost development of low carbon energy technologies, Jrc, european commission technical report, 2018."
+Electrical components,Battery,storage,0.89,0.0,0.0652185583786886,116.6871167573772,110.0,2.75,5.0,2000.0,1.0,1.0,1.0,https://wedocs.unep.org/bitstream/handle/20.500.11822/27402/ALAB.pdf?sequence=1&isAllowed=y
+Electrical components,Grid underground (100 km),transport,0.9994,0.0,0.11243058958419634,5848.9196475756,4000.0,100.0,40.0,,1.0,,0.25,https://www.swissgrid.ch/dam/swissgrid/projects/project-overview/220517-flyer-de.pdf
+Electrical components,Grid surface (100 km),transport,0.9994,0.0,0.015269621143594012,1341.9042910243377,666.6666666666666,16.666666666666668,80.0,,1.0,,0.25,https://www.swissgrid.ch/dam/swissgrid/projects/project-overview/220517-flyer-de.pdf
+Electrical components,Hydro pump,transport,0.88,0.0,0.01967048359024895,2446.268725011616,2000.0,50.0,20.0,,1.0,,1.0,https://en.wikipedia.org/wiki/Cost_of_electricity_by_source
+Electrical components,Lake,storage,1.0,0.0,1.2973335548789172e-07,0.03182320970369657,0.02,0.0005,50.0,,1.0,,1.0,https://en.wikipedia.org/wiki/Cost_of_electricity_by_source
+Electrical components,Hydro Turb,production,0.88,0.0,0.0393409671804979,4892.537450023232,4000.0,100.0,20.0,,1.0,,1.0,https://en.wikipedia.org/wiki/Cost_of_electricity_by_source
+Electrical components,Charger,transform,0.8,0.0,0.1173275834305043,2084.87693222474,1909.090909090909,47.72727272727273,8.0,,1.0,,0.3,https://cyberswitching.com/how-much-does-a-charging-station-for-electric-cars-cost/#costofEvcs
+Electrical components,Pb-Battery,storage,0.82,0.0,0.1292350771879356,183.47015437587118,150.0,3.75,20.0,2000.0,,1.0,1.0,https://wedocs.unep.org/bitstream/handle/20.500.11822/27402/ALAB.pdf?sequence=1&isAllowed=y
+Electrical components,Li-Battery,storage,0.925,0.0,0.38762351792103056,655.2470358420611,600.0,15.0,8.0,2000.0,,1.0,1.0,https://wedocs.unep.org/bitstream/handle/20.500.11822/27402/ALAB.pdf?sequence=1&isAllowed=y
+Electrical components,NaS,transform,0.89,0.0,0.11116799723640104,238.67819336736247,225.0,5.625,5.0,2000.0,,1.2,1.0,https://www.ngk-insulators.com/en/resource/pdf/info/financial_times.pdf
+Electrical components,Converter AC/DC,transform,0.97,0.0,0.008121862811791856,318.2375911564833,300.0,7.5,5.0,,1.0,,1.0,https://ch.wiautomation.com/en/allen-bradley/drives-motors-circuits-protection/20AC3P5A0AYNANC0
+Electrical components,Inverter DC/AC,transform,0.97,0.0,0.008121862811791856,318.2375911564833,300.0,7.5,5.0,,1.0,,1.0,https://ch.wiautomation.com/en/allen-bradley/drives-motors-circuits-protection/20AC3P5A0AYNANC0
+Electrical components,E-Motor,transform,0.95,0.0,0.005888471523245806,421.235510841738,378.3783783783784,9.45945945945946,10.0,,1.0,,1.0,https://www.dslengineering.co.uk/downloads/electric-motors.pdf
+HYDROGEN,Electrolyzer,transform,0.6,0.02,0.08093374241962893,1669.897917979747,1500.0,187.5,10.0,,1.0,,0.5,
+HYDROGEN,H2 Storage UG 200bar,storage,1.0,0.15,0.0714545495589418,0.9092345629627593,400.0,50.0,50.0,50.0,1.0,700.0,1.0,
+HYDROGEN,Compressor 30-200bar,0.97,0.15,0.010625383454639863,611.567181252904,500.0,62.5,20.0,,1.0,,1.0,
+HYDROGEN,Metal hydride,storage,1.0,0.15,0.01429322784612481,166.30635427463483,6000.0,120.0,8.0,2000.0,,39.4,1.0,
+HYDROGEN,Hydrogen Transport,transport,0.95,0.04,0.009548678014542598,3182.320970369657,2000.0,20.0,50.0,,1.0,,1.0,
+HYDROGEN,Filling Station,storage,1.0,0.2,4.377329293984671e-07,155.22009676469642,1500000.0,,20.0,30000.0,,11820.0,1.0,
+HYDROGEN,Hydrogen Tank,storage,1.0,0.0,0.028462687250116157,2.446268725011616,2.0,0.02,20.0,100.0,,1.0,0.5,
+HYDROGEN,Liquifaction,transform,1.0,0.3,0.0011615402456105343,3795.222540863061,3409.090909090909,68.18181818181819,10.0,,44.0,,1.0,
+HYDROGEN,Ship transport,transport,0.86,0.0,0.0003238907571440161,107.6358239005111,88.0,1.76,20.0,1000.0,,441.0,1.0,
+HYDROGEN,Liquid storage,storage,1.0,,8.122913028001188e-05,12.23134362505808,10.0,0.1,20.0,,1.0,1.0,1.0,
+HYDROGEN,Liquid to gas,transform,1.0,0.0,0.00016245826056002376,24.46268725011616,20.0,0.2,20.0,,1.0,,1.0,
+HYDROGEN,Fuel Cell,storage,0.5,0.0,0.03683254060851974,2226.5305573063292,2000.0,100.0,10.0,,1.0,,1.0,
+HYDROGEN,Combined cycle power plant,transform,0.5,,0.02310968913639149,2561.0219208697367,2000.0,100.0,25.0,,1.0,,1.0,
+HYDROGEN,Pipeline,transport,0.99,0.001,0.009340549052933399,1591.1604851848285,1000.0,50.0,50.0,,1.0,,1.0,
+CO2 Capture,CO2 Capture 400 ppm,transform,1.0,0.054,0.3598019937547733,3404.145478426254,3000.0,300.0,12.0,,0.18518518518518517,,1.0,
+CO2 Capture,CO2 Capture >10%,transform,1.0,0.0143,0.06635815723871581,907.7721275803344,800.0,32.0,12.0,,0.18518518518518517,,1.0,
+CO2 Capture,CO2 Storage,storage,1.0,0.05,0.001010649247891699,40.18493006406268,30.0,0.3,30.0,,0.18518518518518517,,1.0,
+SYN. FUEL,FT-Synthesis,transform,0.7,0.05,0.027962785262023615,3466.6199668598065,2588.0,129.4,30.0,,1.0,,1.0,
+SYN. FUEL,Selective Synthesis,transform,0.346,0.0,0.024087610402483448,3180.1493425151007,2600.0,52.0,20.0,,1.0,,1.0,
+SYN. FUEL,Fermentation,transform,0.45,0.1,0.2963757870837403,17043.778422803476,14600.0,1460.0,15.0,,1.0,,1.0,
+SYN. FUEL,Pyrolysis,transform,0.84,0.0003461538461538462,0.015,587.1044940027878,480.0,29.0,20.0,,1.0,,1.0,
+SYN. FUEL,Cracking,transform,0.95,,0.015,1741.3469694427158,1300.0,130.0,30.0,,1.0,,1.0,
+SYN. FUEL,Oligomerisation,transform,0.95,,0.015,1741.3469694427158,1300.0,130.0,30.0,,1.0,,1.0,
+SYN. FUEL,Steam reforming,transform,0.95,,0.015,1741.3469694427158,1300.0,130.0,30.0,,1.0,,1.0,
+SYN. FUEL,Dry reforming,transform,0.95,0.0686,0.015,1741.3469694427158,1300.0,130.0,30.0,,1.0,,1.0,
+SYN. FUEL,Refining,transform,0.95,,0.015,1741.3469694427158,1300.0,130.0,30.0,,1.0,,1.0,
+SYN. FUEL,Fuel Tank,storage,0.99,,5.33675385939678e-07,0.18347015437587116,0.15,0.0015,20.0,20.0,,20000.0,1.0,
+SYN. FUEL,Fuel Taransport,transport,0.99,,1.067350771879356e-05,3.669403087517424,3.0,0.03,20.0,20.0,,20000.0,0.1,
+SYN. FUEL,Fueling Station,storage,1.0,,0.0006176310359611142,81.54229083372053,66.66666666666667,1.3333333333333335,20.0,,1.0,,1.0,
+SYN. FUEL,Fuel Tank mob.,storage,1.0,,1.5583310403397573e-08,0.0010920783930701019,0.001,,8.0,,1.0,,1.0,
+SYN. FUEL,ICE,transform,0.3,,0.015052376623331786,98.28705537630917,90.0,0.9,8.0,,1.0,,0.1,
+SYN. FUEL,Transmission,transport,0.95,,0.11676470539045505,98.28705537630917,90.0,90.0,8.0,,1.0,,0.1,
+SYN. FUEL,Steam generator,transform,1.0,,0.0004873747816800712,73.38806175034847,60.0,0.6,20.0,,1.0,,1.0,
+SYN. FUEL,Gas Turbine,transform,0.3,,0.0019513903313394618,141.88358605067373,116.0,10.0,20.0,,1.0,,1.0,
+SYN. FUEL,Methanol reactor,transform,0.8528,,0.027962785262023615,3466.6199668598065,2588.0,129.4,30.0,,1.0,,1.0,
+SYN. FUEL,Water condensation,transform,0.95,,0.0025378246147326573,244.62687250116159,200.0,10.0,20.0,,1.0,,1.0,
+SYN. FUEL,Methanol condensation,transform,0.9,,0.0025378246147326573,244.62687250116159,200.0,10.0,20.0,,1.0,,1.0,
+SYN. FUEL,"H2, CO2 compression",transform,0.95,,0.010625383454639863,611.567181252904,500.0,62.5,20.0,,1.0,,1.0,
+SYN. FUEL,Methanol Tank,storage,0.99,,4.774339007271299e-06,1.5911604851848287,1.0,0.01,50.0,,1.0,,1.0,
+Methane,Sabatier reaction,transform,0.78,,0.015,733.8806175034847,600.0,60.0,20.0,,1.0,,1.0,
+Methane,Methane compression,transform,0.97,0.1,0.006375230072783918,366.94030875174235,300.0,37.5,20.0,,1.0,,1.0,
+Methane,Methane liquifaction,transform,1.0,,,,,,,,,,,
+Methane,Methane transport,transport,0.98,,,,,,,,,,,
+Methane,CH4 storage 200bar,storage,1.0,0.15,0.0714545495589418,0.9092345629627593,400.0,50.0,50.0,50.0,1.0,700.0,1.0,
+Methane,Biogas purification,transform,0.98,0.1,0.008122913028001187,1223.134362505808,1000.0,10.0,20.0,,1.0,,1.0,
+Ammonia,N2 separation,transform,1.0,0.01,0.0016245826056002373,244.62687250116159,200.0,2.0,20.0,,1.0,,1.0,
+Ammonia,"N2,H2 compression",transform,0.99,,0.004061456514000594,611.567181252904,500.0,5.0,20.0,,1.0,,1.0,
+Ammonia,NH3 synthesis,transform,0.783,0.22,0.012184369542001777,1834.7015437587118,1500.0,15.0,20.0,,1.0,1.0,1.0,
+Ammonia,Ammonia liquifaction,transform,1.0,0.2,0.000387180081870178,1265.0741802876869,1136.3636363636363,22.727272727272727,10.0,,44.0,,1.0,
+Ammonia,Ammonia shipping,transport,0.99,0.0,0.00018402883928637278,61.156718125290396,50.0,1.0,20.0,1000.0,,441.0,1.0,
+Ammonia,Ammonia storage,storage,1.0,0.0,8.122913028001188e-05,12.23134362505808,10.0,0.1,20.0,,1.0,1.0,1.0,
+Ammonia,Ammonia cracking,transform,0.75,0.25,0.008122913028001187,1223.134362505808,1000.0,10.0,20.0,,1.0,,1.0,
+Solar concentrator,Solar concentrator salt,transform,0.05,0.01,0.5529285379348777,10659.615969238115,8715.0,435.75,20.0,,1.0,,0.2,
+Solar concentrator,Solar concentrator steam,transform,0.17,0.01,0.2018839481019829,3892.0135414934803,3182.0,159.10000000000002,20.0,,1.0,,0.2,
+Electricity,Imported electricity,transport,1.0,,0.25,0.0,,,,,,,1.0,
+Electricity,Electricity,transport,1.0,,0.2,0.0,,,,,,,1.0,
+Electricity,Grid 10km,transport,0.95,,0.0008919509248276594,134.19042910243377,66.66666666666667,0.6666666666666667,80.0,,1.0,,0.3,
+Electricity,Grid 100 km,transport,0.95,,0.004459754624138296,670.9521455121688,333.3333333333333,3.333333333333333,80.0,,1.0,,0.3,
+Electricity,Grid 1000 km,transport,0.8,,0.08919509248276594,13419.042910243377,6666.666666666667,66.66666666666667,80.0,,1.0,,0.3,
+Biomass,Biomass,storage,1.0,,0.095,0.0,,,,,,,,
+Biomass,Biogas  (50% CH4),storage,1.0,,0.1,0.0,,,,,,,,
+Biomass,Sugar,storage,1.0,,0.14,0.0,,,,,,,,
+Biomass,Biooil,storage,1.0,,0.067,0.0,,,,,,,,
+Biomass,Wood,storage,1.0,,0.095,0.0,,,,,,,,
+Biomass,Palm oil,storage,1.0,,0.07,0.0,,,,,,,,
+Biomass,Karoch oil,storage,1.0,,0.035,0.0,,,,,,,,
+Desalination,Reverse Osmosis,transform,1.0,0.001255994519296643,0.039369329114769966,6886.246460907698,5630.0,0.5630000000000001,20.0,,1.0,,1.0,
