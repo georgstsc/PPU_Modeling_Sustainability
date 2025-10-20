@@ -339,3 +339,52 @@ def update_incidence(raw_energy_incidence, t, lat=46.8, lon=8.2):
             item["current_value"] = get_incidence_data('wind', lat=lat, lon=lon, t=t)
         # Wood remains unchanged as it's not incidence-based
     return raw_energy_incidence
+
+# -------------------------
+# FP-Style Composition Helpers (New Additions)
+# -------------------------
+
+from functools import reduce
+import pandas as pd
+
+def pipeline(*funcs):
+    """FP helper: Compose functions for chaining (e.g., load -> process -> output)."""
+    def composed(*args, **kwargs):
+        result = args[0] if args else kwargs
+        for func in funcs:
+            result = func(result)
+        return result
+    return composed
+
+def compose_ppu_setup(ppu_filepath: str, cost_filepath: str, quantity: int = 10, capacity_gw: float = 1.0) -> pd.DataFrame:
+    """Composed function: Load PPU data -> categorize -> create quantities -> calc metrics -> enrich.
+    Returns enriched PPU quantities DataFrame.
+    """
+    load_ppu = lambda fp: load_ppu_data(fp)
+    categorize = lambda df: categorize_ppus(df)
+    create_quant = lambda cats: create_ppu_quantities(cats[2], cats[0], cats[1], quantity, capacity_gw)
+    load_cost = lambda fp: load_cost_data(fp)
+    calc_metrics = lambda ppu: calculate_ppu_metrics(ppu, load_cost(cost_filepath))
+    enrich = lambda quant: enrich_ppu_quantities(quant, calc_metrics(ppu_data_df))  # Note: ppu_data_df from load_ppu
+    
+    # Chain via pipeline
+    ppu_data_df = load_ppu(ppu_filepath)
+    return pipeline(create_quant, enrich)(categorize(ppu_data_df))
+
+def compose_storage_tracking(raw_storage: list, ppu_quant: pd.DataFrame, ppu_data: pd.DataFrame) -> pd.DataFrame:
+    """Composed: Create storage tracking with max capacities linked to PPUs."""
+    return create_storage_tracking(raw_storage, ppu_quant, ppu_data)
+
+def compose_incidence_tracking(raw_incidence: list, ppu_quant: pd.DataFrame, ppu_data: pd.DataFrame) -> pd.DataFrame:
+    """Composed: Create incidence tracking with max capacities linked to PPUs."""
+    return create_incidence_tracking(raw_incidence, ppu_quant, ppu_data)
+
+def compose_renewable_tracking(ppu_data: pd.DataFrame, ppu_quant: pd.DataFrame) -> pd.DataFrame:
+    """Composed: Create renewable PPU tracking for location assignments."""
+    return create_renewable_ppu_tracking(ppu_data, ppu_quant)
+
+def update_all_storages(raw_storage: list, raw_incidence: list, updates: dict = None, t: int = None, lat: float = 46.8, lon: float = 8.2) -> tuple:
+    """Composed: Update storage and incidence via net changes and incidence data."""
+    updated_storage = update_storage(raw_storage, updates or {})
+    updated_incidence = update_incidence(raw_incidence, t or 0, lat, lon)
+    return updated_storage, updated_incidence
