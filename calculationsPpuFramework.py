@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import ast
 import functools
-from typing import Dict, List, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 
 # -------------------------
 # Location & PPU utilities
@@ -234,14 +234,10 @@ def get_incidence_data(source, lat=None, lon=None, t=None):
     
     if source == 'ror':
         if 'ror_series' not in cache:
-            df = pd.read_csv('data/water_monthly_ror_2024.csv', parse_dates=['Month'])
-            df.set_index('Month', inplace=True)
-            # Calculate average power in GW per month
-            df['avg_power_GW'] = df['RoR_GWh'] / (df.index.days_in_month * 24)
-            # Interpolate to daily for continuity between months
-            daily_series = df['avg_power_GW'].resample('D').interpolate(method='linear')
-            # Then resample to 15-min
-            cache['ror_series'] = daily_series.resample('15min').interpolate(method='linear')
+            df = pd.read_csv('data/water_quarterly_ror_2024.csv', parse_dates=['timestamp'])
+            df.set_index('timestamp', inplace=True)
+            # Data is already at 15-min intervals, just ensure proper sorting
+            cache['ror_series'] = df['RoR_MW'].sort_index()
         series = cache['ror_series']
         if t is not None:
             return series.iloc[t]
@@ -506,6 +502,8 @@ def initialize_ppu_dictionary() -> pd.DataFrame:
             - PPU_ID: Unique incremental integer ID (int)
             - PPU_Name: PPU type name (e.g., 'HYD_S', 'PV', 'WIND_OFFSHORE')
             - PPU_Category: Category (e.g., 'Production', 'Storage')
+            - PPU_Extract: Extract (Incidence, Flex, Store)
+            - Storages: List of raw energy storages this PPU can use (list of str)
             - Chain_Efficiency: Overall efficiency of the component chain (float)
             - Cost_CHF_per_kWh: Total cost in CHF per kWh (float)
             - Cost_CHF_per_Quarter_Hour: Cost per 15-min interval (0.25 * Cost_CHF_per_kWh)
@@ -520,6 +518,9 @@ def initialize_ppu_dictionary() -> pd.DataFrame:
         'PPU_ID',
         'PPU_Name',
         'PPU_Category',
+        'PPU_Extract',
+        'Storages', 
+        'Storage_Distribution',
         'Chain_Efficiency',
         'Cost_CHF_per_kWh',
         'Cost_CHF_per_Quarter_Hour',
@@ -535,9 +536,9 @@ def initialize_ppu_dictionary() -> pd.DataFrame:
 def next_available_location(
     ppu_dictionary: pd.DataFrame,
     renewable_type: str,
-    solar_locations_df: pd.DataFrame = None,
-    wind_locations_df: pd.DataFrame = None
-) -> Dict:
+    solar_locations_df: Optional[pd.DataFrame] = None,
+    wind_locations_df: Optional[pd.DataFrame] = None
+) -> Optional[Dict]:
     """
     Find the next available location for a solar or wind PPU.
     
@@ -624,9 +625,10 @@ def add_ppu_to_dictionary(
     ppu_name: str,
     ppu_constructs_df: pd.DataFrame,
     cost_df: pd.DataFrame,
-    solar_locations_df: pd.DataFrame = None,
-    wind_locations_df: pd.DataFrame = None,
-    delta_t: float = 0.25
+    solar_locations_df: Optional[pd.DataFrame] = None,
+    wind_locations_df: Optional[pd.DataFrame] = None,
+    delta_t: float = 0.25,
+    raw_energy_storage: Optional[List[Dict]] = None
 ) -> pd.DataFrame:
     """
     Add a new PPU to the dictionary with all calculated metrics.
@@ -635,8 +637,9 @@ def add_ppu_to_dictionary(
     1. Gives the PPU a unique incremental ID
     2. Looks up PPU information from ppu_constructs_components.csv
     3. Calculates chain efficiency and cost from cost_table_tidy.csv
-    4. Assigns location ranking for solar/wind PPUs (NaN otherwise)
-    5. Adds the complete PPU entry to the dictionary
+    4. Determines which raw energy storage this PPU uses based on components
+    5. Assigns location ranking for solar/wind PPUs (NaN otherwise)
+    6. Adds the complete PPU entry to the dictionary
     
     Parameters:
         ppu_dictionary (pd.DataFrame): Existing PPU dictionary (can be empty)
@@ -646,6 +649,7 @@ def add_ppu_to_dictionary(
         solar_locations_df (pd.DataFrame): Solar location rankings
         wind_locations_df (pd.DataFrame): Wind location rankings
         delta_t (float): Time slice duration in hours (default 0.25 for 15 minutes)
+        raw_energy_storage (List[Dict]): Raw energy storage definitions to determine which storage this PPU uses
     
     Returns:
         pd.DataFrame: Updated ppu_dictionary with the new PPU added
@@ -673,6 +677,30 @@ def add_ppu_to_dictionary(
     cost_data = calculate_chain_cost(components, cost_df)
     cost_per_kwh = cost_data['total_cost']
     cost_per_quarter_hour = cost_per_kwh * delta_t
+    
+    # Determine which raw energy storages this PPU can use
+    available_storages = []
+    storage_distribution = {}
+    if raw_energy_storage:
+        available_storages = get_available_storages_for_ppu(components, raw_energy_storage)
+        if available_storages:
+            # Calculate balanced distribution across available storages
+            storage_distribution = balance_storage_usage(
+                available_storages, raw_energy_storage, ppu_capacity_gw=1.0
+            )
+    
+    # Determine PPU_Extract based on category and components
+    ppu_extract = None
+    if category == 'Production':
+        # Check components for extraction type
+        if 'PV' in components or 'Wind' in components:
+            ppu_extract = 'Incidence'
+        elif 'Hydro Turb' in components:
+            ppu_extract = 'Incidence'  # Run-of-river
+        else:
+            ppu_extract = 'Flex'  # Other production PPUs
+    elif category == 'Storage':
+        ppu_extract = 'Store'  # Storage PPUs can store energy
     
     # Determine if this is a renewable PPU that needs location assignment
     location_rank = np.nan
@@ -713,6 +741,9 @@ def add_ppu_to_dictionary(
         'PPU_ID': new_id,
         'PPU_Name': ppu_name,
         'PPU_Category': category,
+        'PPU_Extract': ppu_extract,
+        'Storages': available_storages,
+        'Storage_Distribution': storage_distribution,
         'Chain_Efficiency': efficiency,
         'Cost_CHF_per_kWh': cost_per_kwh,
         'Cost_CHF_per_Quarter_Hour': cost_per_quarter_hour,
@@ -727,8 +758,8 @@ def add_ppu_to_dictionary(
     # Add to dictionary
     updated_dictionary = pd.concat([ppu_dictionary, new_ppu], ignore_index=True)
     
-    print(f"Added PPU '{ppu_name}' (ID: {new_id}, Category: {category}, "
-          f"Efficiency: {efficiency:.4f}, Cost: {cost_per_kwh:.6f} CHF/kWh"
+    print(f"Added PPU '{ppu_name}' (ID: {new_id}, Category: {category}, Extract: {ppu_extract}, "
+          f"Storages: {available_storages}, Efficiency: {efficiency:.4f}, Cost: {cost_per_kwh:.6f} CHF/kWh"
           f"{f', Location Rank: {location_rank}' if not np.isnan(location_rank) else ''})")
     
     return updated_dictionary
@@ -881,3 +912,83 @@ def verify_unique_locations(ppu_dictionary: pd.DataFrame) -> Dict:
         'total_renewable_ppus': len(renewable_ppus),
         'message': message
     }
+
+def balance_storage_usage(
+    available_storages: List[str],
+    raw_energy_storage: List[Dict],
+    ppu_capacity_gw: float = 1.0
+) -> Dict[str, float]:
+    """
+    Balance storage usage across multiple available storages for a PPU.
+    
+    This function distributes PPU capacity proportionally across all available storages
+    based on their capacity per GW-PPU, ensuring balanced utilization.
+    
+    Parameters:
+        available_storages (List[str]): List of storage names this PPU can use
+        raw_energy_storage (List[Dict]): Full storage definitions with capacities
+        ppu_capacity_gw (float): PPU capacity in GW (default 1.0)
+    
+    Returns:
+        Dict[str, float]: Storage name -> fraction of PPU capacity allocated to this storage
+                          (values sum to 1.0 for balanced distribution)
+    
+    Example:
+        If a PPU can use ["Fuel Tank", "Biooil"] with capacities 141320 and 21600 MWh/GW-PPU:
+        Returns: {"Fuel Tank": 0.867, "Biooil": 0.133} (proportional to capacities)
+    """
+    if not available_storages:
+        return {}
+    
+    if len(available_storages) == 1:
+        # Single storage - use 100% of capacity
+        return {available_storages[0]: 1.0}
+    
+    # Multiple storages - distribute proportionally by capacity
+    storage_capacities = {}
+    total_capacity = 0.0
+    
+    for storage_item in raw_energy_storage:
+        storage_name = storage_item['storage']
+        if storage_name in available_storages:
+            capacity_per_gw = storage_item['value']  # MWh/GW-PPU
+            storage_capacities[storage_name] = capacity_per_gw
+            total_capacity += capacity_per_gw
+    
+    if total_capacity == 0:
+        # Fallback: equal distribution if all capacities are 0
+        fraction = 1.0 / len(available_storages)
+        return {storage: fraction for storage in available_storages}
+    
+    # Proportional distribution based on capacity
+    balanced_distribution = {}
+    for storage_name, capacity in storage_capacities.items():
+        fraction = capacity / total_capacity
+        balanced_distribution[storage_name] = fraction
+    
+    return balanced_distribution
+
+
+def get_available_storages_for_ppu(
+    components: List[str],
+    raw_energy_storage: List[Dict]
+) -> List[str]:
+    """
+    Determine which storages a PPU can extract from based on its components.
+    
+    Parameters:
+        components (List[str]): List of components in the PPU chain
+        raw_energy_storage (List[Dict]): Storage definitions with 'extracted_by' lists
+    
+    Returns:
+        List[str]: List of storage names this PPU can use
+    """
+    available_storages = []
+    
+    for storage_item in raw_energy_storage:
+        extracted_by = storage_item['extracted_by']
+        # Check if any of the PPU's components can extract from this storage
+        if any(extractor in components for extractor in extracted_by):
+            available_storages.append(storage_item['storage'])
+    
+    return available_storages
