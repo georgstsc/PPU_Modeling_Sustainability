@@ -26,4 +26,4 @@ NH3_FULL,"['Electrolyzer', 'N2 separation', 'N2,H2 compression', 'NH3 synthesis'
 SYN_CRACK,"['Electrolyzer', 'Palm oil', 'H2, CO2 compression', 'Cracking', 'Refining', 'Fuel Tank']",Storage,Store
 CH4_BIO,"['Electrolyzer', 'Biogas purification', 'Sabatier reaction', 'Methane compression', 'Biogas (50% CH4)']",Storage,Store
 PHS,"['Electricity', 'Hydro pump', 'Lake']",Storage,Store
-GR,"['Grid']",Production,Flex
+THERM_CH4,"['CH4 storage 200bar', 'Methane compression', 'Methane transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex

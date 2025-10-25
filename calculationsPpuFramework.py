@@ -501,14 +501,13 @@ def initialize_ppu_dictionary() -> pd.DataFrame:
         pd.DataFrame: Empty DataFrame with columns:
             - PPU_ID: Unique incremental integer ID (int)
             - PPU_Name: PPU type name (e.g., 'HYD_S', 'PV', 'WIND_OFFSHORE')
-            - PPU_Category: Category (e.g., 'Production', 'Storage')
             - PPU_Extract: Extract (Incidence, Flex, Store)
-            - Storages: List of raw energy storages this PPU can use (list of str)
+            - can_extract_from: List of storages this PPU can extract from (list of str)
+            - can_input_to: List of storages this PPU can input to (list of str)
             - Chain_Efficiency: Overall efficiency of the component chain (float)
             - Cost_CHF_per_kWh: Total cost in CHF per kWh (float)
             - Cost_CHF_per_Quarter_Hour: Cost per 15-min interval (0.25 * Cost_CHF_per_kWh)
             - Location_Rank: Location ranking for solar/wind, NaN otherwise (float)
-            - Components: List of components in the PPU chain (object)
             - d_stor: Disposition index tracking dictionary (object)
             - u_dis: Discharge utility index tracking dictionary (object)
             - u_chg: Charge utility index tracking dictionary (object)
@@ -517,15 +516,13 @@ def initialize_ppu_dictionary() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         'PPU_ID',
         'PPU_Name',
-        'PPU_Category',
         'PPU_Extract',
-        'Storages', 
-        'Storage_Distribution',
+        'can_extract_from',
+        'can_input_to',
         'Chain_Efficiency',
         'Cost_CHF_per_kWh',
         'Cost_CHF_per_Quarter_Hour',
         'Location_Rank',
-        'Components',
         'd_stor',
         'u_dis',
         'u_chg',
@@ -620,6 +617,47 @@ def next_available_location(
     }
 
 
+def select_storage_with_fewest_ppus(
+    available_storages: List[str],
+    ppu_dictionary: pd.DataFrame,
+    raw_energy_storage: List[Dict]
+) -> Optional[str]:
+    """
+    Select the storage with the fewest PPUs currently assigned to it.
+    
+    Parameters:
+        available_storages (List[str]): List of storage names this PPU can use
+        ppu_dictionary (pd.DataFrame): Current PPU dictionary
+        raw_energy_storage (List[Dict]): Storage definitions
+    
+    Returns:
+        Optional[str]: Name of storage with fewest PPUs, or None if no storages available
+    """
+    if not available_storages:
+        return None
+    
+    if ppu_dictionary.empty:
+        # No PPUs yet, return first available storage
+        return available_storages[0]
+    
+    # Count current PPUs per storage
+    storage_counts = {storage: 0 for storage in available_storages}
+    
+    for _, ppu_row in ppu_dictionary.iterrows():
+        storage_dist = ppu_row.get('Storage_Distribution', {})
+        if isinstance(storage_dist, dict):
+            for storage_name, fraction in storage_dist.items():
+                if storage_name in storage_counts and fraction > 0:
+                    storage_counts[storage_name] += 1
+    
+    # Find storage with minimum count
+    min_count = min(storage_counts.values())
+    candidates = [storage for storage, count in storage_counts.items() if count == min_count]
+    
+    # Return first candidate (arbitrary choice if tie)
+    return candidates[0] if candidates else available_storages[0]
+
+
 def add_ppu_to_dictionary(
     ppu_dictionary: pd.DataFrame,
     ppu_name: str,
@@ -628,7 +666,8 @@ def add_ppu_to_dictionary(
     solar_locations_df: Optional[pd.DataFrame] = None,
     wind_locations_df: Optional[pd.DataFrame] = None,
     delta_t: float = 0.25,
-    raw_energy_storage: Optional[List[Dict]] = None
+    raw_energy_storage: Optional[List[Dict]] = None,
+    raw_energy_incidence: Optional[List[Dict]] = None
 ) -> pd.DataFrame:
     """
     Add a new PPU to the dictionary with all calculated metrics.
@@ -649,7 +688,8 @@ def add_ppu_to_dictionary(
         solar_locations_df (pd.DataFrame): Solar location rankings
         wind_locations_df (pd.DataFrame): Wind location rankings
         delta_t (float): Time slice duration in hours (default 0.25 for 15 minutes)
-        raw_energy_storage (List[Dict]): Raw energy storage definitions to determine which storage this PPU uses
+        raw_energy_storage (List[Dict]): Raw energy storage definitions with PPU-based extracted_by/input_by
+        raw_energy_incidence (List[Dict]): Raw energy incidence definitions with PPU-based extracted_by
     
     Returns:
         pd.DataFrame: Updated ppu_dictionary with the new PPU added
@@ -678,29 +718,58 @@ def add_ppu_to_dictionary(
     cost_per_kwh = cost_data['total_cost']
     cost_per_quarter_hour = cost_per_kwh * delta_t
     
-    # Determine which raw energy storages this PPU can use
-    available_storages = []
-    storage_distribution = {}
-    if raw_energy_storage:
-        available_storages = get_available_storages_for_ppu(components, raw_energy_storage)
-        if available_storages:
-            # Calculate balanced distribution across available storages
-            storage_distribution = balance_storage_usage(
-                available_storages, raw_energy_storage, ppu_capacity_gw=1.0
-            )
+    # Determine storage capabilities based on updated storage dictionaries
+    can_extract_from = []
+    can_input_to = []
     
-    # Determine PPU_Extract based on category and components
+    if raw_energy_storage:
+        for storage in raw_energy_storage:
+            # Check if any component of this PPU can extract from this storage
+            if any(component in storage.get('extracted_by', []) for component in components):
+                can_extract_from.append(storage['storage'])
+            if any(component in storage.get('input_by', []) for component in components):
+                can_input_to.append(storage['storage'])
+    
+    if raw_energy_incidence:
+        for incidence in raw_energy_incidence:
+            # Check if any component of this PPU can extract from this incidence
+            if any(component in incidence.get('extracted_by', []) for component in components):
+                can_extract_from.append(incidence['storage'])
+    
+    # For backward compatibility, determine available storages for storage assignment
+    available_storages = can_extract_from.copy()  # PPUs can be assigned to storages they can extract from
+    storage_distribution = {}
+    if available_storages:
+        # Select single storage with fewest current PPUs assigned
+        selected_storage = select_storage_with_fewest_ppus(
+            available_storages, ppu_dictionary, raw_energy_storage or []
+        )
+        if selected_storage:
+            storage_distribution = {selected_storage: 1.0}
+    
+    # Determine PPU_Extract based on extraction and input capabilities
     ppu_extract = None
-    if category == 'Production':
-        # Check components for extraction type
-        if 'PV' in components or 'Wind' in components:
-            ppu_extract = 'Incidence'
-        elif 'Hydro Turb' in components:
-            ppu_extract = 'Incidence'  # Run-of-river
-        else:
-            ppu_extract = 'Flex'  # Other production PPUs
-    elif category == 'Storage':
-        ppu_extract = 'Store'  # Storage PPUs can store energy
+    
+    # Define incidence sources (uncontrollable energy sources)
+    incidence_sources = ['Solar', 'Wind', 'River', 'Lake', 'Wood']
+    
+    # Check if PPU can extract from incidence sources
+    extracts_from_incidence = any(source in can_extract_from for source in incidence_sources)
+    
+    # Check if PPU can extract from storage sources
+    extracts_from_storage = any(source not in incidence_sources for source in can_extract_from)
+    
+    # Check if PPU can input to storage sources
+    inputs_to_storage = len(can_input_to) > 0
+    
+    if extracts_from_incidence:
+        ppu_extract = 'Incidence'  # Uncontrollable production from incidence sources
+    elif extracts_from_storage:
+        ppu_extract = 'Flex'  # Flexible production from storage sources
+    elif inputs_to_storage:
+        ppu_extract = 'Store'  # Storage PPUs that can charge storage
+    else:
+        ppu_extract = 'Flex'  # Default fallback for production PPUs
     
     # Determine if this is a renewable PPU that needs location assignment
     location_rank = np.nan
@@ -742,8 +811,8 @@ def add_ppu_to_dictionary(
         'PPU_Name': ppu_name,
         'PPU_Category': category,
         'PPU_Extract': ppu_extract,
-        'Storages': available_storages,
-        'Storage_Distribution': storage_distribution,
+        'can_extract_from': can_extract_from,
+        'can_input_to': can_input_to,
         'Chain_Efficiency': efficiency,
         'Cost_CHF_per_kWh': cost_per_kwh,
         'Cost_CHF_per_Quarter_Hour': cost_per_quarter_hour,
@@ -759,7 +828,7 @@ def add_ppu_to_dictionary(
     updated_dictionary = pd.concat([ppu_dictionary, new_ppu], ignore_index=True)
     
     print(f"Added PPU '{ppu_name}' (ID: {new_id}, Category: {category}, Extract: {ppu_extract}, "
-          f"Storages: {available_storages}, Efficiency: {efficiency:.4f}, Cost: {cost_per_kwh:.6f} CHF/kWh"
+          f"Extract From: {can_extract_from}, Input To: {can_input_to}, Efficiency: {efficiency:.4f}, Cost: {cost_per_kwh:.6f} CHF/kWh"
           f"{f', Location Rank: {location_rank}' if not np.isnan(location_rank) else ''})")
     
     return updated_dictionary
@@ -813,13 +882,12 @@ def verify_storage_capacity(
         unit = storage_item['unit']
         extracted_by = storage_item['extracted_by']
         
-        # Find PPUs that use this storage (check if any extractor component is in PPU components)
+        # Find PPUs that use this storage (check if storage name is in PPU's can_extract_from)
         matching_ppus = []
         if not ppu_dictionary.empty:
             for _, ppu_row in ppu_dictionary.iterrows():
-                ppu_components = ppu_row['Components']
-                # Check if any of the storage's extractors are in this PPU's components
-                if any(extractor in ppu_components for extractor in extracted_by):
+                ppu_extract_from = ppu_row.get('can_extract_from', [])
+                if storage_name in ppu_extract_from:
                     matching_ppus.append(ppu_row['PPU_Name'])
         
         num_instances = len(matching_ppus)
