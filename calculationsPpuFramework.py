@@ -719,33 +719,65 @@ def add_ppu_to_dictionary(
     cost_per_quarter_hour = cost_per_kwh * delta_t
     
     # Determine storage capabilities based on updated storage dictionaries
-    can_extract_from = []
-    can_input_to = []
+    # IMPORTANT: Each PPU should be linked to at most ONE storage for extraction
+    # and at most ONE storage for input
+    all_extractable_storages = []
+    all_inputable_storages = []
     
     if raw_energy_storage:
         for storage in raw_energy_storage:
             # Check if any component of this PPU can extract from this storage
             if any(component in storage.get('extracted_by', []) for component in components):
-                can_extract_from.append(storage['storage'])
+                all_extractable_storages.append(storage['storage'])
             if any(component in storage.get('input_by', []) for component in components):
-                can_input_to.append(storage['storage'])
+                all_inputable_storages.append(storage['storage'])
     
     if raw_energy_incidence:
         for incidence in raw_energy_incidence:
             # Check if any component of this PPU can extract from this incidence
             if any(component in incidence.get('extracted_by', []) for component in components):
-                can_extract_from.append(incidence['storage'])
+                all_extractable_storages.append(incidence['storage'])
+    
+    # Select SINGLE storage for extraction
+    # Special cases for hydro PPUs:
+    # - HYD_S extracts from Lake
+    # - HYD_R extracts from River
+    can_extract_from = []
+    if ppu_name == 'HYD_S':
+        # HYD_S specifically extracts from Lake
+        if 'Lake' in all_extractable_storages:
+            can_extract_from = ['Lake']
+        else:
+            print(f"Warning: HYD_S cannot find 'Lake' in extractable storages: {all_extractable_storages}")
+    elif ppu_name == 'HYD_R':
+        # HYD_R specifically extracts from River
+        if 'River' in all_extractable_storages:
+            can_extract_from = ['River']
+        else:
+            print(f"Warning: HYD_R cannot find 'River' in extractable storages: {all_extractable_storages}")
+    elif all_extractable_storages:
+        # For all other PPUs, choose storage with fewest PPUs assigned
+        selected_extract_storage = select_storage_with_fewest_ppus(
+            all_extractable_storages, ppu_dictionary, raw_energy_storage or []
+        )
+        if selected_extract_storage:
+            can_extract_from = [selected_extract_storage]
+    
+    # Select SINGLE storage for input (choose one with fewest PPUs assigned)
+    can_input_to = []
+    if all_inputable_storages:
+        selected_input_storage = select_storage_with_fewest_ppus(
+            all_inputable_storages, ppu_dictionary, raw_energy_storage or []
+        )
+        if selected_input_storage:
+            can_input_to = [selected_input_storage]
     
     # For backward compatibility, determine available storages for storage assignment
     available_storages = can_extract_from.copy()  # PPUs can be assigned to storages they can extract from
     storage_distribution = {}
     if available_storages:
-        # Select single storage with fewest current PPUs assigned
-        selected_storage = select_storage_with_fewest_ppus(
-            available_storages, ppu_dictionary, raw_energy_storage or []
-        )
-        if selected_storage:
-            storage_distribution = {selected_storage: 1.0}
+        # Already selected single storage above
+        storage_distribution = {available_storages[0]: 1.0}
     
     # Determine PPU_Extract based on extraction and input capabilities
     ppu_extract = None

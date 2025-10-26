@@ -50,7 +50,7 @@ def load_energy_data(data_dir: str = "data") -> Tuple[pd.Series, pd.Series, pd.D
     # Load RoR data (already 15-min)
     ror_df = pd.read_csv(f'{data_dir}/water_quarterly_ror_2024.csv', parse_dates=['timestamp'])
     ror_df = ror_df.set_index('timestamp').sort_index()
-
+    ror_df.head()
     return demand_15min, spot_15min, ror_df
 
 
@@ -249,28 +249,26 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     """
     num_timesteps = min(len(demand_15min), len(spot_15min), len(ror_df),
                        len(solar_15min), len(wind_15min))
-
+    # num_timesteps = 1000
     # Initialize technology tracking
     Technology_volume = initialize_technology_tracking(ppu_dictionary)
     phi_smoothed = 0.0
-
     for t in range(num_timesteps):
         if t % 5000 == 0:
             print(f"  Progress: {t:,}/{num_timesteps:,} ({t/num_timesteps*100:.1f}%)")
-
+            # show the state of each storage 
+            for storage in raw_energy_storage:
+                print(f"    {storage['storage']}: {storage['current_value']} MW")
+            for storage in raw_energy_incidence:
+                print(f"    {storage['storage']}: {storage['current_value']} MW")
         # 1) Import the demand
         demand_MW = demand_15min.iloc[t]
         spot_price = spot_15min.iloc[t]
 
         # 2) Update raw_energy_incidence with respective values for each energy source/storage
         raw_energy_incidence = update_raw_energy_incidence(
-            raw_energy_incidence, t, solar_ranking_df, wind_ranking_df, ppu_dictionary
-        )
-
-        # 3) Use 'Incidence' PPUs to calculate energy production and cost
-        raw_energy_incidence = calculate_incidence_production(
-            ppu_dictionary, raw_energy_incidence, Technology_volume, t,
-            solar_ranking_df, wind_ranking_df, hyperparams
+            raw_energy_incidence, Technology_volume, t, solar_ranking_df, wind_ranking_df,
+            ppu_dictionary, ror_df, solar_15min, wind_15min
         )
 
         # Get energy produced by incidence PPUs (stored in "Grid")
@@ -552,54 +550,115 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
     return results
 
 
-def update_raw_energy_incidence(raw_energy_incidence: List[Dict], t: int,
+def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_volume: Dict, t: int,
                                solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame,
-                               ppu_dictionary: pd.DataFrame) -> List[Dict]:
+                               ppu_dictionary: pd.DataFrame, ror_df: pd.DataFrame, 
+                               solar_15min: pd.DataFrame, wind_15min: pd.DataFrame) -> List[Dict]:
     """
-    Update raw_energy_incidence with respective values for each energy source/storage.
-
+    Update raw_energy_incidence by simulating PPU extractions from each storage.
+    
+    For each storage:
+    1. Find PPUs that can extract from this storage
+    2. Calculate extraction for each PPU until max limit per PPU or all energy extracted
+    3. Set current_value to total extracted energy
+    4. Record extractions in Technology_volume
+    
     Parameters:
         raw_energy_incidence: List of incidence dictionaries
+        Technology_volume: Technology tracking dictionary
         t: Timestep index
         solar_ranking_df: Solar location rankings
         wind_ranking_df: Wind location rankings
         ppu_dictionary: PPU configuration
+        ror_df: Run-of-river DataFrame (timestamp-indexed) loaded earlier
+        solar_15min: Solar generation DataFrame (timestamp-indexed) loaded earlier
+        wind_15min: Wind generation DataFrame (timestamp-indexed) loaded earlier
 
     Returns:
         Updated raw_energy_incidence list
     """
+    available_energy_ror, available_energy_wood, available_energy_solar, available_energy_wind = 0.0, 0.0, 0.0, 0.0
     for incidence_item in raw_energy_incidence:
-        storage_name = incidence_item['storage']
+        if incidence_item['storage'] == 'River':
+            # Extract available energy from the provided ror_df (safe access with fallback)
+            try:
+                # Prefer .iloc by timestep index if ror_df is time-indexed and t is positional
+                available_energy_ror = float(ror_df.iloc[t].get('RoR_MW', 12.0))
+            except Exception:
+                available_energy_ror = 0.0
+        elif incidence_item['storage'] == 'Wood':
+            available_energy_wood = 500
 
-        if storage_name == "River":
-            # Update with current ROR incidence
-            incidence_item["current_value"] = get_incidence_data('ror', t=t)
-        elif storage_name == "Solar":
-            # Update with current solar incidence (use first PV location as reference)
-            pv_ppus = ppu_dictionary[ppu_dictionary['PPU_Name'] == 'PV']
-            if not pv_ppus.empty:
-                first_pv = pv_ppus.iloc[0]
-                if not pd.isna(first_pv['Location_Rank']):
-                    lat = solar_ranking_df.iloc[int(first_pv['Location_Rank']) - 1]['latitude']
-                    lon = solar_ranking_df.iloc[int(first_pv['Location_Rank']) - 1]['longitude']
-                    incidence_item["current_value"] = get_incidence_data('solar', lat=lat, lon=lon, t=t)
-        elif storage_name == "Wind":
-            # Update with current wind incidence (use first wind location as reference)
-            wind_ppus = ppu_dictionary[ppu_dictionary['PPU_Name'].isin(['WD_OFF', 'WD_ON'])]
-            if not wind_ppus.empty:
-                first_wind = wind_ppus.iloc[0]
-                if not pd.isna(first_wind['Location_Rank']):
-                    lat = wind_ranking_df.iloc[int(first_wind['Location_Rank']) - 1]['latitude']
-                    lon = wind_ranking_df.iloc[int(first_wind['Location_Rank']) - 1]['longitude']
-                    incidence_item["current_value"] = get_incidence_data('wind', lat=lat, lon=lon, t=t)
-        elif storage_name == "Wood":
-            # Wood is a constant resource, set to maximum available
-            incidence_item["current_value"] = 1000.0  # 1 GW constant availability
-        # Grid and other storages remain at 0 until updated by incidence production
+    # We track ror and wood in a descending way
+    available_energy_river_track = 0
+    available_energy_wood_track = 0
+    for idx, each_ppu in ppu_dictionary.iterrows():
+        can_extract_from = each_ppu.get("can_extract_from", [])
+        ppu_name = each_ppu['PPU_Name']
+        
+        # Initialize Technology_volume for this PPU if not exists
+        if ppu_name not in Technology_volume:
+            Technology_volume[ppu_name] = {
+                'production': [],
+                'spot_bought': [],
+                'spot_sold': [],
+                'cost_indices': []
+            }
+        
+        if 'Solar' in can_extract_from:
+            location_rank = each_ppu.get('Location_Rank', np.nan)
+            if pd.notna(location_rank):
+                area_m2 = 100000 # Example area
+                current_solar_prod = calculate_solar_production(int(location_rank), area_m2, t, solar_15min, solar_ranking_df)
+                Technology_volume[ppu_name]['production'].append((t, current_solar_prod))
+                available_energy_solar += current_solar_prod    
+        elif 'Wind' in can_extract_from:
+            location_rank = each_ppu.get('Location_Rank', np.nan)
+            if pd.notna(location_rank):
+                num_turbines = 5  # You may want to get this from each_ppu if available
+                current_wind_prod = calculate_wind_production(int(location_rank), num_turbines, t, wind_15min, wind_ranking_df)
+                Technology_volume[ppu_name]['production'].append((t, current_wind_prod))
+                available_energy_wind += current_wind_prod
+        elif 'River' in can_extract_from:
+            if available_energy_ror > 1000: 
+                extraction = 1000
+                available_energy_river_track += 1000
+                available_energy_ror -= 1000
+            else:
+                extraction = available_energy_ror
+                available_energy_river_track += available_energy_ror
+                available_energy_ror = 0
+            Technology_volume[ppu_name]['production'].append((t, extraction))
+        elif 'Wood' in can_extract_from:
+            if available_energy_wood > 500:
+                extraction = 500
+                available_energy_wood -= 500
+                available_energy_wood_track += 500
+            else:
+                extraction = available_energy_wood
+                available_energy_wood_track += available_energy_wood
+                available_energy_wood = 0
+            Technology_volume[ppu_name]['production'].append((t, extraction))
+    
 
-        # Update history for all items
-        incidence_item['history'].append((t, incidence_item['current_value']))
-
+    total_energy = available_energy_river_track + available_energy_wood_track + available_energy_solar + available_energy_wind
+    # in raw_energy_incidence get "Grid" and set current_value to total_energy
+    for incidence_item in raw_energy_incidence:
+        if incidence_item['storage'] == 'Grid':
+            incidence_item['current_value'] = total_energy
+            incidence_item['history'].append((t, total_energy))
+        elif incidence_item['storage'] == 'Solar':
+            incidence_item['current_value'] = available_energy_solar
+            incidence_item['history'].append((t, available_energy_solar))
+        elif incidence_item['storage'] == 'Wind':
+            incidence_item['current_value'] = available_energy_wind
+            incidence_item['history'].append((t, available_energy_wind))
+        elif incidence_item['storage'] == 'River':
+            incidence_item['current_value'] = available_energy_river_track
+            incidence_item['history'].append((t, available_energy_river_track))
+        elif incidence_item['storage'] == 'Wood':
+            incidence_item['current_value'] = available_energy_wood_track
+            incidence_item['history'].append((t, available_energy_wood_track))
     return raw_energy_incidence
 
 
@@ -607,108 +666,27 @@ def calculate_incidence_production(ppu_dictionary: pd.DataFrame, raw_energy_inci
                                  Technology_volume: Dict, t: int, solar_ranking_df: pd.DataFrame,
                                  wind_ranking_df: pd.DataFrame, hyperparams: Dict) -> List[Dict]:
     """
-    Use 'Incidence' PPUs to calculate energy production and cost, update Technology_volume,
-    and store produced energy in "Grid" in raw_energy_incidence.
-
-    Parameters:
-        ppu_dictionary: PPU configuration
-        raw_energy_incidence: Incidence dictionaries
-        Technology_volume: Technology tracking dictionary
-        t: Timestep index
-        solar_ranking_df: Solar location rankings
-        wind_ranking_df: Wind location rankings
-        hyperparams: Simulation hyperparameters
-
-    Returns:
-        Updated raw_energy_incidence with production stored in "Grid"
+    Calculate total incidence production from extracted energy in raw_energy_incidence.
+    
+    Since update_raw_energy_incidence now handles extraction simulation and recording,
+    this function just sums the extracted energy and puts it in Grid.
     """
     total_production_MW = 0.0
-
-    for _, ppu_row in ppu_dictionary.iterrows():
-        ppu_name = str(ppu_row['PPU_Name'])
-        ppu_extract = str(ppu_row['PPU_Extract'])
-
-        # Only process Incidence-based PPUs
-        if ppu_extract != 'Incidence':
-            continue
-
-        location_rank_raw = ppu_row['Location_Rank']
-        location_rank = location_rank_raw if not pd.isna(location_rank_raw) else np.nan
-
-        production_MW = 0.0
-
-        # Get storages this PPU can extract from
-        can_extract_from = ppu_row.get('can_extract_from', [])
-        if not can_extract_from:
-            continue
-
-        # Calculate production from each extractable storage
-        for storage_name in can_extract_from:
-            storage_production = 0.0
-
-            if storage_name == "Solar":
-                # Calculate solar production
-                if pd.notna(location_rank):
-                    rank_idx = int(location_rank) - 1
-                    lat = solar_ranking_df.iloc[rank_idx]['latitude']
-                    lon = solar_ranking_df.iloc[rank_idx]['longitude']
-                    incidence = get_incidence_data('solar', lat=lat, lon=lon, t=t)
-                    # Assume 100,000 m² area (this should be parameterized)
-                    area_m2 = 100000
-                    storage_production = float(incidence) * area_m2 * 0.25 / 1000
-
-            elif storage_name == "Wind":
-                # Calculate wind production
-                if pd.notna(location_rank):
-                    rank_idx = int(location_rank) - 1
-                    lat = wind_ranking_df.iloc[rank_idx]['latitude']
-                    lon = wind_ranking_df.iloc[rank_idx]['longitude']
-                    wind_speed = get_incidence_data('wind', lat=lat, lon=lon, t=t)
-
-                    # Wind turbine parameters
-                    rotor_diameter_m = 120
-                    air_density = 1.225  # kg/m³
-                    swept_area = np.pi * (rotor_diameter_m / 2) ** 2  # m²
-                    power_coefficient = 0.45  # turbine efficiency
-                    num_turbines = 5  # Assume 5 turbines
-
-                    power_per_turbine_W = 0.5 * air_density * swept_area * (float(wind_speed) ** 3) * power_coefficient
-                    power_per_turbine_MW = power_per_turbine_W / 1e6
-                    storage_production = power_per_turbine_MW * num_turbines
-
-            elif storage_name == "River":
-                # Calculate ROR production
-                ror_total_MW = get_incidence_data('ror', t=t)
-                num_ror_ppus = len(ppu_dictionary[(ppu_dictionary['PPU_Extract'] == 'Incidence') &
-                                                 (ppu_dictionary['can_extract_from'].apply(lambda x: 'River' in x if isinstance(x, list) else False))])
-                if num_ror_ppus > 0:
-                    storage_production = min(float(ror_total_MW) / num_ror_ppus, 1000)  # 1 GW limit per PPU
-
-            elif storage_name == "Wood":
-                # Wood is a constant resource, assume 1 GW available per PPU
-                storage_production = 1000.0
-
-            production_MW += storage_production
-
-        # Each PPU can produce at most 1 GW
-        production_MW = min(production_MW, 1000)
-
-        # Record production in Technology_volume
-        Technology_volume[ppu_name]['production'].append((t, production_MW))
-
-        # Add to total production
-        total_production_MW += production_MW
-
-    # Update raw_energy_incidence: set all to 0 except "Grid" which gets total production
+    
+    # Sum extracted energy from all incidence storages
+    for incidence_item in raw_energy_incidence:
+        if incidence_item['storage'] != 'Grid':  # Grid is the output, not input
+            total_production_MW += incidence_item['current_value']
+    
+    # Update raw_energy_incidence: set Grid to total production, others remain as extracted amounts
     for incidence_item in raw_energy_incidence:
         if incidence_item['storage'] == 'Grid':
             incidence_item['current_value'] = total_production_MW
-        else:
-            incidence_item['current_value'] = 0.0
-
+        # Other storages keep their extracted amounts
+        
         # Update history
         incidence_item['history'].append((t, incidence_item['current_value']))
-
+    
     return raw_energy_incidence
 
 
@@ -810,6 +788,7 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
             flex_ppus.append(ppu_row)
 
     if not flex_ppus:
+        print(f"Why are there no PPU left to produce energy?")
         # No Flex PPUs available, buy from spot market
         tech_count = len(Technology_volume)
         spot_buy_per_tech = deficit_MW / tech_count
@@ -915,6 +894,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
             store_ppus.append(ppu_row)
 
     if not store_ppus:
+        print(f"Why are there no PPU left to store energy?")
         # No Store PPUs available, sell to spot market
         tech_count = len(Technology_volume)
         spot_sell_per_tech = surplus_MW / tech_count
