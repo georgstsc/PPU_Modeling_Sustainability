@@ -7,6 +7,13 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy.interpolate import CubicSpline
 try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    def tqdm(iterable, **kwargs):
+        return iterable
+try:
     from numba import njit, prange  # type: ignore
     NUMBA_AVAILABLE = True
 except Exception:
@@ -614,14 +621,18 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     overflow_count = 0
     surplus_count = 0
     balanced_count = 0
-    for t in range(num_timesteps):
+    
+    # Create progress bar
+    timestep_iter = tqdm(range(num_timesteps), desc="⚡ Dispatch Simulation", 
+                         unit="timestep", ncols=100, 
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+    
+    for t in timestep_iter:
         if t % 5000 == 0:
-            print(f"  Progress: {t:,}/{num_timesteps:,} ({t/num_timesteps*100:.1f}%)")
-            # show the state of each storage 
-            for storage in raw_energy_storage:
-                print(f"    {storage['storage']}: {storage['current_value']} MW")
-            for storage in raw_energy_incidence:
-                print(f"    {storage['storage']}: {storage['current_value']} MW")
+            # Update progress bar description with storage states
+            storage_status = " | ".join([f"{s['storage'][:4]}:{s['current_value']/1000:.0f}k" 
+                                        for s in raw_energy_storage[:3]])
+            timestep_iter.set_postfix_str(storage_status)
         # 1) Import the demand
         demand_MW = demand_15min.iloc[t]
         spot_price = spot_15min.iloc[t]
