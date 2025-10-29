@@ -396,6 +396,19 @@ def update_all_storages(raw_storage: list, raw_incidence: list, updates: dict = 
     updated_incidence = update_incidence(raw_incidence, t or 0, lat, lon)
     return updated_storage, updated_incidence
 
+def get_component_data(component: str, cost_df: pd.DataFrame) -> Dict:
+    if component in cost_df.index:
+        row = cost_df.loc[component]
+        # ----  NEW:  force numeric, replace non-parsable by defaults  ----
+        eff   = pd.to_numeric(row['efficiency'], errors='coerce') if 'efficiency' in row else 1.0
+        cost  = pd.to_numeric(row['cost'],       errors='coerce') if 'cost'       in row else 0.0
+        w     = pd.to_numeric(row['w'],          errors='coerce') if 'w'          in row else 0.0
+        # fill NaN that to_numeric produced
+        eff, cost, w = [x if not pd.isna(x) else (1.0,0.0,0.0)[i] for i,x in enumerate((eff,cost,w))]
+        return {'efficiency': eff, 'cost': cost, 'w': w,
+                'component_type': row.get('component', 'unknown')}
+    else:
+        return {'efficiency': 1.0, 'cost': 0.0, 'w': 0.0, 'component_type': 'unknown'}
 
 def add_ppu(
     ppu_name: str,
@@ -676,7 +689,7 @@ def add_ppu_to_dictionary(
     1. Gives the PPU a unique incremental ID
     2. Looks up PPU information from ppu_constructs_components.csv
     3. Calculates chain efficiency and cost from cost_table_tidy.csv
-    4. Determines which raw energy storage this PPU uses based on components
+    4. Determines which raw energy storage this PPU uses based on DIRECT PPU-TO-STORAGE MAPPING
     5. Assigns location ranking for solar/wind PPUs (NaN otherwise)
     6. Adds the complete PPU entry to the dictionary
     
@@ -688,8 +701,8 @@ def add_ppu_to_dictionary(
         solar_locations_df (pd.DataFrame): Solar location rankings
         wind_locations_df (pd.DataFrame): Wind location rankings
         delta_t (float): Time slice duration in hours (default 0.25 for 15 minutes)
-        raw_energy_storage (List[Dict]): Raw energy storage definitions with PPU-based extracted_by/input_by
-        raw_energy_incidence (List[Dict]): Raw energy incidence definitions with PPU-based extracted_by
+        raw_energy_storage (List[Dict]): Raw energy storage definitions (not used with direct mapping)
+        raw_energy_incidence (List[Dict]): Raw energy incidence definitions (not used with direct mapping)
     
     Returns:
         pd.DataFrame: Updated ppu_dictionary with the new PPU added
@@ -697,6 +710,64 @@ def add_ppu_to_dictionary(
     Raises:
         ValueError: If ppu_name not found in ppu_constructs_df
     """
+    
+    # =========================================================================
+    # DIRECT PPU-TO-STORAGE MAPPING
+    # =========================================================================
+    # This mapping explicitly defines which PPUs can extract from and input to
+    # which storages. No more component matching - direct and explicit.
+    
+    PPU_STORAGE_MAPPING = {
+        # Hydro PPUs
+        'HYD_S': {'extract_from': [], 'input_to': ['Lake']},  # Hydroelectric storage - extracts from Lake
+        'HYD_R': {'extract_from': ['River'], 'input_to': []},  # Run-of-river - extracts from River
+        'PHS': {'extract_from': ['Lake'], 'input_to': []},  # Pumped hydro storage - both extract and pump into Lake
+        
+        # Hydrogen PPUs (gaseous 200bar)
+        'H2_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 turbine + electrolyzer
+        'H2P_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 turbine only (no input)
+        
+        # Hydrogen PPUs (liquid)
+        'H2_L': {'extract_from': [], 'input_to': ['Liquid storage']},  # Liquid H2 turbine + liquefier
+        'H2P_L': {'extract_from': ['Liquid storage'], 'input_to': []},  # Liquid H2 turbine only
+        
+        # Hydrogen PPUs (gaseous-liquid hybrid)
+        'H2_GL': {'extract_from': [], 'input_to': ['H2 Storage UG 200bar']},  # Extract liquid, store gaseous
+        
+        # Synthetic fuel PPUs
+        'SYN_FT': {'extract_from': [], 'input_to': ['Fuel Tank']},  # Fischer-Tropsch synthesis
+        'SYN_METH': {'extract_from': [], 'input_to': ['CH4 storage 200bar']},  # Methane synthesis
+        'SYN_CRACK': {'extract_from': [], 'input_to': ['Fuel Tank']},  # Fuel cracking
+        
+        # Ammonia PPUs
+        'NH3_FULL': {'extract_from': [], 'input_to': ['Ammonia storage']},  # Ammonia synthesis + ICE
+        'NH3_P': {'extract_from': ['Ammonia storage'], 'input_to': []},  # Ammonia ICE only
+        
+        # Biogas PPUs
+        'CH4_BIO': {'extract_from': [], 'input_to': ['Biogas (50% CH4)']},  # Biogas upgrade
+        'IMP_BIOG': {'extract_from': ['Biogas (50% CH4)'], 'input_to': []},  # Import biogas only
+        
+        # Biofuel PPUs
+        'BIO_OIL_ICE': {'extract_from': ['Biooil'], 'input_to': []},  # Biooil ICE
+        'BIO_WOOD': {'extract_from': ['Wood'], 'input_to': []},  # Wood gasification
+        'PALM_ICE': {'extract_from': ['Palm oil'], 'input_to': []},  # Palm oil ICE
+        
+        # Solar thermal PPUs
+        'SOL_SALT': {'extract_from': ['Solar concentrator salt'], 'input_to': []},  # CSP with salt storage
+        'SOL_STEAM': {'extract_from': ['Solar concentrator salt'], 'input_to': []},  # CSP without storage
+        
+        # Thermal PPUs (natural gas)
+        'THERM': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Gas turbine
+        'THERM_CH4': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Gas turbine with CH4
+        'THERM_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 gas turbine
+        'THERM_M': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Methane turbine
+        
+        # Renewables (Incidence sources - no storage)
+        'PV': {'extract_from': ['Solar'], 'input_to': []},  # Solar PV
+        'WD_ON': {'extract_from': ['Wind'], 'input_to': []},  # Wind onshore
+        'WD_OFF': {'extract_from': ['Wind'], 'input_to': []},  # Wind offshore
+    }
+    # =========================================================================
     # Look up PPU information
     ppu_row = ppu_constructs_df[ppu_constructs_df['PPU'] == ppu_name]
     if ppu_row.empty:
@@ -718,59 +789,22 @@ def add_ppu_to_dictionary(
     cost_per_kwh = cost_data['total_cost']
     cost_per_quarter_hour = cost_per_kwh * delta_t
     
-    # Determine storage capabilities based on updated storage dictionaries
-    # IMPORTANT: Each PPU should be linked to at most ONE storage for extraction
-    # and at most ONE storage for input
-    all_extractable_storages = []
-    all_inputable_storages = []
-    
-    if raw_energy_storage:
-        for storage in raw_energy_storage:
-            # Check if any component of this PPU can extract from this storage
-            if any(component in storage.get('extracted_by', []) for component in components):
-                all_extractable_storages.append(storage['storage'])
-            if any(component in storage.get('input_by', []) for component in components):
-                all_inputable_storages.append(storage['storage'])
-    
-    if raw_energy_incidence:
-        for incidence in raw_energy_incidence:
-            # Check if any component of this PPU can extract from this incidence
-            if any(component in incidence.get('extracted_by', []) for component in components):
-                all_extractable_storages.append(incidence['storage'])
-    
-    # Select SINGLE storage for extraction
-    # Special cases for hydro PPUs:
-    # - HYD_S extracts from Lake
-    # - HYD_R extracts from River
+    # =========================================================================
+    # USE DIRECT PPU-TO-STORAGE MAPPING
+    # =========================================================================
+    # Get storage capabilities from the mapping (no more component matching!)
     can_extract_from = []
-    if ppu_name == 'HYD_S':
-        # HYD_S specifically extracts from Lake
-        if 'Lake' in all_extractable_storages:
-            can_extract_from = ['Lake']
-        else:
-            print(f"Warning: HYD_S cannot find 'Lake' in extractable storages: {all_extractable_storages}")
-    elif ppu_name == 'HYD_R':
-        # HYD_R specifically extracts from River
-        if 'River' in all_extractable_storages:
-            can_extract_from = ['River']
-        else:
-            print(f"Warning: HYD_R cannot find 'River' in extractable storages: {all_extractable_storages}")
-    elif all_extractable_storages:
-        # For all other PPUs, choose storage with fewest PPUs assigned
-        selected_extract_storage = select_storage_with_fewest_ppus(
-            all_extractable_storages, ppu_dictionary, raw_energy_storage or []
-        )
-        if selected_extract_storage:
-            can_extract_from = [selected_extract_storage]
-    
-    # Select SINGLE storage for input (choose one with fewest PPUs assigned)
     can_input_to = []
-    if all_inputable_storages:
-        selected_input_storage = select_storage_with_fewest_ppus(
-            all_inputable_storages, ppu_dictionary, raw_energy_storage or []
-        )
-        if selected_input_storage:
-            can_input_to = [selected_input_storage]
+    
+    if ppu_name in PPU_STORAGE_MAPPING:
+        mapping = PPU_STORAGE_MAPPING[ppu_name]
+        can_extract_from = mapping.get('extract_from', []).copy()
+        can_input_to = mapping.get('input_to', []).copy()
+    else:
+        # Fallback for PPUs not in mapping - assume no storage capabilities
+        print(f"Warning: PPU '{ppu_name}' not found in PPU_STORAGE_MAPPING. Assuming no storage capabilities.")
+        can_extract_from = []
+        can_input_to = []
     
     # For backward compatibility, determine available storages for storage assignment
     available_storages = can_extract_from.copy()  # PPUs can be assigned to storages they can extract from
@@ -782,24 +816,35 @@ def add_ppu_to_dictionary(
     # Determine PPU_Extract based on extraction and input capabilities
     ppu_extract = None
     
-    # Define incidence sources (uncontrollable energy sources)
-    incidence_sources = ['Solar', 'Wind', 'River', 'Lake', 'Wood']
+    # Define pure incidence sources (uncontrollable, non-storage energy sources)
+    # Note: 'River' and 'Lake' can be both incidence AND storage depending on PPU type
+    # - Solar, Wind: Pure incidence (no storage, uncontrollable)
+    # - River: Incidence for HYD_R (run-of-river), but storage-like for others
+    # - Lake: Storage for PHS (pumped hydro), incidence for HYD_S (regular hydro)
+    pure_incidence_sources = ['Solar', 'Wind', 'Wood']
     
-    # Check if PPU can extract from incidence sources
-    extracts_from_incidence = any(source in can_extract_from for source in incidence_sources)
+    # Check if PPU can extract from pure incidence sources
+    extracts_from_pure_incidence = any(source in can_extract_from for source in pure_incidence_sources)
     
-    # Check if PPU can extract from storage sources
-    extracts_from_storage = any(source not in incidence_sources for source in can_extract_from)
+    # Check if PPU is specifically HYD_S or HYD_R (incidence-based hydro)
+    is_incidence_hydro = ppu_name in ['HYD_S', 'HYD_R']
     
     # Check if PPU can input to storage sources
     inputs_to_storage = len(can_input_to) > 0
     
-    if extracts_from_incidence:
+    # Check if PPU can extract from controllable storage sources
+    extracts_from_controllable_storage = len(can_extract_from) > 0 and not extracts_from_pure_incidence and not is_incidence_hydro
+    
+    # Priority order for classification:
+    # 1. Incidence: Extracts from uncontrollable sources (solar, wind, river from HYD_R, lake from HYD_S)
+    # 2. Store: Can INPUT to storage (charge/store energy) - prioritize this over Flex
+    # 3. Flex: Can EXTRACT from controllable storage (discharge/produce energy)
+    if extracts_from_pure_incidence or is_incidence_hydro:
         ppu_extract = 'Incidence'  # Uncontrollable production from incidence sources
-    elif extracts_from_storage:
-        ppu_extract = 'Flex'  # Flexible production from storage sources
     elif inputs_to_storage:
-        ppu_extract = 'Store'  # Storage PPUs that can charge storage
+        ppu_extract = 'Store'  # Storage PPUs that can charge storage (prioritize over Flex)
+    elif extracts_from_controllable_storage:
+        ppu_extract = 'Flex'  # Flexible production from storage sources
     else:
         ppu_extract = 'Flex'  # Default fallback for production PPUs
     
@@ -858,11 +903,6 @@ def add_ppu_to_dictionary(
     
     # Add to dictionary
     updated_dictionary = pd.concat([ppu_dictionary, new_ppu], ignore_index=True)
-    
-    print(f"Added PPU '{ppu_name}' (ID: {new_id}, Category: {category}, Extract: {ppu_extract}, "
-          f"Extract From: {can_extract_from}, Input To: {can_input_to}, Efficiency: {efficiency:.4f}, Cost: {cost_per_kwh:.6f} CHF/kWh"
-          f"{f', Location Rank: {location_rank}' if not np.isnan(location_rank) else ''})")
-    
     return updated_dictionary
 
 

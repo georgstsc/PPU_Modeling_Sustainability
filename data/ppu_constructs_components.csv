@@ -17,6 +17,8 @@ BIO_WOOD,"['Wood', 'Pyrolysis', 'Biooil', 'Steam reforming', 'Combined cycle pow
 WD_OFF,"['Wind (offshore)', 'Inverter DC/AC', 'Battery', 'Converter AC/DC', 'Electricity', 'Grid']",Production,Incidence
 IMP_BIOG,"['Biogas (50% CH4)', 'Pipeline', 'Biogas purification', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
 NH3_P,"['Ammonia cracking', 'H2 Storage UG 200bar', 'Hydrogen Transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
+THERM_CH4,"['CH4 storage 200bar', 'Methane compression', 'Methane transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
+
 H2_G,"['Electrolyzer', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage,Store
 H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",,Store
 H2_L,"['Electrolyzer', 'Liquifaction', 'Liquid storage']",Storage,Store
@@ -26,4 +28,3 @@ NH3_FULL,"['Electrolyzer', 'N2 separation', 'N2,H2 compression', 'NH3 synthesis'
 SYN_CRACK,"['Electrolyzer', 'Palm oil', 'H2, CO2 compression', 'Cracking', 'Refining', 'Fuel Tank']",Storage,Store
 CH4_BIO,"['Electrolyzer', 'Biogas purification', 'Sabatier reaction', 'Methane compression', 'Biogas (50% CH4)']",Storage,Store
 PHS,"['Electricity', 'Hydro pump', 'Lake']",Storage,Store
-THERM_CH4,"['CH4 storage 200bar', 'Methane compression', 'Methane transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex

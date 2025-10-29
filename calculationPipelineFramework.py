@@ -6,6 +6,14 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy.interpolate import CubicSpline
+try:
+    from numba import njit  # type: ignore
+except Exception:
+    # Fallback no-op decorator if numba isn't available
+    def njit(*args, **kwargs):  # type: ignore
+        def wrapper(func):
+            return func
+        return wrapper
 
 # Import existing frameworks
 from calculationsCostFramework import (
@@ -22,6 +30,123 @@ from calculationsPpuFramework import (
     load_location_rankings,
     load_ppu_data
 )
+
+
+# ------------------------------------------------------------------
+# Ultra-fast solar production mapper (build once, reuse)
+# ------------------------------------------------------------------
+class SolarMapper:
+    """
+    Builds once: (lat, lon) -> closest column index, with 15-min irradiance matrix.
+    """
+    __slots__ = ("lats", "lons", "cols", "data", "rank_order")
+
+    def __init__(self, csv_path: str):
+        # The CSV is shaped like the provided solar_incidence_hourly_2024.csv
+        df = pd.read_csv(csv_path, header=None)
+        self.lats = df.iloc[0, 1:].astype(np.float32).values
+        self.lons = df.iloc[1, 1:].astype(np.float32).values
+        self.cols = np.arange(self.lats.size, dtype=np.int32)
+
+        # Extract hourly incidence and resample to 15-min
+        times = pd.to_datetime(df.iloc[3:, 0])
+        data_hourly = df.iloc[3:, 1:].astype(np.float32).values
+        data_15 = pd.DataFrame(data_hourly, index=times).resample("15min").interpolate().to_numpy()
+        self.data = np.asarray(data_15, dtype=np.float32)
+
+        # Precompute ranking order (highest mean irradiance first)
+        means = self.data.mean(axis=0)
+        self.rank_order = np.argsort(means)[::-1].astype(np.int32)
+
+    def closest_column(self, lat: float, lon: float) -> int:
+        # Manhattan distance in lat/lon grid (consistent with previous logic)
+        dist = np.abs(self.lats - lat) + np.abs(self.lons - lon)
+        return int(self.cols[np.argmin(dist)])
+
+    def col_for_rank(self, rank_1based: int) -> int:
+        # Cycle if rank exceeds number of locations
+        idx = (int(rank_1based) - 1) % self.rank_order.size
+        return int(self.rank_order[idx])
+
+    def irradiance(self, t_idx: int, col_idx: int) -> float:
+        return float(self.data[t_idx, col_idx])
+
+
+_SOLAR_MAPPER: Optional[SolarMapper] = None
+
+
+def _init_solar_mapper(csv_path: str = 'data/solar_incidence_hourly_2024.csv') -> None:
+    global _SOLAR_MAPPER
+    if _SOLAR_MAPPER is None:
+        try:
+            _SOLAR_MAPPER = SolarMapper(csv_path)
+        except Exception:
+            # Leave as None: fallback path will be used
+            _SOLAR_MAPPER = None
+
+
+@njit(cache=True)
+def _solar_prod_fast(irradiance: float, area_m2: float) -> float:
+    """Convert kWh/m²/hour -> MW for a 15-min slice."""
+    return irradiance * area_m2 * 0.25 / 1000.0
+
+
+# ------------------------------------------------------------------
+# Ultra-fast wind production mapper (build once, reuse)
+# ------------------------------------------------------------------
+class WindMapper:
+    __slots__ = ("lats", "lons", "cols", "data", "rank_order")
+
+    def __init__(self, csv_path: str):
+        # Expect multi-index header (lat, lon), datetime index
+        df = pd.read_csv(csv_path, header=[0, 1], index_col=0, parse_dates=True)
+        # Extract lat/lon from multi-index columns
+        self.lats = np.array([float(c[0]) for c in df.columns], dtype=np.float32)
+        self.lons = np.array([float(c[1]) for c in df.columns], dtype=np.float32)
+        self.cols = np.arange(self.lats.size, dtype=np.int32)
+        # Resample to 15-min and convert to numpy
+        data_15 = df.resample('15min').interpolate().to_numpy(dtype=np.float32)
+        self.data = np.asarray(data_15, dtype=np.float32)
+        # Precompute ranking by mean wind speed
+        means = self.data.mean(axis=0)
+        self.rank_order = np.argsort(means)[::-1].astype(np.int32)
+
+    def closest_column(self, lat: float, lon: float) -> int:
+        dist = np.abs(self.lats - lat) + np.abs(self.lons - lon)
+        return int(self.cols[np.argmin(dist)])
+
+    def col_for_rank(self, rank_1based: int) -> int:
+        idx = (int(rank_1based) - 1) % self.rank_order.size
+        return int(self.rank_order[idx])
+
+    def speed(self, t_idx: int, col_idx: int) -> float:
+        return float(self.data[int(t_idx), int(col_idx)])
+
+
+_WIND_MAPPER: Optional[WindMapper] = None
+
+
+def _init_wind_mapper(csv_path: str = 'data/wind_incidence_hourly_2024.csv') -> None:
+    global _WIND_MAPPER
+    if _WIND_MAPPER is None:
+        try:
+            _WIND_MAPPER = WindMapper(csv_path)
+        except Exception:
+            _WIND_MAPPER = None
+
+
+@njit(cache=True)
+def _wind_power_fast(wspd: float, num_turbines: int) -> float:
+    # Generic 120 m rotor, with cut-in/out limits
+    rotor_d = 120.0
+    rho = 1.225
+    A = np.pi * (rotor_d / 2.0) ** 2
+    cp = 0.45
+    # Apply cut-in/out
+    if wspd < 3.0 or wspd > 25.0:
+        return 0.0
+    power_W = 0.5 * rho * A * (wspd ** 3) * cp
+    return power_W * num_turbines / 1e6  # MW
 
 
 def load_energy_data(data_dir: str = "data") -> Tuple[pd.Series, pd.Series, pd.DataFrame]:
@@ -135,6 +260,9 @@ def calculate_solar_production(location_rank: int, area_m2: float, t: int,
     """
     Calculate solar production for a location at timestep t.
 
+    Fast path: use singleton SolarMapper + Numba for direct numpy lookup.
+    Fallback: original pandas-based nearest column search on solar_15min.
+
     Parameters:
         location_rank: Ranking position (1-based)
         area_m2: Solar panel area in square meters
@@ -145,29 +273,49 @@ def calculate_solar_production(location_rank: int, area_m2: float, t: int,
     Returns:
         Production in MW
     """
-    # Get location coordinates from ranking
-    loc = solar_ranking_df.iloc[location_rank - 1]
-    lat, lon = loc['latitude'], loc['longitude']
+    # Fast path using SolarMapper
+    _init_solar_mapper('data/solar_incidence_hourly_2024.csv')
+    if _SOLAR_MAPPER is not None:
+        try:
+            lat = lon = None
+            if len(solar_ranking_df) > 0:
+                location_idx = (location_rank - 1) % len(solar_ranking_df)
+                loc_row = solar_ranking_df.iloc[location_idx]
+                lat = float(loc_row['latitude'])
+                lon = float(loc_row['longitude'])
+            if lat is not None and lon is not None:
+                col_idx = _SOLAR_MAPPER.closest_column(lat, lon)
+            else:
+                col_idx = _SOLAR_MAPPER.col_for_rank(location_rank)
+            irr = _SOLAR_MAPPER.irradiance(int(t), int(col_idx))
+            return float(_solar_prod_fast(float(irr), float(area_m2)))
+        except Exception:
+            # Fall back to original path below
+            pass
 
-    # Find closest column in solar_15min
+    # Fallback: original implementation using provided solar_15min
+    num_locations = len(solar_ranking_df)
+    if num_locations == 0:
+        return 0.0
+    location_idx = (location_rank - 1) % num_locations
+    loc = solar_ranking_df.iloc[location_idx]
+    lat, lon = float(loc['latitude']), float(loc['longitude'])
+
     closest_col = None
     min_dist = float('inf')
     for col in solar_15min.columns:
-        dist = abs(col[0] - lat) + abs(col[1] - lon)
+        dist = abs(float(col[0]) - lat) + abs(float(col[1]) - lon)
         if dist < min_dist:
             min_dist = dist
             closest_col = col
 
-    # Get incidence (kWh/m²/hour)
     if closest_col is not None:
         incidence = solar_15min.iloc[t][closest_col]  # type: ignore
-        # Extract scalar value from pandas object
         incidence = incidence.item() if hasattr(incidence, 'item') else float(incidence)  # type: ignore
     else:
         incidence = 0.0
 
-    # Convert to MW for 15-min: (kWh/m²/hour) * area_m2 * (15min/60min) / 1000
-    production_MW = float(incidence) * area_m2 * 0.25 / 1000
+    production_MW = float(incidence) * float(area_m2) * 0.25 / 1000.0
     return production_MW
 
 
@@ -175,6 +323,9 @@ def calculate_wind_production(location_rank: int, num_turbines: int, t: int,
                              wind_15min: pd.DataFrame, wind_ranking_df: pd.DataFrame) -> float:
     """
     Calculate wind production for a location at timestep t.
+
+    Fast path: use singleton WindMapper + Numba power curve.
+    Fallback: original nearest-column lookup on wind_15min and physics formula.
 
     Parameters:
         location_rank: Ranking position (1-based)
@@ -186,40 +337,52 @@ def calculate_wind_production(location_rank: int, num_turbines: int, t: int,
     Returns:
         Production in MW
     """
-    # Get location coordinates from ranking
-    loc = wind_ranking_df.iloc[location_rank - 1]
-    lat, lon = loc['latitude'], loc['longitude']
+    # Fast path using WindMapper
+    _init_wind_mapper('data/wind_incidence_hourly_2024.csv')
+    if _WIND_MAPPER is not None:
+        try:
+            lat = lon = None
+            if len(wind_ranking_df) > 0:
+                location_idx = (location_rank - 1) % len(wind_ranking_df)
+                loc_row = wind_ranking_df.iloc[location_idx]
+                lat = float(loc_row['latitude'])
+                lon = float(loc_row['longitude'])
+            if lat is not None and lon is not None:
+                col_idx = _WIND_MAPPER.closest_column(lat, lon)
+            else:
+                col_idx = _WIND_MAPPER.col_for_rank(location_rank)
+            wspd = _WIND_MAPPER.speed(int(t), int(col_idx))
+            return float(_wind_power_fast(float(wspd), int(num_turbines)))
+        except Exception:
+            # Fall back to original path below
+            pass
 
-    # Find closest column in wind_15min using numpy for efficiency
+    # Fallback: original implementation using provided wind_15min
+    # Get location coordinates with bounds checking
+    num_locations = len(wind_ranking_df)
+    if num_locations == 0:
+        return 0.0
+    location_idx = (location_rank - 1) % num_locations
+    loc = wind_ranking_df.iloc[location_idx]
+    lat, lon = float(loc['latitude']), float(loc['longitude'])
+
+    wind_speed = 0.0
     if len(wind_15min.columns) > 0:
-        # Extract lat/lon from column tuples
         lats = np.array([float(col[0]) for col in wind_15min.columns])
         lons = np.array([float(col[1]) for col in wind_15min.columns])
-
-        # Calculate distances
         distances = np.abs(lats - lat) + np.abs(lons - lon)
-        closest_idx = np.argmin(distances)
-        closest_col = wind_15min.columns[closest_idx]
+        closest_idx = int(np.argmin(distances))
+        wind_speed = float(wind_15min.iloc[t, closest_idx])  # type: ignore
 
-        # Get wind speed (m/s)
-        wind_speed = wind_15min.iloc[t, closest_idx]
-        wind_speed = float(wind_speed)  # type: ignore
-    else:
-        wind_speed = 0.0
-
-    # Wind turbine parameters
-    rotor_diameter_m = 120
-    air_density = 1.225  # kg/m³
-    swept_area = np.pi * (rotor_diameter_m / 2) ** 2  # m²
-    power_coefficient = 0.45  # turbine efficiency
-
-    # Power per turbine: 0.5 * ρ * A * v³ * Cp
+    # Physics-based power with simple cut-in/out
+    rotor_diameter_m = 120.0
+    air_density = 1.225
+    swept_area = np.pi * (rotor_diameter_m / 2.0) ** 2
+    power_coefficient = 0.45
+    if wind_speed < 3.0 or wind_speed > 25.0:
+        return 0.0
     power_per_turbine_W = 0.5 * air_density * swept_area * (wind_speed ** 3) * power_coefficient
-    power_per_turbine_MW = power_per_turbine_W / 1e6
-
-    # Total production for all turbines
-    production_MW = power_per_turbine_MW * num_turbines
-    return production_MW
+    return (power_per_turbine_W / 1e6) * float(num_turbines)
 
 
 def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
@@ -253,6 +416,11 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     # Initialize technology tracking
     Technology_volume = initialize_technology_tracking(ppu_dictionary)
     phi_smoothed = 0.0
+    
+    # Track how often the system is in deficit (overflow>+epsilon), surplus (overflow<-epsilon), or balanced
+    overflow_count = 0
+    surplus_count = 0
+    balanced_count = 0
     for t in range(num_timesteps):
         if t % 5000 == 0:
             print(f"  Progress: {t:,}/{num_timesteps:,} ({t/num_timesteps*100:.1f}%)")
@@ -275,16 +443,24 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
         grid_energy = 0.0
         for incidence_item in raw_energy_incidence:
             if incidence_item['storage'] == 'Grid':
+                # Get current value directly (already updated in update_raw_energy_incidence)
                 grid_energy = incidence_item['current_value']
                 break
-
         # 4) Compute overflow = demand - energy in "Grid"
         overflow_MW = demand_MW - grid_energy
+        # print(f"The overflow is of : {overflow_MW} MW at timestep {t}")
+        # Count state occurrence for this timestep
+        if overflow_MW > hyperparams['epsilon']:
+            overflow_count += 1
+        elif overflow_MW < -hyperparams['epsilon']:
+            surplus_count += 1
+        else:
+            balanced_count += 1
 
-        # First compute the d_stor, u_dis, u_chg and c for each PPU
+        # First compute the d_stor, u_dis, u_chg and m for each PPU
         ppu_indices = calculate_ppu_indices(
             ppu_dictionary, raw_energy_storage, overflow_MW, phi_smoothed,
-            spot_price, hyperparams
+            spot_price, spot_15min, t, hyperparams
         )
 
         # Update EMA of shortfall for utility index
@@ -299,15 +475,25 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
                     'spot_sold': [],
                     'cost_indices': []
                 }
-            Technology_volume[ppu_name]['cost_indices'].append((t, indices['d_stor'], indices['u_dis'], indices['u_chg'], indices['c']))
-
+            Technology_volume[ppu_name]['cost_indices'].append((
+                t, 
+                indices['d_stor'], 
+                indices['u_dis'], 
+                indices['u_chg'], 
+                indices['m'],
+                indices['kappa_dis'],
+                indices['kappa_chg']
+            ))
+        if t % 5000 == 0:
+            print("[DEBUG] Storage state BEFORE handling:")
+            for storage in raw_energy_storage:
+                print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
         # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
         if overflow_MW > hyperparams['epsilon']:
             raw_energy_storage = handle_energy_deficit(
                 overflow_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
                 ppu_indices, spot_price, t, hyperparams
             )
-
         # 4.2) If overflow < 0: use 'Store' PPUs
         elif overflow_MW < -hyperparams['epsilon']:
             surplus_MW = abs(overflow_MW)
@@ -315,11 +501,24 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
                 surplus_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
                 ppu_indices, spot_price, t, hyperparams
             )
+        # DEBUG: Show storage state before handling
+        if t % 5000 == 0:
+            print("[DEBUG] Storage state AFTER handling:")
+            for storage in raw_energy_storage:
+                print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
 
-        # 5) The supply of energy should be satisfied (already handled above)
-        # 6) Return the volume transactions for the year (done at end of function)
+    # Attach pipeline state statistics for later reporting
+    Technology_volume['__pipeline_stats__'] = {
+        'overflow_count': overflow_count,
+        'surplus_count': surplus_count,
+        'balanced_count': balanced_count,
+        'total_timesteps': num_timesteps
+    }
 
     print(f"  ✓ Simulation complete: {num_timesteps:,} timesteps")
+    print(f"    - Overflow (deficit) steps: {overflow_count:,}")
+    print(f"    - Surplus steps:            {surplus_count:,}")
+    print(f"    - Balanced steps:           {balanced_count:,}")
     return Technology_volume, phi_smoothed
 
 
@@ -353,23 +552,30 @@ def compute_cost_breakdown(technology_volume: Dict[str, Dict], spot_15min: pd.Se
     }
 
     Cost_summary = {}
-    for tech_type in technology_volume:
+    for tech_type, metrics in technology_volume.items():
+        # Skip non-PPU entries (e.g., attached pipeline stats) or malformed entries
+        if isinstance(tech_type, str) and tech_type.startswith('__'):
+            continue
+        if not isinstance(metrics, dict):
+            continue
+        if 'production' not in metrics or 'spot_bought' not in metrics or 'spot_sold' not in metrics:
+            continue
         production_cost = 0.0
         spot_buy_cost = 0.0
         spot_sell_revenue = 0.0
 
         # Production cost
         cost_per_kwh = tech_costs.get(tech_type, 0.10)
-        for (t, vol_MW) in technology_volume[tech_type]['production']:
+        for (t, vol_MW) in metrics['production']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             production_cost += energy_MWh * cost_per_kwh * 1000  # Convert to kWh
 
         # Spot market transactions
-        for (t, vol_MW) in technology_volume[tech_type]['spot_bought']:
+        for (t, vol_MW) in metrics['spot_bought']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             spot_buy_cost += energy_MWh * spot_15min.iloc[t]
 
-        for (t, vol_MW) in technology_volume[tech_type]['spot_sold']:
+        for (t, vol_MW) in metrics['spot_sold']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             spot_sell_revenue += energy_MWh * spot_15min.iloc[t]
 
@@ -457,6 +663,20 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
             'ema_beta': 0.2,
             'horizons': ['1d', '3d', '7d', '30d']
         }
+    hyperparams.update({
+    'spot_unit': 'CHF_per_MWh',       # your spot is ~90–100 CHF/MWh
+    'ppu_cost_unit': 'CHF_per_KWh',   # your per-PPU 'cost' column is per kWh
+    'cost_column': 'cost',            # USE VARIABLE COST (not LCOE)
+    'use_efficiency': True,           # divide cost_in by efficiency to get cost_out
+    'beta_c': 0.12,                   # sensitivity in CHF/kWh (~120 CHF/MWh) to avoid pinning
+    'auto_beta_c': True,              # optional: auto-scale each step
+    'beta_c_pctl': 90,                # use 90th percentile |spread|
+    'beta_c_min': 0.03,               # clamp in CHF/kWh
+    'beta_c_max': 0.30,
+    'alpha_u': 5000.0,                # MW scale for utility to avoid u_dis/u_chg=1.0
+    'stor_deadband': 0.05,
+    'default_target_soc': 0.6
+    })
 
     print("\n[STEP 1] Loading data...")
 
@@ -498,11 +718,46 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
                 raw_energy_storage=raw_energy_storage,
                 raw_energy_incidence=raw_energy_incidence
             )
-
+    # Print entire PPU dictionnary 
     print(f"  ✓ Loaded demand: {len(demand_15min)} timesteps")
     print(f"  ✓ Loaded spot prices: {len(spot_15min)} timesteps")
     print(f"  ✓ Loaded solar/wind data: {len(solar_15min)}/{len(wind_15min)} timesteps")
     print(f"  ✓ Configured {len(ppu_dictionary)} PPUs from {len(ppu_types)} types")
+
+    # Print entire PPU dictionary with comprehensive details
+    print("\nPPU CONFIGURATION:")
+    print("=" * 120)
+    for each_ppu in ppu_dictionary.itertuples():
+        ppu_name = each_ppu.PPU_Name
+        ppu_type = getattr(each_ppu, 'Type', 'N/A')
+        classification = getattr(each_ppu, 'PPU_Extract', 'N/A')
+        
+        # Get storage-related information
+        can_extract = getattr(each_ppu, 'can_extract_from', [])
+        can_input = getattr(each_ppu, 'can_input_to', [])
+        
+        # Get efficiency and cost
+        efficiency = getattr(each_ppu, 'Chain_Efficiency', 'N/A')
+        cost_kwh = getattr(each_ppu, 'Cost_CHF_per_kWh', 'N/A')
+        
+        # Get location rank if applicable
+        location = getattr(each_ppu, 'Location_Rank', 'N/A')
+        
+        print(f"  {ppu_name:15} | Classification: {classification:10} | Type: {ppu_type:15}")
+        
+        if can_extract:
+            print(f"      → Extracts from: {', '.join(can_extract)}")
+        if can_input:
+            print(f"      → Inputs to: {', '.join(can_input)}")
+        
+        print(f"      → Efficiency: {efficiency if isinstance(efficiency, str) else f'{efficiency:.2%}'} | Cost: {cost_kwh if isinstance(cost_kwh, str) else f'{cost_kwh:.4f}'} CHF/kWh", end="")
+        
+        if location != 'N/A' and pd.notna(location):
+            print(f" | Location Rank: {int(location)}")
+        else:
+            print()
+        print()
+    print("=" * 120)
 
     print("\n[STEP 2] Running dispatch simulation...")
     technology_volume, phi_smoothed = run_dispatch_simulation(
@@ -523,6 +778,16 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
     print(f"  X-axis (Price Volatility): {portfolio_metrics['volatility_pct']:.2f}%")
     print(f"  Y-axis (Savings Margin): {portfolio_metrics['margin_pct']:.2f}%")
     print("=" * 80)
+    
+    # Print pipeline state counts if available
+    pipeline_stats = technology_volume.get('__pipeline_stats__', {})
+    if pipeline_stats:
+        print("PIPELINE STATE COUNTS")
+        print("-" * 80)
+        print(f"  Overflow (deficit) steps: {pipeline_stats.get('overflow_count', 0):,}")
+        print(f"  Surplus steps:            {pipeline_stats.get('surplus_count', 0):,}")
+        print(f"  Balanced steps:           {pipeline_stats.get('balanced_count', 0):,}")
+        print("=" * 80)
 
     # Compile complete results
     results = {
@@ -536,6 +801,7 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
         },
         'cost_summary': cost_summary,
         'technology_volume': technology_volume,
+        'pipeline_stats': technology_volume.get('__pipeline_stats__', {}),
         'hyperparams': hyperparams,
         'data_shapes': {
             'demand': len(demand_15min),
@@ -640,7 +906,6 @@ def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_vol
                 available_energy_wood = 0
             Technology_volume[ppu_name]['production'].append((t, extraction))
     
-
     total_energy = available_energy_river_track + available_energy_wood_track + available_energy_solar + available_energy_wind
     # in raw_energy_incidence get "Grid" and set current_value to total_energy
     for incidence_item in raw_energy_incidence:
@@ -692,9 +957,10 @@ def calculate_incidence_production(ppu_dictionary: pd.DataFrame, raw_energy_inci
 
 def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List[Dict],
                          overflow_MW: float, phi_smoothed: float, spot_price: float,
-                         hyperparams: Dict) -> Dict[str, Dict]:
+                         spot_15min: pd.Series, t: int, hyperparams: Dict) -> Dict[str, Dict]:
     """
-    Calculate d_stor, u_dis, u_chg and c indices for each PPU.
+    Calculate d_stor, u_dis, u_chg and m (monetary volatility-aware) indices for each PPU.
+    Uses RELATIVE VALUES throughout to avoid dimension issues and stuck costs.
 
     Parameters:
         ppu_dictionary: PPU configuration
@@ -702,13 +968,25 @@ def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List
         overflow_MW: Current overflow (demand - supply)
         phi_smoothed: Smoothed overflow
         spot_price: Current spot price
+        spot_15min: Full spot price time series
+        t: Current timestep
         hyperparams: Simulation hyperparameters
 
     Returns:
-        Dictionary mapping PPU names to their indices
+        Dictionary mapping PPU names to their indices and costs
     """
     ppu_indices = {}
-
+    
+    # Get hyperparameters
+    alpha_u = hyperparams.get('alpha_u', 5000.0)
+    alpha_m = hyperparams.get('alpha_m', 5.0)
+    deadband = hyperparams.get('stor_deadband', 0.05)
+    
+    # Define horizons in number of timesteps (15-min intervals)
+    # 1d=96, 3d=288, 7d=672, 30d=2880
+    horizon_steps = {'1d': 96, '3d': 288, '7d': 672, '30d': 2880}
+    horizons_30d = ['1d', '3d', '7d', '30d']
+    
     for _, ppu_row in ppu_dictionary.iterrows():
         ppu_name = str(ppu_row['PPU_Name'])
         ppu_category = str(ppu_row['PPU_Category'])
@@ -717,9 +995,10 @@ def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List
         d_stor = 0.0
         u_dis = 0.0
         u_chg = 0.0
-        c_idx = 0.0
+        m_idx = 0.0
 
-        # Calculate disposition index for storage PPUs
+        # ===== 1. Calculate disposition index (d_stor) for storage PPUs =====
+        # Use RELATIVE values: normalize by deadband and max excursion
         if ppu_category == 'Storage':
             # Get storage name from can_extract_from
             can_extract_from = ppu_row.get('can_extract_from', [])
@@ -728,36 +1007,109 @@ def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List
                 storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
 
                 if storage_item:
-                    current_soc = storage_item['current_value'] / storage_item['value']
+                    current_value = storage_item['current_value']
+                    max_value = storage_item['value']
+                    current_soc = current_value / max_value
                     target_soc = storage_item.get('target_SoC', 0.6)
-                    deadband = 0.05
 
-                    # Calculate disposition index
-                    if current_soc > target_soc + deadband:
-                        d_stor = min((current_soc - (target_soc + deadband)) / (1 - target_soc - deadband), 1.0)
-                    elif current_soc < target_soc - deadband:
-                        d_stor = max((current_soc - (target_soc - deadband)) / (target_soc - deadband), -1.0)
-                    else:
-                        d_stor = 0.0
+                    # Calculate RELATIVE deviation from target (normalized by deadband)
+                    soc_deviation = (current_soc - target_soc) / deadband
+                    
+                    # Apply tanh to keep in [-1, 1] range
+                    d_stor = np.tanh(soc_deviation)
 
-        # Calculate utility indices based on overflow
-        if overflow_MW > 0:
-            u_dis = min(overflow_MW / hyperparams.get('alpha_u', 1000.0), 1.0)
+        # ===== 2. Calculate utility indices (u_dis, u_chg) =====
+        # Use RELATIVE values: normalize overflow by system scale
+        if phi_smoothed != 0:
+            # Relative overflow: normalize by alpha_u (system scale)
+            relative_overflow = phi_smoothed / alpha_u
+            
+            # Apply tanh for smooth [-1, 1] range
+            u_dis = np.tanh(relative_overflow)
+            
+            # Charge utility only non-zero during surplus (negative overflow)
+            if phi_smoothed < 0:
+                u_chg = np.tanh(abs(relative_overflow))
+            else:
+                u_chg = 0.0
         else:
-            u_chg = min(abs(overflow_MW) / hyperparams.get('alpha_u', 1000.0), 1.0)
+            # No overflow - neutral utility
+            u_dis = 0.0
+            u_chg = 0.0
 
-        # Calculate cost index (simplified)
-        ppu_cost = ppu_row.get('Cost_CHF_per_kWh', 0.1)
-        c_idx = (spot_price - ppu_cost) / max(ppu_cost, 0.01)
-        c_idx = max(min(c_idx, 1.0), -1.0)  # Clamp to [-1, 1]
+        # ===== 3. Calculate monetary volatility-aware index (m) =====
+        # Use RELATIVE values throughout monetary calculation
+        if ppu_category == 'Storage':
+            ppu_cost_per_kWh = ppu_row.get('Cost_CHF_per_kWh', 0.1)
+            ppu_cost_per_MWh = ppu_cost_per_kWh * 1000.0  # Convert to CHF/MWh
+            efficiency = ppu_row.get('Efficiency', 1.0)
+            
+            # Compute RELATIVE future prices (normalized by current price)
+            future_prices_relative = {}
+            for horizon_name, steps in horizon_steps.items():
+                future_idx = min(t + steps, len(spot_15min) - 1)
+                future_window = spot_15min.iloc[t:min(t + steps, len(spot_15min))]
+                if len(future_window) > 0:
+                    future_price_avg = future_window.mean()
+                    # RELATIVE price: (future - current) / current
+                    future_prices_relative[horizon_name] = (future_price_avg - spot_price) / max(spot_price, 0.01)
+                else:
+                    future_prices_relative[horizon_name] = 0.0
+            
+            # Approximate RELATIVE co-state values
+            spreads_relative = []
+            for horizon_name in horizons_30d:
+                # Co-state relative to current price
+                lambda_relative = (efficiency * spot_15min.iloc[min(t + horizon_steps[horizon_name], len(spot_15min) - 1)] - spot_price) / max(spot_price, 0.01)
+                spread_relative = (spot_price - efficiency * spot_15min.iloc[min(t + horizon_steps[horizon_name], len(spot_15min) - 1)]) / max(spot_price, 0.01)
+                spreads_relative.append(spread_relative)
+            
+            # Average RELATIVE spread across horizons
+            S_relative = np.mean(spreads_relative)
+            
+            # RELATIVE volatility impact
+            future_price_values = [future_prices_relative[h] for h in horizons_30d]
+            price_variance_relative = np.var(future_price_values) if len(future_price_values) > 1 else 0.0
+            
+            # Normalize RELATIVE variance by volatility scale
+            volatility_scale = hyperparams.get('volatility_scale', 30.0)
+            V_relative = price_variance_relative / (volatility_scale ** 2) if volatility_scale > 0 else 0.0
+            
+            # Combine RELATIVE spread and volatility
+            weight_spread = hyperparams.get('weight_spread', 1.0)
+            weight_volatility = hyperparams.get('weight_volatility', 1.0)
+            X_relative = weight_spread * S_relative - weight_volatility * V_relative
+            
+            # Squash RELATIVE score to [-1, 1]
+            m_idx = np.tanh(X_relative / alpha_m)
+        else:
+            # Non-storage PPUs: neutral monetary index
+            m_idx = 0.0
 
+        # ===== 4. Calculate composite benefits and costs =====
+        # All components now use RELATIVE values in [-1, 1] range
+        
+        # Discharge benefit: B_dis = (d_stor + u_dis + m) / 3
+        B_dis = (d_stor + u_dis + m_idx) / 3.0
+        
+        # Charge benefit: B_chg = (-d_stor + u_chg + (-m)) / 3
+        B_chg = (-d_stor + u_chg - m_idx) / 3.0
+        
+        # Convert benefits to costs (lower is better)
+        kappa_dis = 1.0 - B_dis  # Range: [0, 2]
+        kappa_chg = 1.0 - B_chg  # Range: [0, 2]
+        
         ppu_indices[ppu_name] = {
             'd_stor': d_stor,
             'u_dis': u_dis,
             'u_chg': u_chg,
-            'c': c_idx
+            'm': m_idx,
+            'B_dis': B_dis,
+            'B_chg': B_chg,
+            'kappa_dis': kappa_dis,
+            'kappa_chg': kappa_chg
         }
-
+    
     return ppu_indices
 
 
@@ -781,6 +1133,7 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
     Returns:
         Updated raw_energy_storage
     """
+    
     # Find Flex PPUs
     flex_ppus = []
     for _, ppu_row in ppu_dictionary.iterrows():
@@ -789,80 +1142,93 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
 
     if not flex_ppus:
         print(f"Why are there no PPU left to produce energy?")
-        # No Flex PPUs available, buy from spot market
+        # No Flex PPUs available, buy from spot market - but doesn't seem to be the case 
         tech_count = len(Technology_volume)
         spot_buy_per_tech = deficit_MW / tech_count
         for tech_type in Technology_volume:
             Technology_volume[tech_type]['spot_bought'].append((t, spot_buy_per_tech))
         return raw_energy_storage
 
-    # Calculate discharge costs and priorities
-    discharge_costs = []
-    total_inverse_cost = 0.0
+    # Calculate discharge benefits and priorities
+    discharge_benefits = []
+    B_dis_total = 0.0
 
     for ppu_row in flex_ppus:
         ppu_name = str(ppu_row['PPU_Name'])
-        indices = ppu_indices.get(ppu_name, {'d_stor': 0, 'u_dis': 0, 'u_chg': 0, 'c': 0})
-
-        # Calculate composite discharge benefit/cost
-        B_dis = (indices['d_stor'] + indices['u_dis'] + indices['c']) / 3.0
-        kappa_dis = 1.0 - B_dis
-
-        discharge_costs.append({
+        indices = ppu_indices.get(ppu_name, {
+            'd_stor': 0, 'u_dis': 0, 'u_chg': 0, 'm': 0, 
+            'B_dis': 0.0, 'B_chg': 0.0,
+            'kappa_dis': 1.0, 'kappa_chg': 1.0
+        })
+        
+        # Use pre-calculated discharge benefit from calculate_ppu_indices
+        # IMPORTANT: Only use POSITIVE discharge benefits (PPUs that want to discharge)
+        B_dis = max(0.0, indices['B_dis'])
+        
+        discharge_benefits.append({
             'ppu_name': ppu_name,
-            'kappa_dis': kappa_dis,
+            'B_dis': B_dis,
             'ppu_row': ppu_row
         })
 
-        total_inverse_cost += 1.0 / max(kappa_dis, hyperparams['epsilon'])
+        B_dis_total += B_dis
 
-    # Allocate deficit inversely to cost
-    deficit_handled = 0.0
-
-    for cost_info in discharge_costs:
-        ppu_name = cost_info['ppu_name']
-        kappa_dis = cost_info['kappa_dis']
-        ppu_row = cost_info['ppu_row']
-
-        # Calculate allocation
-        weight = (1.0 / max(kappa_dis, hyperparams['epsilon'])) / total_inverse_cost
-        target_discharge_MW = deficit_MW * weight
-
-        # Check available energy from linked storages
-        can_extract_from = ppu_row.get('can_extract_from', [])
-        available_energy_MW = 0.0
-
-        for storage_name in can_extract_from:
-            storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-            if storage_item:
-                available_energy_MW += storage_item['current_value']
-
-        # Limit by available energy and 1 GW PPU capacity
-        actual_discharge_MW = min(target_discharge_MW, available_energy_MW, 1000)
-
-        if actual_discharge_MW > 0:
-            # Distribute discharge across storages proportionally
-            total_available = available_energy_MW
-            if total_available > 0:
-                for storage_name in can_extract_from:
-                    storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-                    if storage_item and storage_item['current_value'] > 0:
-                        storage_fraction = storage_item['current_value'] / total_available
-                        storage_discharge = actual_discharge_MW * storage_fraction
-                        storage_item['current_value'] -= storage_discharge
-                        storage_item['history'].append((t, -storage_discharge))  # Negative for discharge
-
-            # Record production
-            Technology_volume[ppu_name]['production'].append((t, actual_discharge_MW))
-            deficit_handled += actual_discharge_MW
-
-    # Handle remaining deficit with spot market
-    remaining_deficit = deficit_MW - deficit_handled
-    if remaining_deficit > hyperparams['epsilon']:
-        tech_count = len(Technology_volume)
-        spot_buy_per_tech = remaining_deficit / tech_count
-        for tech_type in Technology_volume:
-            Technology_volume[tech_type]['spot_bought'].append((t, spot_buy_per_tech))
+    for each_flex_ppu in discharge_benefits:
+        allocation = each_flex_ppu['B_dis'] / max(B_dis_total, hyperparams['epsilon'])
+        efficiency = each_flex_ppu['ppu_row'].get('Chain_Efficiency', 1.0)
+        target_discharge_MW = deficit_MW * allocation / efficiency  # Divide by efficiency for extraction
+        spot_buy = 0.0
+        
+        # Find available capacity in storage linked to each_flex_ppu 
+        can_extract_from = each_flex_ppu['ppu_row'].get('can_extract_from', [])
+        
+        # Find capacity stored in can_extract_from storages
+        available_capacity_MW = sum(
+            storage_item['current_value'] 
+            for storage_item in raw_energy_storage 
+            if storage_item['storage'] in can_extract_from
+        )
+        # Limit by the smallest: 1 GW PPU capacity, available storage, and target
+        actual_discharge_MW = min(target_discharge_MW, available_capacity_MW, 1000 / efficiency)
+        
+        if actual_discharge_MW == target_discharge_MW:
+            for storage_name in can_extract_from:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item and storage_item['current_value'] > 0:
+                    # Calculate proportion of this storage's available capacity
+                    if available_capacity_MW > 0:
+                        fraction = storage_item['current_value'] / available_capacity_MW
+                        discharge_amount = actual_discharge_MW * fraction
+                        old_value = storage_item['current_value']
+                        storage_item['current_value'] -= discharge_amount
+                        storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
+                        
+        elif actual_discharge_MW == available_capacity_MW:
+            # Storage capacity is the limiting factor - empty storage completely, buy rest
+            spot_buy = target_discharge_MW - actual_discharge_MW
+            for storage_name in can_extract_from:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item:
+                    discharged = storage_item['current_value']
+                    storage_item['current_value'] = 0
+                    storage_item['history'].append((t, -discharged))  # Negative for discharge
+                    
+        else:
+            # PPU capacity is the limiting factor - partial discharge
+            spot_buy = target_discharge_MW - actual_discharge_MW
+            for storage_name in can_extract_from:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item and storage_item['current_value'] > 0:
+                    if available_capacity_MW > 0:
+                        fraction = storage_item['current_value'] / available_capacity_MW
+                        discharge_amount = actual_discharge_MW * fraction
+                        storage_item['current_value'] -= discharge_amount
+                        storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
+        
+        # Record production
+        Technology_volume[each_flex_ppu['ppu_name']]['production'].append((t, actual_discharge_MW))
+        # Record spot market buy if needed
+        Technology_volume[each_flex_ppu['ppu_name']]['spot_bought'].append((t, spot_buy))
 
     return raw_energy_storage
 
@@ -873,6 +1239,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
                         hyperparams: Dict) -> List[Dict]:
     """
     Handle energy surplus using 'Store' PPUs that store in raw_energy_storage.
+    Takes energy from grid and pushes it into storage systems.
 
     Parameters:
         surplus_MW: Energy surplus to store
@@ -887,6 +1254,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
     Returns:
         Updated raw_energy_storage
     """
+    
     # Find Store PPUs
     store_ppus = []
     for _, ppu_row in ppu_dictionary.iterrows():
@@ -894,7 +1262,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
             store_ppus.append(ppu_row)
 
     if not store_ppus:
-        print(f"Why are there no PPU left to store energy?")
+        print(f"Warning: No Store PPUs available at t={t}")
         # No Store PPUs available, sell to spot market
         tech_count = len(Technology_volume)
         spot_sell_per_tech = surplus_MW / tech_count
@@ -902,75 +1270,101 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
             Technology_volume[tech_type]['spot_sold'].append((t, spot_sell_per_tech))
         return raw_energy_storage
 
-    # Calculate storage costs and priorities
-    storage_costs = []
-    total_inverse_cost = 0.0
+    # Calculate charge benefits and priorities
+    charge_benefits = []
+    B_chg_total = 0.0
 
     for ppu_row in store_ppus:
         ppu_name = str(ppu_row['PPU_Name'])
-        indices = ppu_indices.get(ppu_name, {'d_stor': 0, 'u_dis': 0, 'u_chg': 0, 'c': 0})
-
-        # Calculate composite storage benefit/cost (flip disposition and monetary terms)
-        B_chg = (-indices['d_stor'] + indices['u_chg'] - indices['c']) / 3.0
-        kappa_chg = 1.0 - B_chg
-
-        storage_costs.append({
+        indices = ppu_indices.get(ppu_name, {
+            'd_stor': 0, 'u_dis': 0, 'u_chg': 0, 'm': 0, 
+            'B_dis': 0.0, 'B_chg': 0.0,
+            'kappa_dis': 1.0, 'kappa_chg': 1.0
+        })
+        
+        # Use pre-calculated charge benefit from calculate_ppu_indices
+        # IMPORTANT: Only use POSITIVE charge benefits (PPUs that want to charge)
+        B_chg = max(0.0, indices['B_chg'])
+        
+        charge_benefits.append({
             'ppu_name': ppu_name,
-            'kappa_chg': kappa_chg,
+            'B_chg': B_chg,
             'ppu_row': ppu_row
         })
 
-        total_inverse_cost += 1.0 / max(kappa_chg, hyperparams['epsilon'])
+        B_chg_total += B_chg
 
-    # Allocate surplus inversely to cost
-    surplus_handled = 0.0
+    # Handle case where all benefits are 0 (equal allocation)
+    if B_chg_total == 0:
+        weight_per_ppu = 1.0 / len(charge_benefits)
+        for benefit_info in charge_benefits:
+            benefit_info['weight'] = weight_per_ppu
+    else:
+        # Proportional allocation based on benefits
+        for benefit_info in charge_benefits:
+            benefit_info['weight'] = benefit_info['B_chg'] / B_chg_total
 
-    for cost_info in storage_costs:
-        ppu_name = cost_info['ppu_name']
-        kappa_chg = cost_info['kappa_chg']
-        ppu_row = cost_info['ppu_row']
+    for each_store_ppu in charge_benefits:
+        allocation = each_store_ppu['B_chg'] / max(B_chg_total, hyperparams['epsilon'])
+        efficiency = each_store_ppu['ppu_row'].get('Chain_Efficiency', 1.0)
+        target_charge_MW = surplus_MW * allocation * efficiency  # Apply efficiency for charging
+        spot_sell = 0.0
+        
+        # Find available capacity in storage linked to each_store_ppu 
+        can_input_to = each_store_ppu['ppu_row'].get('can_input_to', [])
+        
+        # Find remaining capacity in can_input_to storages
+        available_capacity_MW = sum(
+            storage_item['value'] - storage_item['current_value']
+            for storage_item in raw_energy_storage 
+            if storage_item['storage'] in can_input_to
+        )
+        
+        # Limit by the smallest: 1 GW PPU capacity, available storage capacity, and target charge
+        actual_charge_MW = min(target_charge_MW, available_capacity_MW, 1000 * efficiency)
 
-        # Calculate allocation
-        weight = (1.0 / max(kappa_chg, hyperparams['epsilon'])) / total_inverse_cost
-        target_charge_MW = surplus_MW * weight
-
-        # Check available capacity in linked storages
-        can_input_to = ppu_row.get('can_input_to', [])
-        available_capacity_MW = 0.0
-
-        for storage_name in can_input_to:
-            storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-            if storage_item:
-                available_capacity_MW += storage_item['value'] - storage_item['current_value']
-
-        # Limit by available capacity and 1 GW PPU capacity
-        actual_charge_MW = min(target_charge_MW, available_capacity_MW, 1000)
-
-        if actual_charge_MW > 0:
-            # Distribute charge across storages proportionally
-            total_available = available_capacity_MW
-            if total_available > 0:
-                for storage_name in can_input_to:
-                    storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-                    if storage_item:
-                        storage_capacity = storage_item['value'] - storage_item['current_value']
-                        if storage_capacity > 0:
-                            storage_fraction = storage_capacity / total_available
-                            storage_charge = actual_charge_MW * storage_fraction
-                            storage_item['current_value'] += storage_charge
-                            storage_item['history'].append((t, storage_charge))  # Positive for charge
-
-            # Record consumption (negative production for storage)
-            Technology_volume[ppu_name]['production'].append((t, -actual_charge_MW))
-            surplus_handled += actual_charge_MW
-
-    # Handle remaining surplus with spot market
-    remaining_surplus = surplus_MW - surplus_handled
-    if remaining_surplus > hyperparams['epsilon']:
-        tech_count = len(Technology_volume)
-        spot_sell_per_tech = remaining_surplus / tech_count
-        for tech_type in Technology_volume:
-            Technology_volume[tech_type]['spot_sold'].append((t, spot_sell_per_tech))
+        if actual_charge_MW == target_charge_MW:
+            # Can charge exactly what we want - update storage proportionally
+            new_available = available_capacity_MW - actual_charge_MW
+            for storage_name in can_input_to:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item:
+                    # Calculate proportion of this storage's available capacity
+                    storage_available = storage_item['value'] - storage_item['current_value']
+                    if available_capacity_MW > 0:
+                        fraction = storage_available / available_capacity_MW
+                        charge_amount = actual_charge_MW * fraction
+                        old_value = storage_item['current_value']
+                        storage_item['current_value'] += charge_amount
+                        storage_item['history'].append((t, charge_amount))  # Positive for charge
+                        
+        elif actual_charge_MW == available_capacity_MW:
+            # Storage capacity is the limiting factor - fill storage completely
+            spot_sell = target_charge_MW - actual_charge_MW
+            for storage_name in can_input_to:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item:
+                    storage_available = storage_item['value'] - storage_item['current_value']
+                    storage_item['current_value'] = storage_item['value']  # Fill to max
+                    storage_item['history'].append((t, storage_available))  # Positive for charge
+                    
+        else:
+            # PPU capacity is the limiting factor - partial charge
+            spot_sell = target_charge_MW - actual_charge_MW
+            for storage_name in can_input_to:
+                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
+                if storage_item:
+                    storage_available = storage_item['value'] - storage_item['current_value']
+                    if available_capacity_MW > 0:
+                        fraction = storage_available / available_capacity_MW
+                        charge_amount = actual_charge_MW * fraction
+                        storage_item['current_value'] += charge_amount
+                        storage_item['history'].append((t, charge_amount))  # Positive for charge
+        
+        # Record consumption (negative production for storage charging)
+        Technology_volume[each_store_ppu['ppu_name']]['production'].append((t, -actual_charge_MW))
+        # Record spot market sell if needed
+        Technology_volume[each_store_ppu['ppu_name']]['spot_sold'].append((t, spot_sell))
 
     return raw_energy_storage
 
