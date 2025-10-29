@@ -7,13 +7,17 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy.interpolate import CubicSpline
 try:
-    from numba import njit  # type: ignore
+    from numba import njit, prange  # type: ignore
+    NUMBA_AVAILABLE = True
 except Exception:
+    NUMBA_AVAILABLE = False
     # Fallback no-op decorator if numba isn't available
     def njit(*args, **kwargs):  # type: ignore
         def wrapper(func):
             return func
         return wrapper
+    def prange(*args, **kwargs):  # type: ignore
+        return range(*args, **kwargs)
 
 # Import existing frameworks
 from calculationsCostFramework import (
@@ -71,6 +75,23 @@ class SolarMapper:
     def irradiance(self, t_idx: int, col_idx: int) -> float:
         return float(self.data[t_idx, col_idx])
 
+    def precompute_productions(self, ranks: np.ndarray, areas: np.ndarray, num_timesteps: int) -> np.ndarray:
+        """
+        Precompute productions for all ranks and timesteps.
+        Args:
+            ranks: 1D array of 1-based location ranks
+            areas: 1D array of total areas (m²) for each rank
+            num_timesteps: Number of timesteps to compute
+        Returns:
+            (num_timesteps, len(ranks)) array of MW productions
+        """
+        # Map ranks to column indices
+        col_idxs = np.array([self.col_for_rank(int(r)) for r in ranks], dtype=np.int32)
+        # Extract irradiance matrix slice
+        irr_matrix = self.data[:num_timesteps, col_idxs]
+        # Batch compute productions
+        return _solar_prod_batch(irr_matrix, areas)
+
 
 _SOLAR_MAPPER: Optional[SolarMapper] = None
 
@@ -89,6 +110,24 @@ def _init_solar_mapper(csv_path: str = 'data/solar_incidence_hourly_2024.csv') -
 def _solar_prod_fast(irradiance: float, area_m2: float) -> float:
     """Convert kWh/m²/hour -> MW for a 15-min slice."""
     return irradiance * area_m2 * 0.25 / 1000.0
+
+
+@njit(parallel=NUMBA_AVAILABLE, cache=True)
+def _solar_prod_batch(irr_matrix: np.ndarray, areas: np.ndarray) -> np.ndarray:
+    """
+    Vectorized batch solar production calculation.
+    Args:
+        irr_matrix: (num_timesteps, num_ranks) irradiance values
+        areas: (num_ranks,) area in m² for each rank
+    Returns:
+        (num_timesteps, num_ranks) production in MW
+    """
+    nt, nr = irr_matrix.shape
+    prods = np.zeros((nt, nr), dtype=np.float32)
+    for t in prange(nt):
+        for r in range(nr):
+            prods[t, r] = irr_matrix[t, r] * areas[r] * 0.25 / 1000.0
+    return prods
 
 
 # ------------------------------------------------------------------
@@ -122,6 +161,23 @@ class WindMapper:
     def speed(self, t_idx: int, col_idx: int) -> float:
         return float(self.data[int(t_idx), int(col_idx)])
 
+    def precompute_productions(self, ranks: np.ndarray, num_turbines: np.ndarray, num_timesteps: int) -> np.ndarray:
+        """
+        Precompute productions for all ranks and timesteps.
+        Args:
+            ranks: 1D array of 1-based location ranks
+            num_turbines: 1D array of total turbine counts for each rank
+            num_timesteps: Number of timesteps to compute
+        Returns:
+            (num_timesteps, len(ranks)) array of MW productions
+        """
+        # Map ranks to column indices
+        col_idxs = np.array([self.col_for_rank(int(r)) for r in ranks], dtype=np.int32)
+        # Extract wind speed matrix slice
+        wspd_matrix = self.data[:num_timesteps, col_idxs]
+        # Batch compute productions
+        return _wind_power_batch(wspd_matrix, num_turbines)
+
 
 _WIND_MAPPER: Optional[WindMapper] = None
 
@@ -147,6 +203,34 @@ def _wind_power_fast(wspd: float, num_turbines: int) -> float:
         return 0.0
     power_W = 0.5 * rho * A * (wspd ** 3) * cp
     return power_W * num_turbines / 1e6  # MW
+
+
+@njit(parallel=NUMBA_AVAILABLE, cache=True)
+def _wind_power_batch(wspd_matrix: np.ndarray, num_turbines: np.ndarray) -> np.ndarray:
+    """
+    Vectorized batch wind production calculation.
+    Args:
+        wspd_matrix: (num_timesteps, num_ranks) wind speeds
+        num_turbines: (num_ranks,) turbine count for each rank
+    Returns:
+        (num_timesteps, num_ranks) production in MW
+    """
+    nt, nr = wspd_matrix.shape
+    prods = np.zeros((nt, nr), dtype=np.float32)
+    rotor_d = 120.0
+    rho = 1.225
+    A = np.pi * (rotor_d / 2.0) ** 2
+    cp = 0.45
+    
+    for t in prange(nt):
+        for r in range(nr):
+            wspd = wspd_matrix[t, r]
+            if wspd < 3.0 or wspd > 25.0:
+                prods[t, r] = 0.0
+            else:
+                power_W = 0.5 * rho * A * (wspd ** 3) * cp
+                prods[t, r] = power_W * num_turbines[r] / 1e6
+    return prods
 
 
 def load_energy_data(data_dir: str = "data") -> Tuple[pd.Series, pd.Series, pd.DataFrame]:
@@ -253,6 +337,108 @@ def initialize_technology_tracking(ppu_dictionary: pd.DataFrame) -> Dict[str, Di
             }
 
     return Technology_volume
+
+
+def precompute_renewable_productions(ppu_dictionary: pd.DataFrame, num_timesteps: int,
+                                     solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame) -> Dict:
+    """
+    Precompute all renewable productions by grouping PPUs by rank.
+    
+    Args:
+        ppu_dictionary: PPU configuration
+        num_timesteps: Number of timesteps to precompute
+        solar_ranking_df: Solar location rankings
+        wind_ranking_df: Wind location rankings
+    
+    Returns:
+        Dictionary with:
+            'solar_prod_matrix': (num_timesteps, num_solar_ranks) or None
+            'wind_prod_matrix': (num_timesteps, num_wind_ranks) or None
+            'solar_rank_to_ppus': {rank: [(ppu_name, area_fraction), ...]}
+            'wind_rank_to_ppus': {rank: [(ppu_name, turbine_fraction), ...]}
+            'solar_ranks': sorted array of ranks
+            'wind_ranks': sorted array of ranks
+    """
+    # Group solar PPUs by rank
+    solar_groups = {}  # rank: total_area
+    solar_ppu_map = {}  # rank: [(ppu_name, area), ...]
+    
+    wind_groups = {}  # rank: total_turbines
+    wind_ppu_map = {}  # rank: [(ppu_name, num_turbines), ...]
+    
+    for idx, row in ppu_dictionary.iterrows():
+        can_extract_from = row.get("can_extract_from", [])
+        ppu_name = row['PPU_Name']
+        location_rank = row.get('Location_Rank', np.nan)
+        
+        if pd.notna(location_rank):
+            rank = int(location_rank)
+            
+            if 'Solar' in can_extract_from:
+                area_m2 = 100000  # Default area (could be from config)
+                solar_groups[rank] = solar_groups.get(rank, 0.0) + area_m2
+                if rank not in solar_ppu_map:
+                    solar_ppu_map[rank] = []
+                solar_ppu_map[rank].append((ppu_name, area_m2))
+                
+            elif 'Wind' in can_extract_from:
+                num_turbines = 5  # Default (could be from config)
+                wind_groups[rank] = wind_groups.get(rank, 0.0) + num_turbines
+                if rank not in wind_ppu_map:
+                    wind_ppu_map[rank] = []
+                wind_ppu_map[rank].append((ppu_name, num_turbines))
+    
+    # Convert to fraction maps for distribution
+    solar_rank_to_ppus = {}
+    for rank, ppus in solar_ppu_map.items():
+        total = solar_groups[rank]
+        solar_rank_to_ppus[rank] = [(name, area/total) for name, area in ppus]
+    
+    wind_rank_to_ppus = {}
+    for rank, ppus in wind_ppu_map.items():
+        total = wind_groups[rank]
+        wind_rank_to_ppus[rank] = [(name, turb/total) for name, turb in ppus]
+    
+    result = {
+        'solar_prod_matrix': None,
+        'wind_prod_matrix': None,
+        'solar_rank_to_ppus': solar_rank_to_ppus,
+        'wind_rank_to_ppus': wind_rank_to_ppus,
+        'solar_ranks': np.array([]),
+        'wind_ranks': np.array([])
+    }
+    
+    # Precompute solar productions
+    if solar_groups:
+        _init_solar_mapper('data/solar_incidence_hourly_2024.csv')
+        if _SOLAR_MAPPER is not None:
+            try:
+                solar_ranks = np.array(sorted(solar_groups.keys()), dtype=np.int32)
+                solar_areas = np.array([solar_groups[r] for r in solar_ranks], dtype=np.float32)
+                result['solar_prod_matrix'] = _SOLAR_MAPPER.precompute_productions(
+                    solar_ranks, solar_areas, num_timesteps
+                )
+                result['solar_ranks'] = solar_ranks
+                print(f"  Precomputed solar productions: {len(solar_ranks)} ranks, {num_timesteps} timesteps")
+            except Exception as e:
+                print(f"  Solar precomputation failed: {e}, will use fallback")
+    
+    # Precompute wind productions
+    if wind_groups:
+        _init_wind_mapper('data/wind_incidence_hourly_2024.csv')
+        if _WIND_MAPPER is not None:
+            try:
+                wind_ranks = np.array(sorted(wind_groups.keys()), dtype=np.int32)
+                wind_nums = np.array([wind_groups[r] for r in wind_ranks], dtype=np.float32)
+                result['wind_prod_matrix'] = _WIND_MAPPER.precompute_productions(
+                    wind_ranks, wind_nums, num_timesteps
+                )
+                result['wind_ranks'] = wind_ranks
+                print(f"  Precomputed wind productions: {len(wind_ranks)} ranks, {num_timesteps} timesteps")
+            except Exception as e:
+                print(f"  Wind precomputation failed: {e}, will use fallback")
+    
+    return result
 
 
 def calculate_solar_production(location_rank: int, area_m2: float, t: int,
@@ -413,6 +599,13 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     num_timesteps = min(len(demand_15min), len(spot_15min), len(ror_df),
                        len(solar_15min), len(wind_15min))
     # num_timesteps = 1000
+    
+    # Precompute renewable productions (MAJOR SPEEDUP)
+    print("Precomputing renewable productions...")
+    precomputed = precompute_renewable_productions(
+        ppu_dictionary, num_timesteps, solar_ranking_df, wind_ranking_df
+    )
+    
     # Initialize technology tracking
     Technology_volume = initialize_technology_tracking(ppu_dictionary)
     phi_smoothed = 0.0
@@ -436,7 +629,7 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
         # 2) Update raw_energy_incidence with respective values for each energy source/storage
         raw_energy_incidence = update_raw_energy_incidence(
             raw_energy_incidence, Technology_volume, t, solar_ranking_df, wind_ranking_df,
-            ppu_dictionary, ror_df, solar_15min, wind_15min
+            ppu_dictionary, ror_df, solar_15min, wind_15min, precomputed
         )
 
         # Get energy produced by incidence PPUs (stored in "Grid")
@@ -819,7 +1012,8 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
 def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_volume: Dict, t: int,
                                solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame,
                                ppu_dictionary: pd.DataFrame, ror_df: pd.DataFrame, 
-                               solar_15min: pd.DataFrame, wind_15min: pd.DataFrame) -> List[Dict]:
+                               solar_15min: pd.DataFrame, wind_15min: pd.DataFrame,
+                               precomputed: Optional[Dict] = None) -> List[Dict]:
     """
     Update raw_energy_incidence by simulating PPU extractions from each storage.
     
@@ -874,15 +1068,49 @@ def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_vol
         if 'Solar' in can_extract_from:
             location_rank = each_ppu.get('Location_Rank', np.nan)
             if pd.notna(location_rank):
-                area_m2 = 100000 # Example area
-                current_solar_prod = calculate_solar_production(int(location_rank), area_m2, t, solar_15min, solar_ranking_df)
+                # Fast path: use precomputed matrix if available
+                current_solar_prod = 0.0
+                if (precomputed and precomputed.get('solar_prod_matrix') is not None 
+                    and int(location_rank) in precomputed['solar_rank_to_ppus']):
+                    # Look up from precomputed matrix
+                    rank = int(location_rank)
+                    rank_idx = np.where(precomputed['solar_ranks'] == rank)[0]
+                    if len(rank_idx) > 0:
+                        total_prod = float(precomputed['solar_prod_matrix'][t, rank_idx[0]])
+                        # Get this PPU's fraction
+                        for ppu, frac in precomputed['solar_rank_to_ppus'][rank]:
+                            if ppu == ppu_name:
+                                current_solar_prod = total_prod * frac
+                                break
+                else:
+                    # Fallback to original calculation
+                    area_m2 = 100000
+                    current_solar_prod = calculate_solar_production(int(location_rank), area_m2, t, solar_15min, solar_ranking_df)
+                
                 Technology_volume[ppu_name]['production'].append((t, current_solar_prod))
                 available_energy_solar += current_solar_prod    
         elif 'Wind' in can_extract_from:
             location_rank = each_ppu.get('Location_Rank', np.nan)
             if pd.notna(location_rank):
-                num_turbines = 5  # You may want to get this from each_ppu if available
-                current_wind_prod = calculate_wind_production(int(location_rank), num_turbines, t, wind_15min, wind_ranking_df)
+                # Fast path: use precomputed matrix if available
+                current_wind_prod = 0.0
+                if (precomputed and precomputed.get('wind_prod_matrix') is not None 
+                    and int(location_rank) in precomputed['wind_rank_to_ppus']):
+                    # Look up from precomputed matrix
+                    rank = int(location_rank)
+                    rank_idx = np.where(precomputed['wind_ranks'] == rank)[0]
+                    if len(rank_idx) > 0:
+                        total_prod = float(precomputed['wind_prod_matrix'][t, rank_idx[0]])
+                        # Get this PPU's fraction
+                        for ppu, frac in precomputed['wind_rank_to_ppus'][rank]:
+                            if ppu == ppu_name:
+                                current_wind_prod = total_prod * frac
+                                break
+                else:
+                    # Fallback to original calculation
+                    num_turbines = 5
+                    current_wind_prod = calculate_wind_production(int(location_rank), num_turbines, t, wind_15min, wind_ranking_df)
+                
                 Technology_volume[ppu_name]['production'].append((t, current_wind_prod))
                 available_energy_wind += current_wind_prod
         elif 'River' in can_extract_from:
