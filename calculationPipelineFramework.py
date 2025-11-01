@@ -299,29 +299,6 @@ def load_incidence_data(data_dir: str = "data") -> Tuple[pd.DataFrame, pd.DataFr
     return solar_15min, wind_15min
 
 
-def configure_ppu_portfolio() -> Dict[str, Dict]:
-    """
-    Configure the PPU portfolio for the dispatch simulation.
-
-    Returns:
-        Dictionary of PPU configurations
-    """
-    PPU_dict = {
-        'PV_1': {'type': 'PV', 'classification': 'Incidence', 'storage_used': None,
-                 'location_rank': 1, 'area_m2': 100000},
-        'PV_2': {'type': 'PV', 'classification': 'Incidence', 'storage_used': None,
-                 'location_rank': 2, 'area_m2': 100000},
-        'WIND_1': {'type': 'WIND_ONSHORE', 'classification': 'Incidence', 'storage_used': None,
-                   'location_rank': 1, 'num_turbines': 5},
-        'WIND_2': {'type': 'WIND_ONSHORE', 'classification': 'Incidence', 'storage_used': None,
-                   'location_rank': 2, 'num_turbines': 5},
-        'HYD_ROR_1': {'type': 'HYD_ROR', 'classification': 'Incidence', 'storage_used': None},
-        'HYD_ROR_2': {'type': 'HYD_ROR', 'classification': 'Incidence', 'storage_used': None},
-    }
-
-    return PPU_dict
-
-
 def initialize_technology_tracking(ppu_dictionary: pd.DataFrame) -> Dict[str, Dict]:
     """
     Initialize technology volume tracking structure.
@@ -865,7 +842,9 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
             'epsilon': 1e-6,
             'timestep_hours': 0.25,
             'ema_beta': 0.2,
-            'horizons': ['1d', '3d', '7d', '30d']
+            'horizons': ['1d', '3d', '7d', '30d'],
+            'wood_price_chf_per_kwh' : 0.095,
+            'palm_oil_price_chf_per_kwh' : 0.070
         }
     hyperparams.update({
     'spot_unit': 'CHF_per_MWh',       # your spot is ~90–100 CHF/MWh
@@ -1543,9 +1522,71 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
         for benefit_info in charge_benefits:
             benefit_info['weight'] = benefit_info['B_chg'] / B_chg_total
 
+    # Special PPUs that convert electricity → commodity → biooil (unlimited flow)
+    special_biooil_ppus = ['BIO_OIL_FROM_WOOD', 'BIO_OIL_FROM_PALM', 'PALM_STORE_IMPORT']
+    
     for each_store_ppu in charge_benefits:
+        ppu_name = each_store_ppu['ppu_name']
         allocation = each_store_ppu['B_chg'] / max(B_chg_total, hyperparams['epsilon'])
         efficiency = each_store_ppu['ppu_row'].get('Chain_Efficiency', 1.0)
+        
+        # Check if this is a special biooil conversion PPU
+        if ppu_name in special_biooil_ppus:
+            # SPECIAL LOGIC: Sell electricity on spot, buy commodity, convert to biooil
+            # 1. Allocated energy (MW) to this PPU
+            allocated_energy_MW = surplus_MW * allocation
+            
+            # 2. Convert to energy (MWh for this 15-min timestep)
+            energy_MWh = allocated_energy_MW * hyperparams['timestep_hours']
+            
+            # 3. Sell on spot market to get CHF
+            revenue_CHF = energy_MWh * spot_price
+            
+            # 4. Determine commodity type and price
+            can_extract_from = each_store_ppu['ppu_row'].get('can_extract_from', [])
+            if 'Wood' in can_extract_from:
+                commodity_price_chf_per_kwh = hyperparams.get('wood_price_chf_per_kwh', 0.095)
+                commodity_name = 'Wood'
+            elif 'Palm oil' in can_extract_from:
+                commodity_price_chf_per_kwh = hyperparams.get('palm_oil_price_chf_per_kwh', 0.070)
+                commodity_name = 'Palm oil'
+            else:
+                # Unknown commodity, skip special logic
+                commodity_price_chf_per_kwh = 0.0
+                commodity_name = None
+            
+            if commodity_name:
+                # 5. Buy commodity with revenue (MWh of commodity)
+                commodity_energy_MWh = revenue_CHF / (commodity_price_chf_per_kwh * 1000.0)  # Convert kWh to MWh
+                
+                # 6. Convert commodity → biooil via chain efficiency
+                biooil_energy_MWh = commodity_energy_MWh * efficiency
+                biooil_energy_MW = biooil_energy_MWh / hyperparams['timestep_hours']  # Convert back to MW
+                
+                # 7. Store in Biooil storage (check capacity)
+                can_input_to = each_store_ppu['ppu_row'].get('can_input_to', [])
+                for storage_name in can_input_to:
+                    if storage_name == 'Biooil':
+                        storage_item = next((item for item in raw_energy_storage if item['storage'] == 'Biooil'), None)
+                        if storage_item:
+                            storage_available = storage_item['value'] - storage_item['current_value']
+                            actual_stored_MW = min(biooil_energy_MW, storage_available)
+                            
+                            # Update storage
+                            storage_item['current_value'] += actual_stored_MW
+                            storage_item['history'].append((t, actual_stored_MW))
+                            
+                            # Record production (energy converted and stored)
+                            Technology_volume[ppu_name]['production'].append((t, -actual_stored_MW))
+                            
+                            # If storage was full, the excess is lost (net loss recorded via production)
+                            # Note: We don't mark spot_sold because we already used that money to buy commodity
+                            break
+                
+                # Continue to next PPU
+                continue
+        
+        # NORMAL STORE PPU LOGIC (for non-special PPUs)
         target_charge_MW = surplus_MW * allocation * efficiency  # Apply efficiency for charging
         spot_sell = 0.0
         
@@ -1559,7 +1600,8 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
             if storage_item['storage'] in can_input_to
         )
         
-        # Limit by the smallest: 1 GW PPU capacity, available storage capacity, and target charge
+        # Limit by: available storage capacity, 1 GW PPU capacity, and target charge
+        # Note: Special biooil PPUs bypass the 1 GW limit, but they're handled above
         actual_charge_MW = min(target_charge_MW, available_capacity_MW, 1000 * efficiency)
 
         if actual_charge_MW == target_charge_MW:
