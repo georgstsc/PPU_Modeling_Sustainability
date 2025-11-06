@@ -43,6 +43,56 @@ from calculationsPpuFramework import (
 )
 
 
+def scale_storage_capacities_by_unit_counts(
+    ppu_dictionary: pd.DataFrame,
+    raw_energy_storage: List[Dict],
+    do_not_scale: Optional[List[str]] = None
+) -> None:
+    """
+    Scale each storage's max capacity ('value') by the number of Store-PPUs that input to it.
+
+    Example: If there are 3 NH3_FULL units (each feeding 'Ammonia storage'), and base per-unit
+    capacity is 100,000, the storage 'value' becomes 300,000.
+
+    Mutates raw_energy_storage in place. Persists 'base_value' to avoid compounding when the
+    function is called multiple times in one process.
+
+    Args:
+        ppu_dictionary: Configured PPUs with 'can_input_to'
+        raw_energy_storage: Storage dicts with 'storage', 'value', 'current_value'
+        do_not_scale: Optional list of storages to exclude from scaling (e.g., ['Lake'])
+    """
+    try:
+        # Count how many PPUs can INPUT to each storage
+        storage_unit_counts: Dict[str, int] = {}
+        for _, row in ppu_dictionary.iterrows():
+            can_input_to = row.get('can_input_to', []) or []
+            if not isinstance(can_input_to, list):
+                continue
+            for sto in can_input_to:
+                storage_unit_counts[sto] = storage_unit_counts.get(sto, 0) + 1
+
+        do_not_scale_set = set(do_not_scale or ['Lake'])
+
+        for storage in raw_energy_storage:
+            name = storage.get('storage')
+            if not name or name in do_not_scale_set:
+                continue
+
+            # Save base per-unit capacity the first time
+            if 'base_value' not in storage:
+                storage['base_value'] = storage.get('value', 0.0)
+
+            unit_count = storage_unit_counts.get(name, 0)
+            if unit_count > 0:
+                new_max = float(storage['base_value']) * float(unit_count)
+                storage['value'] = new_max
+                if storage.get('current_value', 0.0) > new_max:
+                    storage['current_value'] = new_max
+    except Exception as e:
+        print(f"[WARN] Failed to scale storage capacities by unit counts: {e}")
+
+
 # ------------------------------------------------------------------
 # Ultra-fast solar production mapper (build once, reuse)
 # ------------------------------------------------------------------
@@ -53,22 +103,21 @@ class SolarMapper:
     __slots__ = ("lats", "lons", "cols", "data", "rank_order")
 
     def __init__(self, csv_path: str):
-        # The CSV is shaped like the provided solar_incidence_hourly_2024.csv
+        # The CSV is shaped like solar_incidence_hourly_2024.csv
         df = pd.read_csv(csv_path, header=None)
         self.lats = df.iloc[0, 1:].astype(np.float32).values
         self.lons = df.iloc[1, 1:].astype(np.float32).values
         self.cols = np.arange(self.lats.size, dtype=np.int32)
 
-        # Extract hourly incidence and resample to 15-min using fast numpy interpolation
-        times_dt = pd.to_datetime(df.iloc[3:, 0]).to_numpy()
+        # Interpolate hourly to 15-min using numpy interpolation
+        times = pd.to_datetime(df.iloc[3:, 0].values)
+        times_dt = times.to_numpy()
         times_seconds = times_dt.astype('datetime64[s]').astype(np.int64)
-        data_hourly = df.iloc[3:, 1:].astype(np.float32).to_numpy()
+        data_hourly = df.iloc[3:, 1:].astype(np.float32).values
 
-        # Build target 15-min timestamps covering the same range
         target_dt = pd.date_range(start=times_dt[0], end=times_dt[-1], freq='15min').to_numpy()
         target_seconds = target_dt.astype('datetime64[s]').astype(np.int64)
 
-        # Interpolate each column with numpy.interp (fast, avoids pandas internals)
         nt = target_seconds.size
         nc = data_hourly.shape[1]
         data_15 = np.empty((nt, nc), dtype=np.float32)
@@ -947,6 +996,9 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
                 raw_energy_storage=raw_energy_storage,
                 raw_energy_incidence=raw_energy_incidence
             )
+
+    # Scale storage capacities by number of Store-PPUs feeding them (e.g., NH3_FULL: 3 -> 3x Ammonia)
+    scale_storage_capacities_by_unit_counts(ppu_dictionary, raw_energy_storage, do_not_scale=['Lake'])
     # Print entire PPU dictionnary 
     print(f"  ✓ Loaded demand: {len(demand_15min)} timesteps")
     print(f"  ✓ Loaded spot prices: {len(spot_15min)} timesteps")

@@ -719,9 +719,9 @@ def add_ppu_to_dictionary(
     
     PPU_STORAGE_MAPPING = {
         # Hydro PPUs
-        'HYD_S': {'extract_from': [], 'input_to': ['Lake']},  # Hydroelectric storage - extracts from Lake
+        'HYD_S': {'extract_from': ['Lake'], 'input_to': []},  # Hydroelectric storage - ONLY extracts from Lake
         'HYD_R': {'extract_from': ['River'], 'input_to': []},  # Run-of-river - extracts from River
-        'PHS': {'extract_from': ['Lake'], 'input_to': []},  # Pumped hydro storage - both extract and pump into Lake
+        'PHS': {'extract_from': [], 'input_to': ['Lake']},  # Pumped hydro storage - ONLY pumps into Lake
         
         # Hydrogen PPUs (gaseous 200bar)
         'H2_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 turbine + electrolyzer
