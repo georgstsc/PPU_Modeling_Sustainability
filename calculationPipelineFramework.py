@@ -59,11 +59,23 @@ class SolarMapper:
         self.lons = df.iloc[1, 1:].astype(np.float32).values
         self.cols = np.arange(self.lats.size, dtype=np.int32)
 
-        # Extract hourly incidence and resample to 15-min
-        times = pd.to_datetime(df.iloc[3:, 0])
-        data_hourly = df.iloc[3:, 1:].astype(np.float32).values
-        data_15 = pd.DataFrame(data_hourly, index=times).resample("15min").interpolate().to_numpy()
-        self.data = np.asarray(data_15, dtype=np.float32)
+        # Extract hourly incidence and resample to 15-min using fast numpy interpolation
+        times_dt = pd.to_datetime(df.iloc[3:, 0]).to_numpy()
+        times_seconds = times_dt.astype('datetime64[s]').astype(np.int64)
+        data_hourly = df.iloc[3:, 1:].astype(np.float32).to_numpy()
+
+        # Build target 15-min timestamps covering the same range
+        target_dt = pd.date_range(start=times_dt[0], end=times_dt[-1], freq='15min').to_numpy()
+        target_seconds = target_dt.astype('datetime64[s]').astype(np.int64)
+
+        # Interpolate each column with numpy.interp (fast, avoids pandas internals)
+        nt = target_seconds.size
+        nc = data_hourly.shape[1]
+        data_15 = np.empty((nt, nc), dtype=np.float32)
+        for j in range(nc):
+            data_15[:, j] = np.interp(target_seconds, times_seconds, data_hourly[:, j])
+
+        self.data = data_15
 
         # Precompute ranking order (highest mean irradiance first)
         means = self.data.mean(axis=0)
@@ -150,9 +162,21 @@ class WindMapper:
         self.lats = np.array([float(c[0]) for c in df.columns], dtype=np.float32)
         self.lons = np.array([float(c[1]) for c in df.columns], dtype=np.float32)
         self.cols = np.arange(self.lats.size, dtype=np.int32)
-        # Resample to 15-min and convert to numpy
-        data_15 = df.resample('15min').interpolate().to_numpy(dtype=np.float32)
-        self.data = np.asarray(data_15, dtype=np.float32)
+        # Resample to 15-min using numpy interpolation to avoid pandas interpolation overhead
+        times_dt = df.index.to_numpy()
+        times_seconds = times_dt.astype('datetime64[s]').astype(np.int64)
+        data_hourly = df.to_numpy(dtype=np.float32)
+
+        target_dt = pd.date_range(start=times_dt[0], end=times_dt[-1], freq='15min').to_numpy()
+        target_seconds = target_dt.astype('datetime64[s]').astype(np.int64)
+
+        nt = target_seconds.size
+        nc = data_hourly.shape[1]
+        data_15 = np.empty((nt, nc), dtype=np.float32)
+        for j in range(nc):
+            data_15[:, j] = np.interp(target_seconds, times_seconds, data_hourly[:, j])
+
+        self.data = data_15
         # Precompute ranking by mean wind speed
         means = self.data.mean(axis=0)
         self.rank_order = np.argsort(means)[::-1].astype(np.int32)
@@ -290,11 +314,33 @@ def load_incidence_data(data_dir: str = "data") -> Tuple[pd.DataFrame, pd.DataFr
     # Create MultiIndex for solar
     solar_columns = pd.MultiIndex.from_arrays([latitudes_solar, longitudes_solar], names=['lat', 'lon'])
     solar_df = pd.DataFrame(solar_data, index=times_solar, columns=solar_columns)
-    solar_15min = solar_df.resample('15min').interpolate(method='linear')
+    # Fast numpy-based interpolation to 15-min (avoid heavy pandas resample/interpolate)
+    times_solar_dt = times_solar.to_numpy()
+    times_solar_seconds = times_solar_dt.astype('datetime64[s]').astype(np.int64)
+    target_dt = pd.date_range(start=times_solar_dt[0], end=times_solar_dt[-1], freq='15min')
+    target_seconds = target_dt.to_numpy().astype('datetime64[s]').astype(np.int64)
+    solar_hourly = solar_data.astype(np.float32)
+    nt = target_seconds.size
+    nc = solar_hourly.shape[1]
+    solar_interp = np.empty((nt, nc), dtype=np.float32)
+    for j in range(nc):
+        solar_interp[:, j] = np.interp(target_seconds, times_solar_seconds, solar_hourly[:, j])
+    solar_15min = pd.DataFrame(solar_interp, index=target_dt, columns=solar_columns)
 
     # Load hourly wind data
     wind_hourly_df = pd.read_csv(f'{data_dir}/wind_incidence_hourly_2024.csv', index_col=0, header=[0, 1], parse_dates=True)
-    wind_15min = wind_hourly_df.resample('15min').interpolate(method='linear')
+    # Fast interpolation for wind as well
+    wind_times = wind_hourly_df.index.to_numpy()
+    wind_seconds = wind_times.astype('datetime64[s]').astype(np.int64)
+    target_dt_w = pd.date_range(start=wind_times[0], end=wind_times[-1], freq='15min')
+    target_seconds_w = target_dt_w.to_numpy().astype('datetime64[s]').astype(np.int64)
+    wind_hourly_values = wind_hourly_df.to_numpy(dtype=np.float32)
+    ntw = target_seconds_w.size
+    ncw = wind_hourly_values.shape[1]
+    wind_interp = np.empty((ntw, ncw), dtype=np.float32)
+    for j in range(ncw):
+        wind_interp[:, j] = np.interp(target_seconds_w, wind_seconds, wind_hourly_values[:, j])
+    wind_15min = pd.DataFrame(wind_interp, index=target_dt_w, columns=wind_hourly_df.columns)
 
     return solar_15min, wind_15min
 
