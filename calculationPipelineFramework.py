@@ -1551,6 +1551,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
                 commodity_price_chf_per_kwh = hyperparams.get('palm_oil_price_chf_per_kwh', 0.070)
                 commodity_name = 'Palm oil'
             else:
+                print(f"Warning: Special PPU {ppu_name} has unknown commodity source.")
                 # Unknown commodity, skip special logic
                 commodity_price_chf_per_kwh = 0.0
                 commodity_name = None
