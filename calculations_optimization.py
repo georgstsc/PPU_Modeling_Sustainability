@@ -154,39 +154,39 @@ def load_annual_data(data_dir: str = 'data/') -> Dict[str, Any]:
 
 
 def generate_random_scenario(
-    n_days: int = 30,
-    data_dict: Dict[str, Any] = None,
+    annual_data: Dict[str, Any],
+    num_days: int = 30,
     seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Randomly select n_days individual days from annual data and concatenate.
+    Randomly select num_days individual days from annual data and concatenate.
     
     Parameters
     ----------
-    n_days : int
-        Number of days to sample (default=30)
-    data_dict : dict
+    annual_data : dict
         Output from load_annual_data()
+    num_days : int
+        Number of days to sample (default=30)
     seed : int, optional
         Random seed for reproducibility
         
     Returns
     -------
     scenario_dict : dict
-        - 'demand_15min': Series[2880] concatenated demand
-        - 'spot_15min': Series[2880] concatenated spot prices
-        - 'solar_15min': DataFrame[2880 x locations] solar CF
-        - 'wind_15min': DataFrame[2880 x locations] wind CF
-        - 'ror_15min': Series[2880] RoR production
-        - 'day_indices': List[int] selected day numbers (0-364)
-        - 'sampled_dates': List[datetime] actual dates sampled
+        - 'demand_MW': Array of concatenated demand
+        - 'spot_price': Array of concatenated spot prices
+        - 'solar_cf': Array of solar capacity factors
+        - 'wind_cf': Array of wind capacity factors
+        - 'ror_MW': Array of RoR production
+        - 'selected_days': List[int] selected day numbers (0-364)
+        - 'num_days': int number of days sampled
     """
     if seed is not None:
         np.random.seed(seed)
     
     # Sample random days (without replacement)
     n_days_in_year = 365
-    day_indices = np.random.choice(n_days_in_year, size=n_days, replace=False)
+    day_indices = np.random.choice(n_days_in_year, size=num_days, replace=False)
     day_indices = sorted(day_indices.tolist())  # Sort for easier interpretation
     
     # Extract 96 timesteps per day and concatenate
@@ -204,38 +204,44 @@ def generate_random_scenario(
         start_idx = day_idx * timesteps_per_day
         end_idx = (day_idx + 1) * timesteps_per_day
         
-        # Extract segments
-        demand_segments.append(data_dict['demand_15min'].iloc[start_idx:end_idx])
-        spot_segments.append(data_dict['spot_15min'].iloc[start_idx:end_idx])
-        solar_segments.append(data_dict['solar_incidence'].iloc[start_idx:end_idx])
-        wind_segments.append(data_dict['wind_incidence'].iloc[start_idx:end_idx])
-        ror_segments.append(data_dict['ror_15min'].iloc[start_idx:end_idx])
+        # Extract segments - handle Series/arrays
+        demand_seg = annual_data['demand_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['demand_15min'], 'iloc') else annual_data['demand_15min'][start_idx:end_idx]
+        spot_seg = annual_data['spot_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['spot_15min'], 'iloc') else annual_data['spot_15min'][start_idx:end_idx]
+        solar_seg = annual_data['solar_incidence'].iloc[start_idx:end_idx] if hasattr(annual_data['solar_incidence'], 'iloc') else annual_data['solar_incidence'][start_idx:end_idx]
+        wind_seg = annual_data['wind_incidence'].iloc[start_idx:end_idx] if hasattr(annual_data['wind_incidence'], 'iloc') else annual_data['wind_incidence'][start_idx:end_idx]
+        ror_seg = annual_data['ror_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['ror_15min'], 'iloc') else annual_data['ror_15min'][start_idx:end_idx]
+        
+        demand_segments.append(demand_seg)
+        spot_segments.append(spot_seg)
+        solar_segments.append(solar_seg)
+        wind_segments.append(wind_seg)
+        ror_segments.append(ror_seg)
         
         # Record the date
-        sampled_dates.append(data_dict['timestamp_index'][start_idx])
+        sampled_dates.append(annual_data['timestamp_index'][start_idx])
     
-    # Concatenate all segments
-    scenario_demand = pd.concat(demand_segments, ignore_index=True)
-    scenario_spot = pd.concat(spot_segments, ignore_index=True)
-    scenario_solar = pd.concat(solar_segments, ignore_index=True)
-    scenario_wind = pd.concat(wind_segments, ignore_index=True)
-    scenario_ror = pd.concat(ror_segments, ignore_index=True)
+    # Concatenate all segments - convert to numpy arrays
+    scenario_demand = np.concatenate([np.array(s) for s in demand_segments])
+    scenario_spot = np.concatenate([np.array(s) for s in spot_segments])
+    scenario_solar = np.concatenate([np.array(s) for s in solar_segments])
+    scenario_wind = np.concatenate([np.array(s) for s in wind_segments])
+    scenario_ror = np.concatenate([np.array(s) for s in ror_segments])
     
     return {
-        'demand_15min': scenario_demand,
-        'spot_15min': scenario_spot,
-        'solar_15min': scenario_solar,
-        'wind_15min': scenario_wind,
-        'ror_15min': scenario_ror,
-        'day_indices': day_indices,
+        'demand_MW': scenario_demand,
+        'spot_price': scenario_spot,
+        'solar_cf': scenario_solar,
+        'wind_cf': scenario_wind,
+        'ror_MW': scenario_ror,
+        'selected_days': day_indices,
+        'num_days': num_days,
         'sampled_dates': sampled_dates
     }
 
 
 def validate_scenario_completeness(
-    scenario_dict: Dict[str, Any],
-    expected_locations: Dict[str, int]
-) -> Tuple[bool, Dict[str, Any]]:
+    scenario_dict: Dict[str, Any]
+) -> Tuple[bool, str]:
     """
     Ensure scenario contains all required data and matches expected structure.
     
@@ -243,25 +249,34 @@ def validate_scenario_completeness(
     ----------
     scenario_dict : dict
         Output from generate_random_scenario()
-    expected_locations : dict
-        {'solar': int, 'wind': int} expected location counts
         
     Returns
     -------
     is_valid : bool
         True if all checks pass
-    validation_report : dict
-        Details of any issues found
+    message : str
+        Validation result message
     """
-    report = {'errors': [], 'warnings': [], 'info': []}
-    
     # Check required keys
-    required_keys = ['demand_15min', 'spot_15min', 'solar_15min', 
-                     'wind_15min', 'ror_15min', 'day_indices', 'sampled_dates']
+    required_keys = ['demand_MW', 'spot_price', 'solar_cf', 
+                     'wind_cf', 'ror_MW', 'selected_days', 'num_days']
     
-    for key in required_keys:
-        if key not in scenario_dict:
-            report['errors'].append(f"Missing required key: {key}")
+    missing_keys = [key for key in required_keys if key not in scenario_dict]
+    if missing_keys:
+        return False, f"Missing required keys: {missing_keys}"
+    
+    # Check array lengths match
+    num_timesteps = len(scenario_dict['demand_MW'])
+    expected_timesteps = scenario_dict['num_days'] * 96  # 96 timesteps per day
+    
+    for key in ['spot_price', 'solar_cf', 'wind_cf', 'ror_MW']:
+        if len(scenario_dict[key]) != num_timesteps:
+            return False, f"Length mismatch: {key} has {len(scenario_dict[key])} timesteps, expected {num_timesteps}"
+    
+    if num_timesteps != expected_timesteps:
+        return False, f"Total timesteps {num_timesteps} doesn't match expected {expected_timesteps} for {scenario_dict['num_days']} days"
+    
+    return True, f"Scenario valid: {scenario_dict['num_days']} days, {num_timesteps} timesteps"
     
     if report['errors']:
         return False, report
@@ -678,7 +693,7 @@ def evaluate_portfolio_multiscenario(
     for i in range(n_scenarios):
         # Generate scenario
         seed = seed_base + i if seed_base is not None else None
-        scenario = generate_random_scenario(n_days=30, data_dict=data_dict, seed=seed)
+        scenario = generate_random_scenario(annual_data=data_dict, num_days=30, seed=seed)
         
         # Run dispatch
         results = run_single_scenario_dispatch(portfolio_dict, scenario, hyperparams)
