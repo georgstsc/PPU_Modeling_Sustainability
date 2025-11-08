@@ -544,34 +544,149 @@ def assign_renewable_locations(
 def run_single_scenario_dispatch(
     portfolio_dict: Dict[str, int],
     scenario_dict: Dict[str, Any],
-    hyperparams: Dict[str, Any]
+    hyperparams: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Execute dispatch simulation for a given portfolio over a single scenario.
+    Execute simplified dispatch simulation for a given portfolio over a single scenario.
     
-    This is a wrapper around the existing dispatch framework.
+    This implements a greedy heuristic dispatch:
+    - Renewables produce at capacity factor
+    - RoR produces at available level
+    - Storage and conventional plants balance remaining demand
+    - Spot market handles final surplus/deficit
     
     Parameters
     ----------
     portfolio_dict : dict
-        PPU counts
+        PPU counts, e.g. {'hydro_storage': 2, 'nuclear_large': 1, ...}
     scenario_dict : dict
-        From generate_random_scenario()
-    hyperparams : dict
-        Configuration (storage efficiency, spot limits, etc.)
+        From generate_random_scenario() with keys: demand_MW, spot_price, solar_cf, wind_cf, ror_MW
+    hyperparams : dict, optional
+        Configuration (defaults provided if None)
         
     Returns
     -------
     results_dict : dict
-        - 'net_cost_CHF': Total cost (CAPEX + spot transactions)
-        - 'technology_volume': Dict of production/consumption by PPU
-        - 'raw_energy_storage': List of storage states over time
-        - 'overflow_series': Surplus/deficit at each timestep
-        - 'diagnostics': HHI, spot_dependence, storage_utilization
+        - 'net_cost_CHF': Total operational cost (spot transactions + storage losses)
+        - 'energy_balance': Array of net energy at each timestep (demand - supply)
+        - 'spot_transactions': Array of spot market purchases (MW)
+        - 'storage_soc': Dict of SOC trajectories for each storage PPU
+        - 'diagnostics': Dictionary with HHI, spot_dependence, etc.
     """
-    # TODO: Implement wrapper around calculationPipelineFramework.run_dispatch_simulation()
-    # For now, return placeholder
-    raise NotImplementedError("Dispatch wrapper not yet implemented")
+    if hyperparams is None:
+        hyperparams = {
+            'storage_capacity_mwh': 1000.0,  # MWh per storage PPU
+            'storage_efficiency': 0.85,
+            'nuclear_capacity_mw': 1000.0,  # MW per nuclear unit
+            'hydro_capacity_mw': 500.0,     # MW per hydro unit
+        }
+    
+    n_timesteps = len(scenario_dict['demand_MW'])
+    demand = scenario_dict['demand_MW']
+    spot_price = scenario_dict['spot_price']
+    solar_cf = scenario_dict['solar_cf']
+    wind_cf = scenario_dict['wind_cf']
+    ror_mw = scenario_dict['ror_MW']
+    
+    # Initialize arrays
+    supply = np.zeros(n_timesteps)
+    spot_transactions = np.zeros(n_timesteps)  # Positive = buy, negative = sell
+    net_cost = 0.0
+    
+    # 1. Add renewable production (at capacity factor)
+    solar_capacity = portfolio_dict.get('solar_pv', 0) * 100.0  # 100 MW per PV unit
+    wind_capacity = portfolio_dict.get('wind_onshore', 0) * 100.0  # 100 MW per wind unit
+    
+    renewable_supply = solar_capacity * solar_cf + wind_capacity * wind_cf + ror_mw
+    
+    # 2. Add baseload (nuclear runs at constant capacity)
+    nuclear_capacity = portfolio_dict.get('nuclear_large', 0) * hyperparams['nuclear_capacity_mw']
+    baseload_supply = np.full(n_timesteps, nuclear_capacity)
+    
+    # 3. Simple storage dispatch: charge when surplus, discharge when deficit
+    storage_units = portfolio_dict.get('hydro_storage', 0)
+    storage_capacity_total = storage_units * hyperparams['storage_capacity_mwh']
+    storage_soc = storage_capacity_total * 0.5  # Start at 50% SOC
+    storage_soc_trajectory = []
+    storage_discharge = np.zeros(n_timesteps)
+    storage_charge = np.zeros(n_timesteps)
+    
+    for t in range(n_timesteps):
+        # Calculate available supply before storage/spot
+        available_supply = renewable_supply[t] + baseload_supply[t]
+        balance = demand[t] - available_supply
+        
+        if balance > 0:  # Need more energy - discharge storage or buy from spot
+            # Try to discharge storage first
+            max_discharge_power = storage_units * hyperparams['hydro_capacity_mw']
+            max_discharge_energy = storage_soc * hyperparams['storage_efficiency']
+            discharge = min(max_discharge_power, max_discharge_energy, balance)
+            
+            storage_soc -= discharge / hyperparams['storage_efficiency']
+            storage_discharge[t] = discharge
+            balance -= discharge
+            
+            # Remaining deficit from spot market
+            spot_transactions[t] = balance
+            net_cost += balance * spot_price[t] * 0.25  # 0.25 hours per timestep
+            
+        else:  # Surplus energy - charge storage or sell to spot
+            surplus = -balance
+            # Try to charge storage first
+            max_charge_power = storage_units * hyperparams['hydro_capacity_mw']
+            max_charge_capacity = (storage_capacity_total - storage_soc) / hyperparams['storage_efficiency']
+            charge = min(max_charge_power, max_charge_capacity, surplus)
+            
+            storage_soc += charge * hyperparams['storage_efficiency']
+            storage_charge[t] = charge
+            surplus -= charge
+            
+            # Sell remaining surplus to spot market  
+            spot_transactions[t] = -surplus
+            net_cost -= surplus * spot_price[t] * 0.25
+        
+        storage_soc_trajectory.append(storage_soc)
+    
+    # Total supply = renewables + baseload + storage discharge - storage charge + spot
+    supply = renewable_supply + baseload_supply + storage_discharge - storage_charge + spot_transactions
+    
+    # Calculate diagnostics
+    total_demand = np.sum(demand) * 0.25  # MWh
+    total_spot_buy = np.sum(np.maximum(spot_transactions, 0)) * 0.25
+    spot_dependence = total_spot_buy / total_demand if total_demand > 0 else 0
+    
+    # Calculate Herfindahl-Hirschman Index (HHI) for energy mix diversity
+    total_renewable = np.sum(renewable_supply) * 0.25
+    total_nuclear = np.sum(baseload_supply) * 0.25
+    total_storage_discharge = np.sum(storage_discharge) * 0.25
+    total_supply = total_renewable + total_nuclear + total_storage_discharge + total_spot_buy
+    
+    shares = []
+    if total_supply > 0:
+        if total_renewable > 0:
+            shares.append((total_renewable / total_supply) ** 2)
+        if total_nuclear > 0:
+            shares.append((total_nuclear / total_supply) ** 2)
+        if total_storage_discharge > 0:
+            shares.append((total_storage_discharge / total_supply) ** 2)
+        if total_spot_buy > 0:
+            shares.append((total_spot_buy / total_supply) ** 2)
+    
+    hhi = sum(shares) if shares else 0
+    
+    return {
+        'net_cost_CHF': net_cost,
+        'energy_balance': demand - supply,
+        'spot_transactions': spot_transactions,
+        'storage_soc': {'hydro_storage': storage_soc_trajectory},
+        'diagnostics': {
+            'hhi': hhi,
+            'spot_dependence': spot_dependence,
+            'total_demand_mwh': total_demand,
+            'total_spot_buy_mwh': total_spot_buy,
+            'avg_storage_soc': np.mean(storage_soc_trajectory) / storage_capacity_total if storage_capacity_total > 0 else 0
+        }
+    }
 
 
 def validate_energy_balance(
