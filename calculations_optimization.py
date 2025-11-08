@@ -15,10 +15,13 @@ Step 6: Visualization and Frontier Analysis
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
 import json
+import csv
+from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Any, Optional
+import matplotlib.pyplot as plt
+import pickle
 
 
 # ============================================================================
@@ -47,66 +50,98 @@ def load_annual_data(data_dir: str = 'data/') -> Dict[str, Any]:
     """
     data_path = Path(data_dir)
     
-    # Load hourly demand data and resample to 15-min
+    # 1. Load hourly demand data - following existing pipeline format
     demand_hourly = pd.read_csv(
         data_path / 'monthly_hourly_load_values_2024.csv',
-        parse_dates=['timestamp']
+        sep='\t'
     )
-    demand_hourly.set_index('timestamp', inplace=True)
-    demand_15min = demand_hourly['load_MW'].resample('15min').interpolate(method='linear')
+    # Filter for Switzerland (CH) - as in analyze_monthly_hourly_load()
+    demand_hourly = demand_hourly[demand_hourly['CountryCode'] == 'CH'].copy()
+    # Parse datetime from DateUTC (format: DD-MM-YYYY HH:MM) - as in existing pipeline
+    demand_hourly['datetime'] = pd.to_datetime(
+        demand_hourly['DateUTC'], 
+        format='%d-%m-%Y %H:%M'
+    )
+    # Drop duplicate timestamps (e.g., daylight saving time transitions)
+    demand_hourly = demand_hourly.drop_duplicates(subset=['datetime'], keep='first')
+    demand_hourly.set_index('datetime', inplace=True)
+    demand_hourly.sort_index(inplace=True)
+    # Resample hourly demand to 15-min with linear interpolation
+    demand_15min = demand_hourly['Value'].resample('15min').interpolate(method='linear')
     
-    # Load spot prices (hourly) and resample to 15-min
-    with open(data_path / 'energy_price_all_2024.json', 'r') as f:
-        spot_data = json.load(f)
-    
-    spot_df = pd.DataFrame([
-        {'timestamp': datetime.fromisoformat(entry['timestamp']), 
-         'price': entry['price_chf_mwh']}
-        for entry in spot_data
-    ])
-    spot_df.set_index('timestamp', inplace=True)
+    # 2. Load spot prices - following existing pipeline format
+    spot_df = pd.read_csv(
+        data_path / 'spot_price_hourly.csv',
+        parse_dates=['time']
+    )
+    spot_df.set_index('time', inplace=True)
+    spot_df.sort_index(inplace=True)
     spot_15min = spot_df['price'].resample('15min').interpolate(method='linear')
     
-    # Load solar incidence (hourly by location)
-    solar_hourly = pd.read_csv(
+    # 3. Load solar incidence - following existing pipeline format with lat/lon header rows
+    import csv
+    with open(data_path / 'solar_incidence_hourly_2024.csv', 'r') as f:
+        reader = csv.reader(f)
+        lat_row = next(reader)
+        lon_row = next(reader)
+        time_row = next(reader)
+    
+    # Read the actual data (skip first 3 header rows)
+    solar_df = pd.read_csv(
         data_path / 'solar_incidence_hourly_2024.csv',
-        parse_dates=['timestamp']
+        skiprows=3
     )
-    solar_hourly.set_index('timestamp', inplace=True)
+    solar_df.rename(columns={solar_df.columns[0]: "datetime"}, inplace=True)
+    solar_df["datetime"] = pd.to_datetime(solar_df["datetime"])
+    solar_df.set_index("datetime", inplace=True)
     
-    # Resample to 15-min for each location
-    solar_15min = pd.DataFrame()
-    for col in solar_hourly.columns:
-        solar_15min[col] = solar_hourly[col].resample('15min').interpolate(method='linear')
+    # Get mean solar incidence across all locations (spatial average)
+    data_cols = [col for col in solar_df.columns if col != "datetime"]
+    solar_hourly = solar_df[data_cols].mean(axis=1)
+    solar_15min = solar_hourly.resample('15min').interpolate(method='linear')
     
-    # Load wind incidence (hourly by location)
-    wind_hourly = pd.read_csv(
+    # 4. Load wind incidence - following existing pipeline format
+    with open(data_path / 'wind_incidence_hourly_2024.csv', 'r') as f:
+        reader = csv.reader(f)
+        lat_row = next(reader)
+        lon_row = next(reader)
+        time_row = next(reader)
+    
+    wind_df = pd.read_csv(
         data_path / 'wind_incidence_hourly_2024.csv',
-        parse_dates=['timestamp']
+        skiprows=3
     )
-    wind_hourly.set_index('timestamp', inplace=True)
+    wind_df.rename(columns={wind_df.columns[0]: "datetime"}, inplace=True)
+    wind_df["datetime"] = pd.to_datetime(wind_df["datetime"])
+    wind_df.set_index("datetime", inplace=True)
     
-    # Resample to 15-min for each location
-    wind_15min = pd.DataFrame()
-    for col in wind_hourly.columns:
-        wind_15min[col] = wind_hourly[col].resample('15min').interpolate(method='linear')
+    # Get mean wind incidence across all locations (spatial average)
+    data_cols = [col for col in wind_df.columns if col != "datetime"]
+    wind_hourly = wind_df[data_cols].mean(axis=1)
+    wind_15min = wind_hourly.resample('15min').interpolate(method='linear')
     
-    # Load run-of-river monthly data and distribute to 15-min
+    # 5. Load run-of-river monthly data - following existing pipeline format
     ror_monthly = pd.read_csv(data_path / 'water_monthly_ror_2024.csv')
-    # Convert monthly to hourly (uniform distribution within month)
-    # Then resample to 15-min
-    # For now, create a simple uniform distribution
+    ror_monthly['Month'] = pd.to_datetime(ror_monthly['Month'], format='%Y-%m')
+    ror_monthly.set_index('Month', inplace=True)
+    
+    # Create full year timestamp index at 15-min resolution
     timestamp_index = pd.date_range(
         start='2024-01-01 00:00:00',
         end='2024-12-31 23:45:00',
         freq='15min'
     )
     
-    # Simple uniform RoR (this should be improved based on actual monthly data)
-    ror_15min = pd.Series(
-        data=100.0,  # Placeholder - should compute from monthly data
-        index=timestamp_index
-    )
+    # Distribute monthly RoR energy (GWh) uniformly across each month's 15-min intervals
+    # Converting to power (MW): Energy (GWh) * 1000 / (num_intervals * 0.25 hours)
+    ror_15min = pd.Series(index=timestamp_index, dtype=float)
+    for month_start, row in ror_monthly.iterrows():
+        # Get all timestamps in this month
+        month_mask = (timestamp_index.year == month_start.year) & \
+                     (timestamp_index.month == month_start.month)
+        num_intervals = month_mask.sum()
+        # Convert GWh to MW for 15-min intervals
+        ror_15min[month_mask] = (row['RoR_GWh'] * 1000) / (num_intervals * 0.25)
     
     return {
         'demand_15min': demand_15min,
