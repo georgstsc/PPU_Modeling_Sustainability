@@ -680,7 +680,8 @@ def add_ppu_to_dictionary(
     wind_locations_df: Optional[pd.DataFrame] = None,
     delta_t: float = 0.25,
     raw_energy_storage: Optional[List[Dict]] = None,
-    raw_energy_incidence: Optional[List[Dict]] = None
+    raw_energy_incidence: Optional[List[Dict]] = None,
+    ppu_count: int = 1
 ) -> pd.DataFrame:
     """
     Add a new PPU to the dictionary with all calculated metrics.
@@ -787,6 +788,16 @@ def add_ppu_to_dictionary(
     efficiency = calculate_chain_efficiency(components, cost_df)
     cost_data = calculate_chain_cost(components, cost_df)
     cost_per_kwh = cost_data['total_cost']
+    
+    # Apply cost escalation based on existing PPUs of the same type
+    existing_count = 0
+    if not ppu_dictionary.empty and 'PPU_Name' in ppu_dictionary.columns:
+        existing_count = (ppu_dictionary['PPU_Name'] == ppu_name).sum()
+    
+    # Cost escalation: (1 + 0.1k) where k is the count of existing PPUs of this type
+    escalation_factor = 1 + 0.1 * existing_count
+    cost_per_kwh *= escalation_factor
+    
     cost_per_quarter_hour = cost_per_kwh * delta_t
     
     # =========================================================================

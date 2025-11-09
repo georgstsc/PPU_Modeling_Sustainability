@@ -922,7 +922,7 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
         Complete pipeline results dictionary
     """
     print("=" * 80)
-    print("ENERGY DISPATCH PIPELINE - FULL YEAR 2024 SIMULATION")
+    print(f"ENERGY DISPATCH PIPELINE - DURATION OF YEAR 2024 SIMULATION")
     print("=" * 80)
 
     # Default hyperparameters
