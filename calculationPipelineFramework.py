@@ -42,6 +42,41 @@ from calculationsPpuFramework import (
     load_ppu_data
 )
 
+# ============================================================================
+# STATIC DATA CACHING - Load once and reuse across multiple pipeline calls
+# ============================================================================
+_STATIC_DATA_CACHE = None
+
+def load_static_data_once(data_dir: str = 'data') -> Dict:
+    """
+    Load all static configuration data once and cache it.
+    
+    Static data includes:
+    - PPU constructs (ppu_constructs_components.csv)
+    - Cost table (cost_table_tidy.csv)
+    - Solar location rankings
+    - Wind location rankings
+    
+    Args:
+        data_dir: Directory containing data files
+        
+    Returns:
+        Dictionary with cached static data
+    """
+    global _STATIC_DATA_CACHE
+    
+    if _STATIC_DATA_CACHE is None:
+        print("[CACHE] Loading static data (first time, will be cached)...")
+        _STATIC_DATA_CACHE = {
+            'ppu_constructs_df': load_ppu_data(f'{data_dir}/ppu_constructs_components.csv'),
+            'cost_df': load_cost_data(f'{data_dir}/cost_table_tidy.csv'),
+            'solar_locations_df': load_location_rankings('solar'),
+            'wind_locations_df': load_location_rankings('wind'),
+        }
+        print("[CACHE] Static data loaded and cached.")
+    
+    return _STATIC_DATA_CACHE
+
 
 def scale_storage_capacities_by_unit_counts(
     ppu_dictionary: pd.DataFrame,
@@ -907,7 +942,7 @@ def compute_portfolio_metrics(cost_summary: Dict[str, Dict], spot_15min: pd.Seri
 
 def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
                         raw_energy_incidence: List[Dict], data_dir: str = "data", 
-                        hyperparams: Optional[Dict] = None) -> Dict:
+                        hyperparams: Optional[Dict] = None, static_data: Optional[Dict] = None) -> Dict:
     """
     Run the complete energy dispatch pipeline.
 
@@ -917,6 +952,7 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
         raw_energy_incidence: List of incidence dictionaries with availability tracking
         data_dir: Directory containing data files
         hyperparams: Optional hyperparameters override
+        static_data: Optional pre-loaded static data (PPU constructs, costs, locations). If None, loads from disk with caching.
 
     Returns:
         Complete pipeline results dictionary
@@ -958,16 +994,20 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
 
     print("\n[STEP 1] Loading data...")
 
-    # Load all data 
-
+    # Load scenario-specific data (demand, spot, incidence)
     demand_15min, spot_15min, ror_df = load_energy_data(data_dir)
     solar_15min, wind_15min = load_incidence_data(data_dir)
     solar_ranking_df = pd.read_csv(f'{data_dir}/ranking_incidence/solar_incidence_ranking.csv').head(10)
     wind_ranking_df = pd.read_csv(f'{data_dir}/ranking_incidence/wind_incidence_ranking.csv').head(10)
-    ppu_constructs_df = load_ppu_data(f'{data_dir}/ppu_constructs_components.csv')
-    cost_df = load_cost_data(f'{data_dir}/cost_table_tidy.csv')
-    solar_locations_df = load_location_rankings('solar')
-    wind_locations_df = load_location_rankings('wind')
+    
+    # Load static data (cached if called multiple times)
+    if static_data is None:
+        static_data = load_static_data_once(data_dir)
+    
+    ppu_constructs_df = static_data['ppu_constructs_df']
+    cost_df = static_data['cost_df']
+    solar_locations_df = static_data['solar_locations_df']
+    wind_locations_df = static_data['wind_locations_df']
 
     # Initialize history tracking for raw_energy_storage and raw_energy_incidence
     for storage in raw_energy_storage:
