@@ -4,7 +4,8 @@
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+import time
+from typing import Any, Dict, List, Tuple, Optional
 from scipy.interpolate import CubicSpline
 try:
     from tqdm import tqdm
@@ -46,6 +47,7 @@ from calculationsPpuFramework import (
 # STATIC DATA CACHING - Load once and reuse across multiple pipeline calls
 # ============================================================================
 _STATIC_DATA_CACHE = None
+_ANNUAL_DATA_CACHE = None
 
 def load_static_data_once(data_dir: str = 'data') -> Dict:
     """
@@ -73,9 +75,135 @@ def load_static_data_once(data_dir: str = 'data') -> Dict:
             'solar_locations_df': load_location_rankings('solar'),
             'wind_locations_df': load_location_rankings('wind'),
         }
-        print("[CACHE] Static data loaded and cached.")
-    
     return _STATIC_DATA_CACHE
+
+
+def ensure_caches_loaded(data_dir: str = 'data', verbose: bool = False) -> None:
+    """Ensure annual and static caches are loaded.
+
+    This initializes the global `_ANNUAL_DATA_CACHE` and `_STATIC_DATA_CACHE`
+    if they are not already populated. The function tolerates missing helper
+    functions (e.g., `load_annual_data`) and prints timing information when
+    `verbose` is True.
+
+    Args:
+        data_dir: Directory where data files are located.
+        verbose: If True, prints timing information and warnings.
+    """
+    global _ANNUAL_DATA_CACHE, _STATIC_DATA_CACHE
+
+    # Annual data cache
+    if _ANNUAL_DATA_CACHE is None:
+        t_load_start = time.time()
+        loader = globals().get('load_annual_data')
+        if callable(loader):
+            try:
+                _ANNUAL_DATA_CACHE = loader(f'{data_dir}/')
+            except Exception as e:
+                _ANNUAL_DATA_CACHE = None
+                if verbose:
+                    print(f"  [WARN] failed to load annual data: {e}")
+            else:
+                if verbose:
+                    print(f"  [TIMING] annual data load: {time.time() - t_load_start:.2f}s (cached)")
+        else:
+            _ANNUAL_DATA_CACHE = None
+            if verbose:
+                print("  [WARN] `load_annual_data` not available; annual cache not loaded")
+
+    # Static data cache
+    if _STATIC_DATA_CACHE is None:
+        t_static_start = time.time()
+        try:
+            _STATIC_DATA_CACHE = load_static_data_once(data_dir)
+        except Exception as e:
+            if verbose:
+                print(f"  [WARN] failed to load static data: {e}")
+        else:
+            if verbose:
+                print(f"  [TIMING] static data load: {time.time() - t_static_start:.2f}s (cached)")
+
+
+def get_annual_data_cache(data_dir: str = 'data') -> Dict[str, Any]:
+    """
+    Return the cached annual dataset, ensuring it is loaded first.
+    """
+    ensure_caches_loaded(data_dir=data_dir)
+    if _ANNUAL_DATA_CACHE is None:
+        raise RuntimeError(
+            "Annual data cache is unavailable; ensure `load_annual_data` exists and completes successfully."
+        )
+    return _ANNUAL_DATA_CACHE
+
+
+def get_static_data_cache(data_dir: str = 'data') -> Dict[str, Any]:
+    """
+    Return the cached static dataset, ensuring it is loaded first.
+    """
+    ensure_caches_loaded(data_dir=data_dir)
+    if _STATIC_DATA_CACHE is None:
+        raise RuntimeError("Static data cache is unavailable; verify the static CSV inputs.")
+    return _STATIC_DATA_CACHE
+
+
+def generate_random_scenario(
+    annual_data: Optional[Dict[str, Any]] = None,
+    num_days: int = 30,
+    seed: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Sample a sequence of day indices WITH replacement and return only that series.
+
+    If `annual_data` is not provided, this function will use the module-level
+    annual cache (loaded/validated via `get_annual_data_cache`). Callers that
+    prefer to remain cache-free may pass `annual_data` explicitly.
+
+    Parameters
+    ----------
+    annual_data : dict, optional
+        Annual data (only `timestamp_index` used here). If None, the global
+        cache is used.
+    num_days : int
+        Number of day indices to sample
+    seed : int, optional
+        Random seed for reproducibility
+
+    Returns
+    -------
+    scenario_dict : dict
+        - 'selected_days': Ordered list (length = num_days; duplicates allowed)
+        - 'num_days': Number of sampled days
+        - 'sampled_dates': List of datetime objects representing start of each sampled day
+    """
+    # Resolve annual data (use validated cache if not supplied)
+    load_static_data_once()
+    if annual_data is None:
+        annual_data = get_annual_data_cache()
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    n_days_in_year = 365
+    day_indices = np.random.randint(0, n_days_in_year, size=num_days).tolist()
+
+    # Build list of datetime objects (start of each sampled day) if available
+    sampled_dates = []
+    if isinstance(annual_data, dict) and 'timestamp_index' in annual_data:
+        for day_idx in day_indices:
+            start_pos = day_idx * 96
+            try:
+                if start_pos < len(annual_data['timestamp_index']):
+                    sampled_dates.append(annual_data['timestamp_index'][start_pos])
+                else:
+                    sampled_dates.append(None)
+            except Exception:
+                sampled_dates.append(None)
+
+    return {
+        'selected_days': day_indices,
+        'num_days': num_days,
+        'sampled_dates': sampled_dates
+    }
 
 
 def scale_storage_capacities_by_unit_counts(
@@ -710,9 +838,22 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     Returns:
         Tuple of (Technology_volume, phi_smoothed)
     """
+    # Prefer static/cached location ranking data instead of requiring callers
+    # to pass rankings on every call. Load cached static data (no-op if already loaded).
+    try:
+        static_data = load_static_data_once()
+        # Replace ranking DataFrames if static versions exist
+        if static_data is not None:
+            if 'solar_locations_df' in static_data and (solar_ranking_df is None or getattr(solar_ranking_df, 'empty', False)):
+                solar_ranking_df = static_data['solar_locations_df']
+            if 'wind_locations_df' in static_data and (wind_ranking_df is None or getattr(wind_ranking_df, 'empty', False)):
+                wind_ranking_df = static_data['wind_locations_df']
+    except Exception:
+        # If caching/load fails, continue with whatever was passed in
+        pass
+
     num_timesteps = min(len(demand_15min), len(spot_15min), len(ror_df),
                        len(solar_15min), len(wind_15min))
-    # num_timesteps = 1000
     
     # Precompute renewable productions (MAJOR SPEEDUP)
     print("Precomputing renewable productions...")
@@ -758,7 +899,9 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
                 grid_energy = incidence_item['current_value']
                 break
         # 4) Compute overflow = demand - energy in "Grid"
+        
         overflow_MW = demand_MW - grid_energy
+
         # print(f"The overflow is of : {overflow_MW} MW at timestep {t}")
         # Count state occurrence for this timestep
         if overflow_MW > hyperparams['epsilon']:
@@ -940,7 +1083,7 @@ def compute_portfolio_metrics(cost_summary: Dict[str, Dict], spot_15min: pd.Seri
     }
 
 
-def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
+def run_complete_pipeline(scenario, ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
                         raw_energy_incidence: List[Dict], data_dir: str = "data", 
                         hyperparams: Optional[Dict] = None, static_data: Optional[Dict] = None) -> Dict:
     """
@@ -957,40 +1100,7 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
     Returns:
         Complete pipeline results dictionary
     """
-    print("=" * 80)
-    print(f"ENERGY DISPATCH PIPELINE - DURATION OF YEAR 2024 SIMULATION")
-    print("=" * 80)
-
-    # Default hyperparameters
-    if hyperparams is None:
-        hyperparams = {
-            'alpha_d': 0.5,
-            'alpha_u': 1000.0,
-            'alpha_m': 5.0,
-            'weight_spread': 1.0,
-            'weight_volatility': 1.0,
-            'volatility_scale': 30.0,
-            'epsilon': 1e-6,
-            'timestep_hours': 0.25,
-            'ema_beta': 0.2,
-            'horizons': ['1d', '3d', '7d', '30d'],
-            'wood_price_chf_per_kwh' : 0.095,
-            'palm_oil_price_chf_per_kwh' : 0.070
-        }
-    hyperparams.update({
-    'spot_unit': 'CHF_per_MWh',       # your spot is ~90–100 CHF/MWh
-    'ppu_cost_unit': 'CHF_per_KWh',   # your per-PPU 'cost' column is per kWh
-    'cost_column': 'cost',            # USE VARIABLE COST (not LCOE)
-    'use_efficiency': True,           # divide cost_in by efficiency to get cost_out
-    'beta_c': 0.12,                   # sensitivity in CHF/kWh (~120 CHF/MWh) to avoid pinning
-    'auto_beta_c': True,              # optional: auto-scale each step
-    'beta_c_pctl': 90,                # use 90th percentile |spread|
-    'beta_c_min': 0.03,               # clamp in CHF/kWh
-    'beta_c_max': 0.30,
-    'alpha_u': 5000.0,                # MW scale for utility to avoid u_dis/u_chg=1.0
-    'stor_deadband': 0.05,
-    'default_target_soc': 0.6
-    })
+    
 
     print("\n[STEP 1] Loading data...")
 
@@ -1018,79 +1128,20 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
         if 'history' not in incidence:
             incidence['history'] = []
 
-    # Configure PPUs using dictionary approach
-    ppu_dictionary = initialize_ppu_dictionary()
+    hyperparams = provide_hyper_parameters(hyperparams=hyperparams)
 
-    # Add PPUs based on counts
-    ppu_types = list(ppu_counts.keys())
-    for ppu_type in ppu_types:
-        count = ppu_counts[ppu_type]
-        for i in range(count):
-            ppu_dictionary = add_ppu_to_dictionary(
-                ppu_dictionary,
-                ppu_type,
-                ppu_constructs_df,
-                cost_df,
-                solar_locations_df,
-                wind_locations_df,
-                raw_energy_storage=raw_energy_storage,
-                raw_energy_incidence=raw_energy_incidence
-            )
-
-    # Scale storage capacities by number of Store-PPUs feeding them (e.g., NH3_FULL: 3 -> 3x Ammonia)
-    scale_storage_capacities_by_unit_counts(ppu_dictionary, raw_energy_storage, do_not_scale=['Lake'])
-    # Print entire PPU dictionnary 
-    print(f"  ✓ Loaded demand: {len(demand_15min)} timesteps")
-    print(f"  ✓ Loaded spot prices: {len(spot_15min)} timesteps")
-    print(f"  ✓ Loaded solar/wind data: {len(solar_15min)}/{len(wind_15min)} timesteps")
-    print(f"  ✓ Configured {len(ppu_dictionary)} PPUs from {len(ppu_types)} types")
-
-    # Print entire PPU dictionary with comprehensive details
-    print("\nPPU CONFIGURATION:")
-    print("=" * 120)
-    for each_ppu in ppu_dictionary.itertuples():
-        ppu_name = each_ppu.PPU_Name
-        ppu_type = getattr(each_ppu, 'Type', 'N/A')
-        classification = getattr(each_ppu, 'PPU_Extract', 'N/A')
-        
-        # Get storage-related information
-        can_extract = getattr(each_ppu, 'can_extract_from', [])
-        can_input = getattr(each_ppu, 'can_input_to', [])
-        
-        # Get efficiency and cost
-        efficiency = getattr(each_ppu, 'Chain_Efficiency', 'N/A')
-        cost_kwh = getattr(each_ppu, 'Cost_CHF_per_kWh', 'N/A')
-        
-        # Get location rank if applicable
-        location = getattr(each_ppu, 'Location_Rank', 'N/A')
-        
-        print(f"  {ppu_name:15} | Classification: {classification:10} | Type: {ppu_type:15}")
-        
-        if can_extract:
-            print(f"      → Extracts from: {', '.join(can_extract)}")
-        if can_input:
-            print(f"      → Inputs to: {', '.join(can_input)}")
-        
-        print(f"      → Efficiency: {efficiency if isinstance(efficiency, str) else f'{efficiency:.2%}'} | Cost: {cost_kwh if isinstance(cost_kwh, str) else f'{cost_kwh:.4f}'} CHF/kWh", end="")
-        
-        if location != 'N/A' and pd.notna(location):
-            print(f" | Location Rank: {int(location)}")
-        else:
-            print()
-        print()
-    print("=" * 120)
-
-    print("\n[STEP 2] Running dispatch simulation...")
+    ppu_dictionary = build_ppu_dictionary(
+        ppu_counts, static_data, raw_energy_storage, raw_energy_incidence
+    )
+    scale_storage_capacities_by_unit_counts(
+        ppu_dictionary, raw_energy_storage, do_not_scale=['Lake']
+    )
     technology_volume, phi_smoothed = run_dispatch_simulation(
         demand_15min, spot_15min, ror_df, solar_15min, wind_15min,
         ppu_dictionary, solar_ranking_df, wind_ranking_df, 
         raw_energy_storage, raw_energy_incidence, hyperparams
     )
-
-    print("\n[STEP 3] Computing costs...")
     cost_summary = compute_cost_breakdown(technology_volume, spot_15min, hyperparams, data_dir)
-
-    print("\n[STEP 4] Computing portfolio metrics...")
     portfolio_metrics = compute_portfolio_metrics(cost_summary, spot_15min, demand_15min, hyperparams)
 
     print("\n" + "=" * 80)
@@ -1135,6 +1186,70 @@ def run_complete_pipeline(ppu_counts: Dict[str, int], raw_energy_storage: List[D
 
     print("\n✓ PIPELINE EXECUTION COMPLETE")
     return results
+
+def provide_hyper_parameters(hyperparams: Optional[Dict] = None) -> Dict:
+    defaults = {
+        'alpha_d': 0.5,
+        'alpha_u': 5000.0,
+        'alpha_m': 5.0,
+        'weight_spread': 1.0,
+        'weight_volatility': 1.0,
+        'volatility_scale': 30.0,
+        'epsilon': 1e-6,
+        'timestep_hours': 0.25,
+        'ema_beta': 0.2,
+        'horizons': ['1d', '3d', '7d', '30d'],
+        'wood_price_chf_per_kwh': 0.095,
+        'palm_oil_price_chf_per_kwh': 0.070,
+        'spot_unit': 'CHF_per_MWh',
+        'ppu_cost_unit': 'CHF_per_KWh',
+        'cost_column': 'cost',
+        'use_efficiency': True,
+        'beta_c': 0.12,
+        'auto_beta_c': True,
+        'beta_c_pctl': 90,
+        'beta_c_min': 0.03,
+        'beta_c_max': 0.30,
+        'stor_deadband': 0.05,
+        'default_target_soc': 0.6
+    }
+
+    if not hyperparams:
+        return dict(defaults)
+
+    merged = dict(defaults)
+    for k in defaults:
+        v = hyperparams.get(k)
+        # treat missing, None, empty string, and empty container as "not provided"
+        if v is None or v == "" or (hasattr(v, "__len__") and not isinstance(v, (str, bytes)) and len(v) == 0):
+            continue
+        merged[k] = v
+
+    return merged
+    
+
+
+def build_ppu_dictionary(ppu_counts, static_data, raw_energy_storage, raw_energy_incidence):
+    ppu_constructs_df = static_data['ppu_constructs_df']
+    cost_df = static_data['cost_df']
+    solar_locations_df = static_data['solar_locations_df']
+    wind_locations_df = static_data['wind_locations_df']
+
+    ppu_dict = initialize_ppu_dictionary()
+    for ppu_type, count in ppu_counts.items():
+        for _ in range(count):
+            ppu_dict = add_ppu_to_dictionary(
+                ppu_dict,
+                ppu_type,
+                ppu_constructs_df,
+                cost_df,
+                solar_locations_df,
+                wind_locations_df,
+                raw_energy_storage=raw_energy_storage,
+                raw_energy_incidence=raw_energy_incidence
+            )
+    scale_storage_capacities_by_unit_counts(ppu_dict, raw_energy_storage, do_not_scale=['Lake'])
+    return ppu_dict
 
 
 def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_volume: Dict, t: int,
@@ -1787,4 +1902,3 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
         Technology_volume[each_store_ppu['ppu_name']]['spot_sold'].append((t, spot_sell))
 
     return raw_energy_storage
-

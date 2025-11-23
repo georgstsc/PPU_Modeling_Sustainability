@@ -159,84 +159,68 @@ def generate_random_scenario(
     seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Randomly select num_days individual days from annual data and concatenate.
-    
+    Sample a sequence of day indices WITH replacement and return only that series.
+
+    This minimalist version ignores slicing and concatenating demand/price/resource
+    arrays. It is intended for downstream code that will perform its own data
+    assembly given the ordered list of selected day indices.
+
     Parameters
     ----------
     annual_data : dict
-        Output from load_annual_data()
+        Annual data (only timestamp_index used here)
     num_days : int
-        Number of days to sample (default=30)
+        Number of day indices to sample
     seed : int, optional
         Random seed for reproducibility
-        
+
     Returns
     -------
     scenario_dict : dict
-        - 'demand_MW': Array of concatenated demand
-        - 'spot_price': Array of concatenated spot prices
-        - 'solar_cf': Array of solar capacity factors
-        - 'wind_cf': Array of wind capacity factors
-        - 'ror_MW': Array of RoR production
-        - 'selected_days': List[int] selected day numbers (0-364)
-        - 'num_days': int number of days sampled
+        - 'selected_days': Ordered list (length = num_days; duplicates allowed)
+        - 'num_days': Number of sampled days
+        - 'sampled_dates': List of datetime objects representing start of each sampled day
     """
     if seed is not None:
         np.random.seed(seed)
     
-    # Sample random days (without replacement)
     n_days_in_year = 365
-    day_indices = np.random.choice(n_days_in_year, size=num_days, replace=False)
-    day_indices = sorted(day_indices.tolist())  # Sort for easier interpretation
-    
-    # Extract 96 timesteps per day and concatenate
-    timesteps_per_day = 96
-    
-    # Initialize lists for concatenation
-    demand_segments = []
-    spot_segments = []
-    solar_segments = []
-    wind_segments = []
-    ror_segments = []
+    day_indices = np.random.randint(0, n_days_in_year, size=num_days).tolist()
+
+    # Build list of datetime objects (start of each sampled day) if available
     sampled_dates = []
-    
-    for day_idx in day_indices:
-        start_idx = day_idx * timesteps_per_day
-        end_idx = (day_idx + 1) * timesteps_per_day
-        
-        # Extract segments - handle Series/arrays
-        demand_seg = annual_data['demand_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['demand_15min'], 'iloc') else annual_data['demand_15min'][start_idx:end_idx]
-        spot_seg = annual_data['spot_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['spot_15min'], 'iloc') else annual_data['spot_15min'][start_idx:end_idx]
-        solar_seg = annual_data['solar_incidence'].iloc[start_idx:end_idx] if hasattr(annual_data['solar_incidence'], 'iloc') else annual_data['solar_incidence'][start_idx:end_idx]
-        wind_seg = annual_data['wind_incidence'].iloc[start_idx:end_idx] if hasattr(annual_data['wind_incidence'], 'iloc') else annual_data['wind_incidence'][start_idx:end_idx]
-        ror_seg = annual_data['ror_15min'].iloc[start_idx:end_idx] if hasattr(annual_data['ror_15min'], 'iloc') else annual_data['ror_15min'][start_idx:end_idx]
-        
-        demand_segments.append(demand_seg)
-        spot_segments.append(spot_seg)
-        solar_segments.append(solar_seg)
-        wind_segments.append(wind_seg)
-        ror_segments.append(ror_seg)
-        
-        # Record the date
-        sampled_dates.append(annual_data['timestamp_index'][start_idx])
-    
-    # Concatenate all segments - convert to numpy arrays
-    scenario_demand = np.concatenate([np.array(s) for s in demand_segments])
-    scenario_spot = np.concatenate([np.array(s) for s in spot_segments])
-    scenario_solar = np.concatenate([np.array(s) for s in solar_segments])
-    scenario_wind = np.concatenate([np.array(s) for s in wind_segments])
-    scenario_ror = np.concatenate([np.array(s) for s in ror_segments])
-    
+    if 'timestamp_index' in annual_data:
+        # Each day has 96 quarter-hour timesteps; take the first timestamp of each day
+        for day_idx in day_indices:
+            start_pos = day_idx * 96
+            if start_pos < len(annual_data['timestamp_index']):
+                sampled_dates.append(annual_data['timestamp_index'][start_pos])
+            else:
+                sampled_dates.append(None)
+
     return {
-        'demand_MW': scenario_demand,
-        'spot_price': scenario_spot,
-        'solar_cf': scenario_solar,
-        'wind_cf': scenario_wind,
-        'ror_MW': scenario_ror,
         'selected_days': day_indices,
         'num_days': num_days,
         'sampled_dates': sampled_dates
     }
+
+
+# Compatibility shim: prefer the pipeline-local implementation (uses global cache)
+# but keep the old signature so callers that pass `annual_data` keep working.
+try:
+    from calculationPipelineFramework import generate_random_scenario as _cpf_generate_random_scenario
+except Exception:
+    _cpf_generate_random_scenario = None
+
+if _cpf_generate_random_scenario is not None:
+    def generate_random_scenario(annual_data: Dict[str, Any], num_days: int = 30, seed: Optional[int] = None) -> Dict[str, Any]:
+        """Compatibility wrapper that delegates to calculationPipelineFramework.generate_random_scenario.
+
+        The `annual_data` argument is accepted for backward compatibility but ignored
+        because the pipeline-local generator uses the module-level annual cache.
+        """
+        return _cpf_generate_random_scenario(num_days=num_days, seed=seed)
+
 
 
 def validate_scenario_completeness(
@@ -277,90 +261,6 @@ def validate_scenario_completeness(
         return False, f"Total timesteps {num_timesteps} doesn't match expected {expected_timesteps} for {scenario_dict['num_days']} days"
     
     return True, f"Scenario valid: {scenario_dict['num_days']} days, {num_timesteps} timesteps"
-    
-    if report['errors']:
-        return False, report
-    
-    # Check lengths
-    expected_length = 2880  # 30 days × 96 timesteps/day
-    
-    for key in ['demand_15min', 'spot_15min', 'ror_15min']:
-        if len(scenario_dict[key]) != expected_length:
-            report['errors'].append(
-                f"{key} has length {len(scenario_dict[key])}, expected {expected_length}"
-            )
-    
-    # Check DataFrame shapes
-    if scenario_dict['solar_15min'].shape[0] != expected_length:
-        report['errors'].append(
-            f"solar_15min has {scenario_dict['solar_15min'].shape[0]} rows, expected {expected_length}"
-        )
-    
-    if scenario_dict['wind_15min'].shape[0] != expected_length:
-        report['errors'].append(
-            f"wind_15min has {scenario_dict['wind_15min'].shape[0]} rows, expected {expected_length}"
-        )
-    
-    # Check location counts
-    if scenario_dict['solar_15min'].shape[1] != expected_locations['solar']:
-        report['warnings'].append(
-            f"solar_15min has {scenario_dict['solar_15min'].shape[1]} locations, "
-            f"expected {expected_locations['solar']}"
-        )
-    
-    if scenario_dict['wind_15min'].shape[1] != expected_locations['wind']:
-        report['warnings'].append(
-            f"wind_15min has {scenario_dict['wind_15min'].shape[1]} locations, "
-            f"expected {expected_locations['wind']}"
-        )
-    
-    # Check for NaN values
-    if scenario_dict['demand_15min'].isna().any():
-        report['errors'].append("demand_15min contains NaN values")
-    
-    if scenario_dict['spot_15min'].isna().any():
-        report['errors'].append("spot_15min contains NaN values")
-    
-    # Check demand is positive
-    if (scenario_dict['demand_15min'] <= 0).any():
-        report['errors'].append("demand_15min contains non-positive values")
-    
-    # Check capacity factors in [0, 1]
-    solar_min = scenario_dict['solar_15min'].min().min()
-    solar_max = scenario_dict['solar_15min'].max().max()
-    
-    if solar_min < 0 or solar_max > 1:
-        report['errors'].append(
-            f"solar_15min capacity factors out of range [0,1]: [{solar_min}, {solar_max}]"
-        )
-    
-    wind_min = scenario_dict['wind_15min'].min().min()
-    wind_max = scenario_dict['wind_15min'].max().max()
-    
-    if wind_min < 0 or wind_max > 1:
-        report['errors'].append(
-            f"wind_15min capacity factors out of range [0,1]: [{wind_min}, {wind_max}]"
-        )
-    
-    # Check day_indices
-    if len(scenario_dict['day_indices']) != 30:
-        report['errors'].append(
-            f"day_indices has {len(scenario_dict['day_indices'])} days, expected 30"
-        )
-    
-    if any(d < 0 or d >= 365 for d in scenario_dict['day_indices']):
-        report['errors'].append("day_indices contains invalid day numbers (must be 0-364)")
-    
-    if len(set(scenario_dict['day_indices'])) != len(scenario_dict['day_indices']):
-        report['errors'].append("day_indices contains duplicate days")
-    
-    # Summary
-    if not report['errors']:
-        report['info'].append(f"Scenario validated successfully: {expected_length} timesteps")
-        return True, report
-    else:
-        return False, report
-
 
 # ============================================================================
 # STEP 2: Cost Escalation and Portfolio Encoding
