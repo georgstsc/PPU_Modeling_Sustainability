@@ -46,10 +46,12 @@ from calculationsPpuFramework import (
 # ============================================================================
 # STATIC DATA CACHING - Load once and reuse across multiple pipeline calls
 # ============================================================================
-_STATIC_DATA_CACHE = None
-_ANNUAL_DATA_CACHE = None
+_STATIC_DATA_CACHE: Optional[Dict[str, Any]] = None
+_ANNUAL_DATA_CACHE: Optional[Dict[str, Any]] = None
 
-def load_static_data_once(data_dir: str = 'data') -> Dict:
+
+
+def load_static_data(data_dir: str = 'data') -> Dict:
     """
     Load all static configuration data once and cache it.
     
@@ -77,72 +79,68 @@ def load_static_data_once(data_dir: str = 'data') -> Dict:
         }
     return _STATIC_DATA_CACHE
 
+def load_annual_data(data_dir: str = 'data') -> Optional[Dict[str, Any]]:
+    """
+    Load annual time-series data once and cache it.
 
-def ensure_caches_loaded(data_dir: str = 'data', verbose: bool = False) -> None:
-    """Ensure annual and static caches are loaded.
-
-    This initializes the global `_ANNUAL_DATA_CACHE` and `_STATIC_DATA_CACHE`
-    if they are not already populated. The function tolerates missing helper
-    functions (e.g., `load_annual_data`) and prints timing information when
-    `verbose` is True.
+    The returned dictionary contains:
+      - 'demand_15min'
+      - 'spot_15min'
+      - 'ror_df'
+      - 'solar_15min'
+      - 'wind_15min'
+      - 'timestamp_index' (canonical DatetimeIndex for 15-min timesteps)
 
     Args:
-        data_dir: Directory where data files are located.
-        verbose: If True, prints timing information and warnings.
+        data_dir: Directory containing the data files.
+
+    Returns:
+        The cached annual data dictionary or None if loading failed.
     """
-    global _ANNUAL_DATA_CACHE, _STATIC_DATA_CACHE
+    global _ANNUAL_DATA_CACHE
 
-    # Annual data cache
     if _ANNUAL_DATA_CACHE is None:
-        t_load_start = time.time()
-        loader = globals().get('load_annual_data')
-        if callable(loader):
-            try:
-                _ANNUAL_DATA_CACHE = loader(f'{data_dir}/')
-            except Exception as e:
-                _ANNUAL_DATA_CACHE = None
-                if verbose:
-                    print(f"  [WARN] failed to load annual data: {e}")
-            else:
-                if verbose:
-                    print(f"  [TIMING] annual data load: {time.time() - t_load_start:.2f}s (cached)")
-        else:
-            _ANNUAL_DATA_CACHE = None
-            if verbose:
-                print("  [WARN] `load_annual_data` not available; annual cache not loaded")
+        print("[CACHE] Loading annual data (first time, will be cached)...")
+        # Reuse the existing loaders in this module so behavior stays consistent
+        demand_15min, spot_15min, ror_df = load_energy_data(data_dir)
+        solar_15min, wind_15min = load_incidence_data(data_dir)
 
-    # Static data cache
-    if _STATIC_DATA_CACHE is None:
-        t_static_start = time.time()
-        try:
-            _STATIC_DATA_CACHE = load_static_data_once(data_dir)
-        except Exception as e:
-            if verbose:
-                print(f"  [WARN] failed to load static data: {e}")
-        else:
-            if verbose:
-                print(f"  [TIMING] static data load: {time.time() - t_static_start:.2f}s (cached)")
+        # Use demand index as the canonical timestamp index when available
+        timestamp_index = getattr(demand_15min, 'index', None)
 
+        _ANNUAL_DATA_CACHE = {
+            'demand_15min': demand_15min,
+            'spot_15min': spot_15min,
+            'ror_df': ror_df,
+            'solar_15min': solar_15min,
+            'wind_15min': wind_15min,
+            'timestamp_index': timestamp_index,
+        }
 
-def get_annual_data_cache(data_dir: str = 'data') -> Dict[str, Any]:
+    return _ANNUAL_DATA_CACHE
+
+def load_cache_data(data_dir: str = 'data') -> None:
+    """
+    Load both static and annual data caches.
+    """
+    load_static_data(data_dir=data_dir)
+    load_annual_data(data_dir=data_dir)
+
+def get_annual_data_cache(data_dir: str = 'data') -> Optional[Dict[str, Any]]:
     """
     Return the cached annual dataset, ensuring it is loaded first.
     """
-    ensure_caches_loaded(data_dir=data_dir)
     if _ANNUAL_DATA_CACHE is None:
-        raise RuntimeError(
-            "Annual data cache is unavailable; ensure `load_annual_data` exists and completes successfully."
-        )
+        load_cache_data(data_dir=data_dir)
     return _ANNUAL_DATA_CACHE
 
 
-def get_static_data_cache(data_dir: str = 'data') -> Dict[str, Any]:
+def get_static_data_cache(data_dir: str = 'data') -> Optional[Dict[str, Any]]:
     """
     Return the cached static dataset, ensuring it is loaded first.
     """
-    ensure_caches_loaded(data_dir=data_dir)
     if _STATIC_DATA_CACHE is None:
-        raise RuntimeError("Static data cache is unavailable; verify the static CSV inputs.")
+        load_cache_data(data_dir=data_dir)
     return _STATIC_DATA_CACHE
 
 
@@ -176,9 +174,8 @@ def generate_random_scenario(
         - 'sampled_dates': List of datetime objects representing start of each sampled day
     """
     # Resolve annual data (use validated cache if not supplied)
-    load_static_data_once()
     if annual_data is None:
-        annual_data = get_annual_data_cache()
+        annual_data = get_annual_data_cache(data_dir='data')
 
     if seed is not None:
         np.random.seed(seed)
@@ -581,66 +578,60 @@ def initialize_technology_tracking(ppu_dictionary: pd.DataFrame) -> Dict[str, Di
     return Technology_volume
 
 
-def precompute_renewable_productions(ppu_dictionary: pd.DataFrame, num_timesteps: int,
-                                     solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame) -> Dict:
+def precompute_renewable_productions(ppu_dictionary: pd.DataFrame, selected_days: List[int]) -> Dict:
     """
-    Precompute all renewable productions by grouping PPUs by rank.
-    
-    Args:
-        ppu_dictionary: PPU configuration
-        num_timesteps: Number of timesteps to precompute
-        solar_ranking_df: Solar location rankings
-        wind_ranking_df: Wind location rankings
-    
-    Returns:
-        Dictionary with:
-            'solar_prod_matrix': (num_timesteps, num_solar_ranks) or None
-            'wind_prod_matrix': (num_timesteps, num_wind_ranks) or None
-            'solar_rank_to_ppus': {rank: [(ppu_name, area_fraction), ...]}
-            'wind_rank_to_ppus': {rank: [(ppu_name, turbine_fraction), ...]}
-            'solar_ranks': sorted array of ranks
-            'wind_ranks': sorted array of ranks
+    Precompute renewable productions for the given selection of days.
+
+    Parameters
+    ----------
+    ppu_dictionary : pd.DataFrame
+        PPU configuration DataFrame (must include 'PPU_Name' and 'Location_Rank',
+        and 'can_extract_from').
+    selected_days : List[int]
+        List of day indices (0-based, 0..364) to include in the precomputation.
+
+    Returns
+    -------
+    dict
+        Same output structure as before:
+          - 'solar_prod_matrix': (num_timesteps, num_solar_ranks) or None
+          - 'wind_prod_matrix': (num_timesteps, num_wind_ranks) or None
+          - 'solar_rank_to_ppus': {rank: [(ppu_name, area_fraction), ...]}
+          - 'wind_rank_to_ppus': {rank: [(ppu_name, turbine_fraction), ...]}
+          - 'solar_ranks': sorted array of ranks
+          - 'wind_ranks': sorted array of ranks
     """
-    # Group solar PPUs by rank
-    solar_groups = {}  # rank: total_area
-    solar_ppu_map = {}  # rank: [(ppu_name, area), ...]
-    
-    wind_groups = {}  # rank: total_turbines
-    wind_ppu_map = {}  # rank: [(ppu_name, num_turbines), ...]
-    
-    for idx, row in ppu_dictionary.iterrows():
-        can_extract_from = row.get("can_extract_from", [])
+    # Validate input
+    if not isinstance(selected_days, (list, tuple, np.ndarray)):
+        raise TypeError("selected_days must be a list/tuple/ndarray of day indices")
+
+    # Build grouping maps from PPUs (same logic as before)
+    solar_groups = {}
+    solar_ppu_map = {}
+    wind_groups = {}
+    wind_ppu_map = {}
+
+    for _, row in ppu_dictionary.iterrows():
+        can_extract_from = row.get("can_extract_from", []) or []
         ppu_name = row['PPU_Name']
         location_rank = row.get('Location_Rank', np.nan)
-        
         if pd.notna(location_rank):
             rank = int(location_rank)
-            
             if 'Solar' in can_extract_from:
-                area_m2 = 100000  # Default area (could be from config)
-                solar_groups[rank] = solar_groups.get(rank, 0.0) + area_m2
-                if rank not in solar_ppu_map:
-                    solar_ppu_map[rank] = []
-                solar_ppu_map[rank].append((ppu_name, area_m2))
-                
-            elif 'Wind' in can_extract_from:
-                num_turbines = 5  # Default (could be from config)
-                wind_groups[rank] = wind_groups.get(rank, 0.0) + num_turbines
-                if rank not in wind_ppu_map:
-                    wind_ppu_map[rank] = []
-                wind_ppu_map[rank].append((ppu_name, num_turbines))
-    
-    # Convert to fraction maps for distribution
-    solar_rank_to_ppus = {}
-    for rank, ppus in solar_ppu_map.items():
-        total = solar_groups[rank]
-        solar_rank_to_ppus[rank] = [(name, area/total) for name, area in ppus]
-    
-    wind_rank_to_ppus = {}
-    for rank, ppus in wind_ppu_map.items():
-        total = wind_groups[rank]
-        wind_rank_to_ppus[rank] = [(name, turb/total) for name, turb in ppus]
-    
+                area_m2 = row.get('area_m2', 100000)
+                solar_groups[rank] = solar_groups.get(rank, 0.0) + float(area_m2)
+                solar_ppu_map.setdefault(rank, []).append((ppu_name, float(area_m2)))
+            if 'Wind' in can_extract_from:
+                num_turbines = row.get('num_turbines', 5)
+                wind_groups[rank] = wind_groups.get(rank, 0.0) + float(num_turbines)
+                wind_ppu_map.setdefault(rank, []).append((ppu_name, float(num_turbines)))
+
+    # Convert totals to fraction maps
+    solar_rank_to_ppus = {r: [(n, a / solar_groups[r]) for n, a in solar_ppu_map[r]]
+                          for r in solar_ppu_map}
+    wind_rank_to_ppus = {r: [(n, t / wind_groups[r]) for n, t in wind_ppu_map[r]]
+                         for r in wind_ppu_map}
+
     result = {
         'solar_prod_matrix': None,
         'wind_prod_matrix': None,
@@ -649,42 +640,62 @@ def precompute_renewable_productions(ppu_dictionary: pd.DataFrame, num_timesteps
         'solar_ranks': np.array([]),
         'wind_ranks': np.array([])
     }
-    
-    # Precompute solar productions
+
+    # Compute number of timesteps we will produce (96 timesteps per day)
+    DAY_STEPS = 96
+    sel_days = list(selected_days)
+    if len(sel_days) == 0:
+        return result
+    num_timesteps = len(sel_days) * DAY_STEPS
+
+    # Get static data (may contain location dfs or other metadata)
+    static_data = get_static_data_cache()
+
+    # Precompute solar productions if any solar PPUs present
     if solar_groups:
         _init_solar_mapper('data/solar_incidence_hourly_2024.csv')
         if _SOLAR_MAPPER is not None:
             try:
                 solar_ranks = np.array(sorted(solar_groups.keys()), dtype=np.int32)
                 solar_areas = np.array([solar_groups[r] for r in solar_ranks], dtype=np.float32)
-                result['solar_prod_matrix'] = _SOLAR_MAPPER.precompute_productions(
-                    solar_ranks, solar_areas, num_timesteps
-                )
+                # Map ranks -> column indices
+                col_idxs = np.array([_SOLAR_MAPPER.col_for_rank(int(r)) for r in solar_ranks], dtype=np.int32)
+                parts = []
+                for d in sel_days:
+                    s = int(d) * DAY_STEPS
+                    e = s + DAY_STEPS
+                    parts.append(_SOLAR_MAPPER.data[s:e, col_idxs])
+                irr_matrix = np.vstack(parts)
+                result['solar_prod_matrix'] = _solar_prod_batch(irr_matrix, solar_areas)
                 result['solar_ranks'] = solar_ranks
                 print(f"  Precomputed solar productions: {len(solar_ranks)} ranks, {num_timesteps} timesteps")
             except Exception as e:
                 print(f"  Solar precomputation failed: {e}, will use fallback")
-    
-    # Precompute wind productions
+
+    # Precompute wind productions if any wind PPUs present
     if wind_groups:
         _init_wind_mapper('data/wind_incidence_hourly_2024.csv')
         if _WIND_MAPPER is not None:
             try:
                 wind_ranks = np.array(sorted(wind_groups.keys()), dtype=np.int32)
                 wind_nums = np.array([wind_groups[r] for r in wind_ranks], dtype=np.float32)
-                result['wind_prod_matrix'] = _WIND_MAPPER.precompute_productions(
-                    wind_ranks, wind_nums, num_timesteps
-                )
+                col_idxs = np.array([_WIND_MAPPER.col_for_rank(int(r)) for r in wind_ranks], dtype=np.int32)
+                parts = []
+                for d in sel_days:
+                    s = int(d) * DAY_STEPS
+                    e = s + DAY_STEPS
+                    parts.append(_WIND_MAPPER.data[s:e, col_idxs])
+                wspd_matrix = np.vstack(parts)
+                result['wind_prod_matrix'] = _wind_power_batch(wspd_matrix, wind_nums)
                 result['wind_ranks'] = wind_ranks
                 print(f"  Precomputed wind productions: {len(wind_ranks)} ranks, {num_timesteps} timesteps")
             except Exception as e:
                 print(f"  Wind precomputation failed: {e}, will use fallback")
-    
+
     return result
 
 
-def calculate_solar_production(location_rank: int, area_m2: float, t: int,
-                              solar_15min: pd.DataFrame, solar_ranking_df: pd.DataFrame) -> float:
+def calculate_solar_production(location_rank: int, area_m2: float, t: int) -> float:
     """
     Calculate solar production for a location at timestep t.
 
@@ -703,12 +714,16 @@ def calculate_solar_production(location_rank: int, area_m2: float, t: int,
     """
     # Fast path using SolarMapper
     _init_solar_mapper('data/solar_incidence_hourly_2024.csv')
+    static_data = get_static_data_cache('data')
+    if not isinstance(static_data, dict):
+        raise TypeError("There is a problem with your static variable")
+    ranking_solar = static_data['solar_locations_df']
     if _SOLAR_MAPPER is not None:
-        try:
+        try: 
             lat = lon = None
-            if len(solar_ranking_df) > 0:
-                location_idx = (location_rank - 1) % len(solar_ranking_df)
-                loc_row = solar_ranking_df.iloc[location_idx]
+            if len(ranking_solar) > 0:
+                location_idx = (location_rank - 1) % len(ranking_solar)
+                loc_row = ranking_solar.iloc[location_idx]
                 lat = float(loc_row['latitude'])
                 lon = float(loc_row['longitude'])
             if lat is not None and lon is not None:
@@ -718,37 +733,37 @@ def calculate_solar_production(location_rank: int, area_m2: float, t: int,
             irr = _SOLAR_MAPPER.irradiance(int(t), int(col_idx))
             return float(_solar_prod_fast(float(irr), float(area_m2)))
         except Exception:
-            # Fall back to original path below
             pass
-
-    # Fallback: original implementation using provided solar_15min
-    num_locations = len(solar_ranking_df)
-    if num_locations == 0:
-        return 0.0
-    location_idx = (location_rank - 1) % num_locations
-    loc = solar_ranking_df.iloc[location_idx]
-    lat, lon = float(loc['latitude']), float(loc['longitude'])
-
-    closest_col = None
-    min_dist = float('inf')
-    for col in solar_15min.columns:
-        dist = abs(float(col[0]) - lat) + abs(float(col[1]) - lon)
-        if dist < min_dist:
-            min_dist = dist
-            closest_col = col
-
-    if closest_col is not None:
-        incidence = solar_15min.iloc[t][closest_col]  # type: ignore
-        incidence = incidence.item() if hasattr(incidence, 'item') else float(incidence)  # type: ignore
-    else:
-        incidence = 0.0
-
-    production_MW = float(incidence) * float(area_m2) * 0.25 / 1000.0
-    return production_MW
+    raise RuntimeError(f"SolarMapper is broken please fix")
 
 
-def calculate_wind_production(location_rank: int, num_turbines: int, t: int,
-                             wind_15min: pd.DataFrame, wind_ranking_df: pd.DataFrame) -> float:
+    # # Fallback: original implementation using provided solar_15min
+    # num_locations = len(solar_ranking_df)
+    # if num_locations == 0:
+    #     return 0.0
+    # location_idx = (location_rank - 1) % num_locations
+    # loc = solar_ranking_df.iloc[location_idx]
+    # lat, lon = float(loc['latitude']), float(loc['longitude'])
+
+    # closest_col = None
+    # min_dist = float('inf')
+    # for col in solar_15min.columns:
+    #     dist = abs(float(col[0]) - lat) + abs(float(col[1]) - lon)
+    #     if dist < min_dist:
+    #         min_dist = dist
+    #         closest_col = col
+
+    # if closest_col is not None:
+    #     incidence = solar_15min.iloc[t][closest_col]  # type: ignore
+    #     incidence = incidence.item() if hasattr(incidence, 'item') else float(incidence)  # type: ignore
+    # else:
+    #     incidence = 0.0
+
+    # production_MW = float(incidence) * float(area_m2) * 0.25 / 1000.0
+    # return production_MW
+
+
+def calculate_wind_production(location_rank: int, num_turbines: int, t: int) -> float:
     """
     Calculate wind production for a location at timestep t.
 
@@ -767,12 +782,16 @@ def calculate_wind_production(location_rank: int, num_turbines: int, t: int,
     """
     # Fast path using WindMapper
     _init_wind_mapper('data/wind_incidence_hourly_2024.csv')
+    static_data = get_static_data_cache('data')
+    if not isinstance(static_data, dict):
+        raise TypeError("There is a problem with your static variable")
+    ranking_wind = static_data['wind_locations_df']
     if _WIND_MAPPER is not None:
         try:
             lat = lon = None
-            if len(wind_ranking_df) > 0:
-                location_idx = (location_rank - 1) % len(wind_ranking_df)
-                loc_row = wind_ranking_df.iloc[location_idx]
+            if len(ranking_wind) > 0:
+                location_idx = (location_rank - 1) % len(ranking_wind)
+                loc_row = ranking_wind.iloc[location_idx]
                 lat = float(loc_row['latitude'])
                 lon = float(loc_row['longitude'])
             if lat is not None and lon is not None:
@@ -782,41 +801,38 @@ def calculate_wind_production(location_rank: int, num_turbines: int, t: int,
             wspd = _WIND_MAPPER.speed(int(t), int(col_idx))
             return float(_wind_power_fast(float(wspd), int(num_turbines)))
         except Exception:
-            # Fall back to original path below
             pass
+    raise RuntimeError(f"WindMapper is broken please fix")
 
-    # Fallback: original implementation using provided wind_15min
-    # Get location coordinates with bounds checking
-    num_locations = len(wind_ranking_df)
-    if num_locations == 0:
-        return 0.0
-    location_idx = (location_rank - 1) % num_locations
-    loc = wind_ranking_df.iloc[location_idx]
-    lat, lon = float(loc['latitude']), float(loc['longitude'])
+    # # Fallback: original implementation using provided wind_15min
+    # # Get location coordinates with bounds checking
+    # num_locations = len(wind_ranking_df)
+    # if num_locations == 0:
+    #     return 0.0
+    # location_idx = (location_rank - 1) % num_locations
+    # loc = wind_ranking_df.iloc[location_idx]
+    # lat, lon = float(loc['latitude']), float(loc['longitude'])
 
-    wind_speed = 0.0
-    if len(wind_15min.columns) > 0:
-        lats = np.array([float(col[0]) for col in wind_15min.columns])
-        lons = np.array([float(col[1]) for col in wind_15min.columns])
-        distances = np.abs(lats - lat) + np.abs(lons - lon)
-        closest_idx = int(np.argmin(distances))
-        wind_speed = float(wind_15min.iloc[t, closest_idx])  # type: ignore
+    # wind_speed = 0.0
+    # if len(wind_15min.columns) > 0:
+    #     lats = np.array([float(col[0]) for col in wind_15min.columns])
+    #     lons = np.array([float(col[1]) for col in wind_15min.columns])
+    #     distances = np.abs(lats - lat) + np.abs(lons - lon)
+    #     closest_idx = int(np.argmin(distances))
+    #     wind_speed = float(wind_15min.iloc[t, closest_idx])  # type: ignore
 
-    # Physics-based power with simple cut-in/out
-    rotor_diameter_m = 120.0
-    air_density = 1.225
-    swept_area = np.pi * (rotor_diameter_m / 2.0) ** 2
-    power_coefficient = 0.45
-    if wind_speed < 3.0 or wind_speed > 25.0:
-        return 0.0
-    power_per_turbine_W = 0.5 * air_density * swept_area * (wind_speed ** 3) * power_coefficient
-    return (power_per_turbine_W / 1e6) * float(num_turbines)
+    # # Physics-based power with simple cut-in/out
+    # rotor_diameter_m = 120.0
+    # air_density = 1.225
+    # swept_area = np.pi * (rotor_diameter_m / 2.0) ** 2
+    # power_coefficient = 0.45
+    # if wind_speed < 3.0 or wind_speed > 25.0:
+    #     return 0.0
+    # power_per_turbine_W = 0.5 * air_density * swept_area * (wind_speed ** 3) * power_coefficient
+    # return (power_per_turbine_W / 1e6) * float(num_turbines)
 
 
-def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
-                          ror_df: pd.DataFrame, solar_15min: pd.DataFrame,
-                          wind_15min: pd.DataFrame, ppu_dictionary: pd.DataFrame,
-                          solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame,
+def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFrame,
                           raw_energy_storage: List[Dict], raw_energy_incidence: List[Dict],
                           hyperparams: Dict) -> Tuple[Dict, float]:
     """
@@ -838,27 +854,11 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     Returns:
         Tuple of (Technology_volume, phi_smoothed)
     """
-    # Prefer static/cached location ranking data instead of requiring callers
-    # to pass rankings on every call. Load cached static data (no-op if already loaded).
-    try:
-        static_data = load_static_data_once()
-        # Replace ranking DataFrames if static versions exist
-        if static_data is not None:
-            if 'solar_locations_df' in static_data and (solar_ranking_df is None or getattr(solar_ranking_df, 'empty', False)):
-                solar_ranking_df = static_data['solar_locations_df']
-            if 'wind_locations_df' in static_data and (wind_ranking_df is None or getattr(wind_ranking_df, 'empty', False)):
-                wind_ranking_df = static_data['wind_locations_df']
-    except Exception:
-        # If caching/load fails, continue with whatever was passed in
-        pass
-
-    num_timesteps = min(len(demand_15min), len(spot_15min), len(ror_df),
-                       len(solar_15min), len(wind_15min))
     
     # Precompute renewable productions (MAJOR SPEEDUP)
     print("Precomputing renewable productions...")
     precomputed = precompute_renewable_productions(
-        ppu_dictionary, num_timesteps, solar_ranking_df, wind_ranking_df
+        ppu_dictionary, scenario['selected_days']
     )
     
     # Initialize technology tracking
@@ -870,106 +870,112 @@ def run_dispatch_simulation(demand_15min: pd.Series, spot_15min: pd.Series,
     surplus_count = 0
     balanced_count = 0
     
-    # Create progress bar
-    timestep_iter = tqdm(range(num_timesteps), desc="⚡ Dispatch Simulation", 
-                         unit="timestep", ncols=100, 
-                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-    
-    for t in timestep_iter:
-        if t % 5000 == 0:
-            # Update progress bar description with storage states
-            storage_status = " | ".join([f"{s['storage'][:4]}:{s['current_value']/1000:.0f}k" 
-                                        for s in raw_energy_storage[:3]])
-            timestep_iter.set_postfix_str(storage_status)
-        # 1) Import the demand
-        demand_MW = demand_15min.iloc[t]
-        spot_price = spot_15min.iloc[t]
+    # Iterate over the scenario-selected days and their 96 timesteps.
+    sel_days = list(scenario.get('selected_days', []))
+    DAY_STEPS = 96
+    total_timesteps = len(sel_days) * DAY_STEPS
 
-        # 2) Update raw_energy_incidence with respective values for each energy source/storage
-        raw_energy_incidence = update_raw_energy_incidence(
-            raw_energy_incidence, Technology_volume, t, solar_ranking_df, wind_ranking_df,
-            ppu_dictionary, ror_df, solar_15min, wind_15min, precomputed
-        )
+    # Load caches used inside the timestep loop (safely)
+    cached_annual = get_annual_data_cache('data') or {}
+    demand_15min = cached_annual.get('demand_15min') if isinstance(cached_annual, dict) else None
 
-        # Get energy produced by incidence PPUs (stored in "Grid")
-        grid_energy = 0.0
-        for incidence_item in raw_energy_incidence:
-            if incidence_item['storage'] == 'Grid':
-                # Get current value directly (already updated in update_raw_energy_incidence)
-                grid_energy = incidence_item['current_value']
-                break
-        # 4) Compute overflow = demand - energy in "Grid"
-        
-        overflow_MW = demand_MW - grid_energy
+    # Create progress bar across all selected timesteps
+    progress = tqdm(iterable=total_timesteps, desc="⚡ Dispatch Simulation",
+                    unit="timestep", ncols=100,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-        # print(f"The overflow is of : {overflow_MW} MW at timestep {t}")
-        # Count state occurrence for this timestep
-        if overflow_MW > hyperparams['epsilon']:
-            overflow_count += 1
-        elif overflow_MW < -hyperparams['epsilon']:
-            surplus_count += 1
-        else:
-            balanced_count += 1
+    for day_idx, day in enumerate(sel_days):
+        for sub in range(DAY_STEPS):
+            # Global timestep index in the full-year series
+            t_global = int(day) * DAY_STEPS + int(sub)
 
-        # First compute the d_stor, u_dis, u_chg and m for each PPU
-        ppu_indices = calculate_ppu_indices(
-            ppu_dictionary, raw_energy_storage, overflow_MW, phi_smoothed,
-            spot_price, spot_15min, t, hyperparams
-        )
-
-        # Update EMA of shortfall for utility index
-        phi_smoothed = exponential_moving_average(overflow_MW, phi_smoothed, hyperparams['ema_beta'])
-
-        # Store cost indices in Technology_volume
-        for ppu_name, indices in ppu_indices.items():
-            if ppu_name not in Technology_volume:
-                Technology_volume[ppu_name] = {
-                    'production': [],
-                    'spot_bought': [],
-                    'spot_sold': [],
-                    'cost_indices': []
-                }
-            Technology_volume[ppu_name]['cost_indices'].append((
-                t, 
-                indices['d_stor'], 
-                indices['u_dis'], 
-                indices['u_chg'], 
-                indices['m'],
-                indices['kappa_dis'],
-                indices['kappa_chg']
-            ))
-        if t % 5000 == 0:
-            print("[DEBUG] Storage state BEFORE handling:")
-            for storage in raw_energy_storage:
-                print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
-        # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
-        if overflow_MW > hyperparams['epsilon']:
-            raw_energy_storage = handle_energy_deficit(
-                overflow_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
-                ppu_indices, spot_price, t, hyperparams
+            # Provide the precomputed row index for lookups (concatenated days)
+            precomputed_row = day_idx * DAY_STEPS + sub
+            raw_energy_incidence = update_raw_energy_incidence(
+                ppu_dictionary,
+                raw_energy_incidence,
+                Technology_volume,
+                t_global
             )
-        # 4.2) If overflow < 0: use 'Store' PPUs
-        elif overflow_MW < -hyperparams['epsilon']:
-            surplus_MW = abs(overflow_MW)
-            raw_energy_storage = handle_energy_surplus(
-                surplus_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
-                ppu_indices, spot_price, t, hyperparams
-            )
-        # DEBUG: Show storage state before handling
-        if t % 5000 == 0:
-            print("[DEBUG] Storage state AFTER handling:")
-            for storage in raw_energy_storage:
-                print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
 
+            # Get energy produced by incidence PPUs (stored in "Grid")
+            grid_energy = 0.0
+            for incidence_item in raw_energy_incidence:
+                if incidence_item['storage'] == 'Grid':
+                    # Get current value directly (already updated in update_raw_energy_incidence)
+                    grid_energy = incidence_item.get('current_value', 0.0)
+                    break
+
+            # 4) Compute overflow = demand - energy in "Grid"
+            if demand_15min is not None and 0 <= t_global < len(demand_15min):
+                demand_MW = float(demand_15min.iloc[t_global])
+            else:
+                demand_MW = 0.0
+            overflow_MW = demand_MW - grid_energy
+
+            # Count state occurrence for this timestep
+            if overflow_MW > hyperparams['epsilon']:
+                overflow_count += 1
+            elif overflow_MW < -hyperparams['epsilon']:
+                surplus_count += 1
+            else:
+                balanced_count += 1
+            print(f"We need to calculate the ppu_indices")
+            # First compute the d_stor, u_dis, u_chg and m for each PPU
+            ppu_indices = calculate_ppu_indices(
+                ppu_dictionary, raw_energy_storage, overflow_MW, phi_smoothed,
+                spot_price, spot_15min, t_global, hyperparams
+            )
+
+            # Update EMA of shortfall for utility index
+            phi_smoothed = exponential_moving_average(overflow_MW, phi_smoothed, hyperparams['ema_beta'])
+
+            # Store cost indices in Technology_volume
+            for ppu_name, indices in ppu_indices.items():
+                if ppu_name not in Technology_volume:
+                    Technology_volume[ppu_name] = {
+                        'production': [],
+                        'spot_bought': [],
+                        'spot_sold': [],
+                        'cost_indices': []
+                    }
+                Technology_volume[ppu_name]['cost_indices'].append((
+                    t_global,
+                    indices['d_stor'],
+                    indices['u_dis'],
+                    indices['u_chg'],
+                    indices['m'],
+                    indices.get('kappa_dis', 1.0),
+                    indices.get('kappa_chg', 1.0)
+                ))
+
+            if t_global % 5000 == 0:
+                print("[DEBUG] Storage state BEFORE handling:")
+                for storage in raw_energy_storage:
+                    print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
+
+            # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
+            if overflow_MW > hyperparams['epsilon']:
+                raw_energy_storage = handle_energy_deficit(
+                    overflow_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
+                    ppu_indices, spot_price, t_global, hyperparams
+                )
+            # 4.2) If overflow < 0: use 'Store' PPUs
+            elif overflow_MW < -hyperparams['epsilon']:
+                surplus_MW = abs(overflow_MW)
+                raw_energy_storage = handle_energy_surplus(
+                    surplus_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
+                    ppu_indices, spot_price, t_global, hyperparams
+                )
     # Attach pipeline state statistics for later reporting
     Technology_volume['__pipeline_stats__'] = {
         'overflow_count': overflow_count,
         'surplus_count': surplus_count,
         'balanced_count': balanced_count,
-        'total_timesteps': num_timesteps
+        'total_timesteps': total_timesteps
     }
 
-    print(f"  ✓ Simulation complete: {num_timesteps:,} timesteps")
+    print(f"  ✓ Simulation complete: {total_timesteps:,} timesteps")
     print(f"    - Overflow (deficit) steps: {overflow_count:,}")
     print(f"    - Surplus steps:            {surplus_count:,}")
     print(f"    - Balanced steps:           {balanced_count:,}")
@@ -1083,9 +1089,9 @@ def compute_portfolio_metrics(cost_summary: Dict[str, Dict], spot_15min: pd.Seri
     }
 
 
-def run_complete_pipeline(scenario, ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
-                        raw_energy_incidence: List[Dict], data_dir: str = "data", 
-                        hyperparams: Optional[Dict] = None, static_data: Optional[Dict] = None) -> Dict:
+def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
+                        raw_energy_incidence: List[Dict], 
+                        hyperparams: Optional[Dict] = None) -> Dict:
     """
     Run the complete energy dispatch pipeline.
 
@@ -1100,25 +1106,6 @@ def run_complete_pipeline(scenario, ppu_counts: Dict[str, int], raw_energy_stora
     Returns:
         Complete pipeline results dictionary
     """
-    
-
-    print("\n[STEP 1] Loading data...")
-
-    # Load scenario-specific data (demand, spot, incidence)
-    demand_15min, spot_15min, ror_df = load_energy_data(data_dir)
-    solar_15min, wind_15min = load_incidence_data(data_dir)
-    solar_ranking_df = pd.read_csv(f'{data_dir}/ranking_incidence/solar_incidence_ranking.csv').head(10)
-    wind_ranking_df = pd.read_csv(f'{data_dir}/ranking_incidence/wind_incidence_ranking.csv').head(10)
-    
-    # Load static data (cached if called multiple times)
-    if static_data is None:
-        static_data = load_static_data_once(data_dir)
-    
-    ppu_constructs_df = static_data['ppu_constructs_df']
-    cost_df = static_data['cost_df']
-    solar_locations_df = static_data['solar_locations_df']
-    wind_locations_df = static_data['wind_locations_df']
-
     # Initialize history tracking for raw_energy_storage and raw_energy_incidence
     for storage in raw_energy_storage:
         if 'history' not in storage:
@@ -1131,16 +1118,16 @@ def run_complete_pipeline(scenario, ppu_counts: Dict[str, int], raw_energy_stora
     hyperparams = provide_hyper_parameters(hyperparams=hyperparams)
 
     ppu_dictionary = build_ppu_dictionary(
-        ppu_counts, static_data, raw_energy_storage, raw_energy_incidence
+        ppu_counts, raw_energy_storage, raw_energy_incidence
     )
-    scale_storage_capacities_by_unit_counts(
-        ppu_dictionary, raw_energy_storage, do_not_scale=['Lake']
-    )
+    print("We build the PPU dictionnary for this run")
     technology_volume, phi_smoothed = run_dispatch_simulation(
-        demand_15min, spot_15min, ror_df, solar_15min, wind_15min,
-        ppu_dictionary, solar_ranking_df, wind_ranking_df, 
-        raw_energy_storage, raw_energy_incidence, hyperparams
+        scenario = scenario, ppu_dictionary = ppu_dictionary, 
+        raw_energy_storage = raw_energy_storage, 
+        raw_energy_incidence = raw_energy_incidence, 
+        hyperparams = hyperparams
     )
+    print("We ran the dispatch simulation")
     cost_summary = compute_cost_breakdown(technology_volume, spot_15min, hyperparams, data_dir)
     portfolio_metrics = compute_portfolio_metrics(cost_summary, spot_15min, demand_15min, hyperparams)
 
@@ -1229,7 +1216,17 @@ def provide_hyper_parameters(hyperparams: Optional[Dict] = None) -> Dict:
     
 
 
-def build_ppu_dictionary(ppu_counts, static_data, raw_energy_storage, raw_energy_incidence):
+def build_ppu_dictionary(ppu_counts, raw_energy_storage, raw_energy_incidence):
+    static_data = get_static_data_cache()
+    if static_data is None:
+        # Try to load static data from disk as a fallback
+        try:
+            static_data = load_static_data()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load static data: {e}, make sure it is loaded appropriately.")
+    if static_data is None:
+        raise RuntimeError("Static data could not be loaded; ensure the data directory contains the required files and call load_cache_data() if needed.")
+
     ppu_constructs_df = static_data['ppu_constructs_df']
     cost_df = static_data['cost_df']
     solar_locations_df = static_data['solar_locations_df']
@@ -1252,11 +1249,11 @@ def build_ppu_dictionary(ppu_counts, static_data, raw_energy_storage, raw_energy
     return ppu_dict
 
 
-def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_volume: Dict, t: int,
-                               solar_ranking_df: pd.DataFrame, wind_ranking_df: pd.DataFrame,
-                               ppu_dictionary: pd.DataFrame, ror_df: pd.DataFrame, 
-                               solar_15min: pd.DataFrame, wind_15min: pd.DataFrame,
-                               precomputed: Optional[Dict] = None) -> List[Dict]:
+def update_raw_energy_incidence(ppu_dictionary : pd.DataFrame,
+                                raw_energy_incidence: List[Dict], 
+                                Technology_volume: Dict, 
+                                t: int
+                                ) -> List[Dict]:
     """
     Update raw_energy_incidence by simulating PPU extractions from each storage.
     
@@ -1270,36 +1267,29 @@ def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_vol
         raw_energy_incidence: List of incidence dictionaries
         Technology_volume: Technology tracking dictionary
         t: Timestep index
-        solar_ranking_df: Solar location rankings
-        wind_ranking_df: Wind location rankings
-        ppu_dictionary: PPU configuration
-        ror_df: Run-of-river DataFrame (timestamp-indexed) loaded earlier
-        solar_15min: Solar generation DataFrame (timestamp-indexed) loaded earlier
-        wind_15min: Wind generation DataFrame (timestamp-indexed) loaded earlier
 
     Returns:
         Updated raw_energy_incidence list
     """
-    available_energy_ror, available_energy_wood, available_energy_solar, available_energy_wind = 0.0, 0.0, 0.0, 0.0
-    for incidence_item in raw_energy_incidence:
-        if incidence_item['storage'] == 'River':
-            # Extract available energy from the provided ror_df (safe access with fallback)
-            try:
-                # Prefer .iloc by timestep index if ror_df is time-indexed and t is positional
-                available_energy_ror = float(ror_df.iloc[t].get('RoR_MW', 12.0))
-            except Exception:
-                available_energy_ror = 0.0
-        elif incidence_item['storage'] == 'Wood':
-            available_energy_wood = 500
+    # Load annual/static caches for incidence data and rankings
+    annual = get_annual_data_cache('data') or {}
+    static = get_static_data_cache('data') or {}
 
-    # We track ror and wood in a descending way
-    available_energy_river_track = 0
-    available_energy_wood_track = 0
-    for idx, each_ppu in ppu_dictionary.iterrows():
-        can_extract_from = each_ppu.get("can_extract_from", [])
-        ppu_name = each_ppu['PPU_Name']
-        
-        # Initialize Technology_volume for this PPU if not exists
+    solar_15min = annual.get('solar_15min') if isinstance(annual, dict) else None
+    wind_15min = annual.get('wind_15min') if isinstance(annual, dict) else None
+    ror_df = annual.get('ror_df') if isinstance(annual, dict) else None
+
+    solar_ranking_df = static.get('solar_locations_df') if isinstance(static, dict) else None
+    wind_ranking_df = static.get('wind_locations_df') if isinstance(static, dict) else None
+
+    # Prepare accumulators
+    total_solar = 0.0
+    total_wind = 0.0
+    total_river = 0.0
+    total_wood = 0.0
+
+    # Helper to ensure Technology_volume entries exist
+    def ensure_tech(ppu_name: str) -> None:
         if ppu_name not in Technology_volume:
             Technology_volume[ppu_name] = {
                 'production': [],
@@ -1307,94 +1297,125 @@ def update_raw_energy_incidence(raw_energy_incidence: List[Dict], Technology_vol
                 'spot_sold': [],
                 'cost_indices': []
             }
-        
-        if 'Solar' in can_extract_from:
-            location_rank = each_ppu.get('Location_Rank', np.nan)
-            if pd.notna(location_rank):
-                # Fast path: use precomputed matrix if available
-                current_solar_prod = 0.0
-                if (precomputed and precomputed.get('solar_prod_matrix') is not None 
-                    and int(location_rank) in precomputed['solar_rank_to_ppus']):
-                    # Look up from precomputed matrix
-                    rank = int(location_rank)
-                    rank_idx = np.where(precomputed['solar_ranks'] == rank)[0]
-                    if len(rank_idx) > 0:
-                        total_prod = float(precomputed['solar_prod_matrix'][t, rank_idx[0]])
-                        # Get this PPU's fraction
-                        for ppu, frac in precomputed['solar_rank_to_ppus'][rank]:
-                            if ppu == ppu_name:
-                                current_solar_prod = total_prod * frac
-                                break
-                else:
-                    # Fallback to original calculation
-                    area_m2 = 100000
-                    current_solar_prod = calculate_solar_production(int(location_rank), area_m2, t, solar_15min, solar_ranking_df)
-                
-                Technology_volume[ppu_name]['production'].append((t, current_solar_prod))
-                available_energy_solar += current_solar_prod    
-        elif 'Wind' in can_extract_from:
-            location_rank = each_ppu.get('Location_Rank', np.nan)
-            if pd.notna(location_rank):
-                # Fast path: use precomputed matrix if available
-                current_wind_prod = 0.0
-                if (precomputed and precomputed.get('wind_prod_matrix') is not None 
-                    and int(location_rank) in precomputed['wind_rank_to_ppus']):
-                    # Look up from precomputed matrix
-                    rank = int(location_rank)
-                    rank_idx = np.where(precomputed['wind_ranks'] == rank)[0]
-                    if len(rank_idx) > 0:
-                        total_prod = float(precomputed['wind_prod_matrix'][t, rank_idx[0]])
-                        # Get this PPU's fraction
-                        for ppu, frac in precomputed['wind_rank_to_ppus'][rank]:
-                            if ppu == ppu_name:
-                                current_wind_prod = total_prod * frac
-                                break
-                else:
-                    # Fallback to original calculation
-                    num_turbines = 5
-                    current_wind_prod = calculate_wind_production(int(location_rank), num_turbines, t, wind_15min, wind_ranking_df)
-                
-                Technology_volume[ppu_name]['production'].append((t, current_wind_prod))
-                available_energy_wind += current_wind_prod
-        elif 'River' in can_extract_from:
-            if available_energy_ror > 1000: 
-                extraction = 1000
-                available_energy_river_track += 1000
-                available_energy_ror -= 1000
-            else:
-                extraction = available_energy_ror
-                available_energy_river_track += available_energy_ror
-                available_energy_ror = 0
-            Technology_volume[ppu_name]['production'].append((t, extraction))
-        elif 'Wood' in can_extract_from:
-            if available_energy_wood > 500:
-                extraction = 500
-                available_energy_wood -= 500
-                available_energy_wood_track += 500
-            else:
-                extraction = available_energy_wood
-                available_energy_wood_track += available_energy_wood
-                available_energy_wood = 0
-            Technology_volume[ppu_name]['production'].append((t, extraction))
-    
-    total_energy = available_energy_river_track + available_energy_wood_track + available_energy_solar + available_energy_wind
-    # in raw_energy_incidence get "Grid" and set current_value to total_energy
+
+    # Process each incidence storage independently (switch/case)
     for incidence_item in raw_energy_incidence:
-        if incidence_item['storage'] == 'Grid':
+        storage = incidence_item.get('storage')
+        if storage == 'Solar':
+            # Sum production from all PPUs that extract from Solar
+            acc = 0.0
+            _init_solar_mapper('data/solar_incidence_hourly_2024.csv')
+            for _, ppu in ppu_dictionary.iterrows():
+                can_extract = ppu.get('can_extract_from', []) or []
+                if 'Solar' not in can_extract:
+                    continue
+                ppu_name = ppu['PPU_Name']
+                ensure_tech(ppu_name)
+                loc_rank = ppu.get('Location_Rank', np.nan)
+                area_m2 = float(ppu.get('area_m2', 100000))
+                prod = 0.0
+                if pd.notna(loc_rank):
+                    try:
+                        if _SOLAR_MAPPER is not None:
+                            col = _SOLAR_MAPPER.col_for_rank(int(loc_rank))
+                            irr = _SOLAR_MAPPER.irradiance(int(t), int(col))
+                            prod = float(_solar_prod_fast(float(irr), float(area_m2)))
+                        else:
+                            prod = calculate_solar_production(int(loc_rank), area_m2, t)
+                    except Exception:
+                        prod = 0.0
+                Technology_volume[ppu_name]['production'].append((t, prod))
+                acc += prod
+            incidence_item['current_value'] = acc
+            incidence_item.setdefault('history', []).append((t, acc))
+            total_solar = acc
+
+        elif storage == 'Wind':
+            acc = 0.0
+            _init_wind_mapper('data/wind_incidence_hourly_2024.csv')
+            for _, ppu in ppu_dictionary.iterrows():
+                can_extract = ppu.get('can_extract_from', []) or []
+                if 'Wind' not in can_extract:
+                    continue
+                ppu_name = ppu['PPU_Name']
+                ensure_tech(ppu_name)
+                loc_rank = ppu.get('Location_Rank', np.nan)
+                num_turbs = int(ppu.get('num_turbines', 5))
+                prod = 0.0
+                if pd.notna(loc_rank):
+                    try:
+                        if _WIND_MAPPER is not None:
+                            col = _WIND_MAPPER.col_for_rank(int(loc_rank))
+                            wspd = _WIND_MAPPER.speed(int(t), int(col))
+                            prod = float(_wind_power_fast(float(wspd), int(num_turbs)))
+                        else:
+                            prod = calculate_wind_production(int(loc_rank), num_turbs, t)
+                    except Exception:
+                        prod = 0.0
+                Technology_volume[ppu_name]['production'].append((t, prod))
+                acc += prod
+            incidence_item['current_value'] = acc
+            incidence_item.setdefault('history', []).append((t, acc))
+            total_wind = acc
+
+        elif storage == 'River':
+            # Sequential extraction like previous logic
+            available = 0.0
+            try:
+                if ror_df is not None:
+                    available = float(ror_df.iloc[t].get('RoR_MW', 12.0))
+            except Exception:
+                available = 0.0
+            acc = 0.0
+            for _, ppu in ppu_dictionary.iterrows():
+                can_extract = ppu.get('can_extract_from', []) or []
+                if 'River' not in can_extract:
+                    continue
+                ppu_name = ppu['PPU_Name']
+                ensure_tech(ppu_name)
+                if available > 1000:
+                    extraction = 1000.0
+                    available -= 1000.0
+                else:
+                    extraction = float(available)
+                    available = 0.0
+                Technology_volume[ppu_name]['production'].append((t, extraction))
+                acc += extraction
+            incidence_item['current_value'] = acc
+            incidence_item.setdefault('history', []).append((t, acc))
+            total_river = acc
+
+        elif storage == 'Wood':
+            available = 500.0
+            acc = 0.0
+            for _, ppu in ppu_dictionary.iterrows():
+                can_extract = ppu.get('can_extract_from', []) or []
+                if 'Wood' not in can_extract:
+                    continue
+                ppu_name = ppu['PPU_Name']
+                ensure_tech(ppu_name)
+                if available > 500:
+                    extraction = 500.0
+                    available -= 500.0
+                else:
+                    extraction = float(available)
+                    available = 0.0
+                Technology_volume[ppu_name]['production'].append((t, extraction))
+                acc += extraction
+            incidence_item['current_value'] = acc
+            incidence_item.setdefault('history', []).append((t, acc))
+            total_wood = acc
+
+        else:
+            # For Grid or unknown storages, leave as-is (Grid will be set later)
+            continue
+
+    # After all storages processed, set Grid to total extracted energy
+    total_energy = total_solar + total_wind + total_river + total_wood
+    for incidence_item in raw_energy_incidence:
+        if incidence_item.get('storage') == 'Grid':
             incidence_item['current_value'] = total_energy
-            incidence_item['history'].append((t, total_energy))
-        elif incidence_item['storage'] == 'Solar':
-            incidence_item['current_value'] = available_energy_solar
-            incidence_item['history'].append((t, available_energy_solar))
-        elif incidence_item['storage'] == 'Wind':
-            incidence_item['current_value'] = available_energy_wind
-            incidence_item['history'].append((t, available_energy_wind))
-        elif incidence_item['storage'] == 'River':
-            incidence_item['current_value'] = available_energy_river_track
-            incidence_item['history'].append((t, available_energy_river_track))
-        elif incidence_item['storage'] == 'Wood':
-            incidence_item['current_value'] = available_energy_wood_track
-            incidence_item['history'].append((t, available_energy_wood_track))
+            incidence_item.setdefault('history', []).append((t, total_energy))
     return raw_energy_incidence
 
 
