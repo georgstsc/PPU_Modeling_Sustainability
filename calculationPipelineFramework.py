@@ -12,8 +12,17 @@ try:
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
+    class MockTqdm:
+        def __init__(self, iterable, **kwargs):
+            self.iterable = iterable
+        def __iter__(self):
+            return iter(self.iterable)
+        def update(self, n=1):
+            pass  # No-op for update
+        def close(self):
+            pass  # No-op for close
     def tqdm(iterable, **kwargs):
-        return iterable
+        return MockTqdm(iterable, **kwargs)
 try:
     from numba import njit, prange  # type: ignore
     NUMBA_AVAILABLE = True
@@ -40,7 +49,8 @@ from calculationsPpuFramework import (
     initialize_ppu_dictionary,
     add_ppu_to_dictionary,
     load_location_rankings,
-    load_ppu_data
+    load_ppu_data,
+    calculate_chain_cost
 )
 
 # ============================================================================
@@ -888,7 +898,7 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
         for sub in range(DAY_STEPS):
             # Global timestep index in the full-year series
             t_global = int(day) * DAY_STEPS + int(sub)
-
+            progress.update(1)
             # Provide the precomputed row index for lookups (concatenated days)
             precomputed_row = day_idx * DAY_STEPS + sub
             raw_energy_incidence = update_raw_energy_incidence(
@@ -920,13 +930,15 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
                 surplus_count += 1
             else:
                 balanced_count += 1
-            print(f"We need to calculate the ppu_indices")
             # First compute the d_stor, u_dis, u_chg and m for each PPU
             ppu_indices = calculate_ppu_indices(
-                ppu_dictionary, raw_energy_storage, overflow_MW, phi_smoothed,
-                spot_price, spot_15min, t_global, hyperparams
+                ppu_dictionary, 
+                raw_energy_storage, 
+                overflow_MW, 
+                phi_smoothed,
+                t_global, 
+                hyperparams
             )
-
             # Update EMA of shortfall for utility index
             phi_smoothed = exponential_moving_average(overflow_MW, phi_smoothed, hyperparams['ema_beta'])
 
@@ -957,15 +969,25 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
             # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
             if overflow_MW > hyperparams['epsilon']:
                 raw_energy_storage = handle_energy_deficit(
-                    overflow_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
-                    ppu_indices, spot_price, t_global, hyperparams
+                    overflow_MW, 
+                    ppu_dictionary, 
+                    raw_energy_storage, 
+                    Technology_volume,
+                    ppu_indices, 
+                    t_global, 
+                    hyperparams
                 )
             # 4.2) If overflow < 0: use 'Store' PPUs
             elif overflow_MW < -hyperparams['epsilon']:
                 surplus_MW = abs(overflow_MW)
                 raw_energy_storage = handle_energy_surplus(
-                    surplus_MW, ppu_dictionary, raw_energy_storage, Technology_volume,
-                    ppu_indices, spot_price, t_global, hyperparams
+                    surplus_MW, 
+                    ppu_dictionary, 
+                    raw_energy_storage, 
+                    Technology_volume,
+                    ppu_indices, 
+                    t_global, 
+                    hyperparams
                 )
     # Attach pipeline state statistics for later reporting
     Technology_volume['__pipeline_stats__'] = {
@@ -982,8 +1004,9 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
     return Technology_volume, phi_smoothed
 
 
-def compute_cost_breakdown(technology_volume: Dict[str, Dict], spot_15min: pd.Series,
-                          hyperparams: Dict, data_dir: str = "data") -> Dict[str, Dict]:
+def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame, 
+                        technology_volume: Dict[str, Dict], 
+                        hyperparams: Dict) -> Dict[str, Dict]:
     """
     Compute retroactive cost breakdown by technology type.
 
@@ -996,20 +1019,41 @@ def compute_cost_breakdown(technology_volume: Dict[str, Dict], spot_15min: pd.Se
     Returns:
         Cost summary dictionary
     """
-    # Load cost data
-    cost_df = load_cost_data(f'{data_dir}/cost_table_tidy.csv')
+    # Derive technology-specific costs from the provided PPU dictionary.
+    # Prefer `Cost_CHF_per_kWh` (CHF/kWh). If only `Cost_CHF_per_Quarter_Hour`
+    # is available, convert to CHF/kWh by dividing by the timestep hours.
+    tech_costs: Dict[str, float] = {}
+    try:
+        if isinstance(ppu_dictionnary, pd.DataFrame) and 'PPU_Name' in ppu_dictionnary.columns:
+            grouped = ppu_dictionnary.groupby('PPU_Name')
+            for name, group in grouped:
+                val = None
+                if 'Cost_CHF_per_kWh' in group.columns and group['Cost_CHF_per_kWh'].notna().any():
+                    val = float(group['Cost_CHF_per_kWh'].astype(float).mean())
+                elif 'Cost_CHF_per_Quarter_Hour' in group.columns and group['Cost_CHF_per_Quarter_Hour'].notna().any():
+                    # convert CHF per quarter-hour -> CHF per kWh using timestep hours
+                    timestep_h = float(hyperparams.get('timestep_hours', 0.25)) if isinstance(hyperparams, dict) else 0.25
+                    # Cost_CHF_per_Quarter_Hour was stored as cost_per_kwh * delta_t in add_ppu_to_dictionary
+                    val = float(group['Cost_CHF_per_Quarter_Hour'].astype(float).mean()) / max(timestep_h, 1e-9)
+                else:
+                    val = None
 
-    # Technology-specific costs (simplified, using PPU names from dictionary)
-    tech_costs = {
-        'PV': 0.10,      # CHF/kWh - Solar PV
-        'WD_OFF': 0.08,  # CHF/kWh - Offshore Wind
-        'WD_ON': 0.08,   # CHF/kWh - Onshore Wind
-        'HYD_ROR': 0.05, # CHF/kWh - Run-of-river Hydro
-        'HYD_S': 0.05,   # CHF/kWh - Storage Hydro
-        'H2_G': 0.15,    # CHF/kWh - Hydrogen Storage
-        'THERM': 0.12,   # CHF/kWh - Thermal
-        'SOL_SALT': 0.11 # CHF/kWh - Solar Salt Storage
-    }
+                if val is not None:
+                    tech_costs[str(name)] = float(val)
+    except Exception:
+        # If anything goes wrong, leave tech_costs empty and fall back to defaults below
+        tech_costs = {}
+
+    # Load spot price series from the annual cache for accurate per-timestep pricing
+    annual_cache = None
+    try:
+        annual_cache = get_annual_data_cache()
+    except Exception:
+        annual_cache = None
+
+    spot_series = None
+    if isinstance(annual_cache, dict):
+        spot_series = annual_cache.get('spot_15min')
 
     Cost_summary = {}
     for tech_type, metrics in technology_volume.items():
@@ -1023,9 +1067,29 @@ def compute_cost_breakdown(technology_volume: Dict[str, Dict], spot_15min: pd.Se
         production_cost = 0.0
         spot_buy_cost = 0.0
         spot_sell_revenue = 0.0
+        # Detailed per-timestep breakdowns (list of dicts)
+        spot_buy_breakdown = []
+        spot_sell_breakdown = []
 
-        # Production cost
-        cost_per_kwh = tech_costs.get(tech_type, 0.10)
+        # Production cost: prefer cost from PPU dictionary, else sensible fallback
+        cost_per_kwh = tech_costs.get(tech_type)
+        if cost_per_kwh is None:
+            # Try to lookup single-row match in the DataFrame (robust fallback)
+            try:
+                if isinstance(ppu_dictionnary, pd.DataFrame) and 'PPU_Name' in ppu_dictionnary.columns:
+                    match = ppu_dictionnary[ppu_dictionnary['PPU_Name'] == tech_type]
+                    if not match.empty:
+                        if 'Cost_CHF_per_kWh' in match.columns and match['Cost_CHF_per_kWh'].notna().any():
+                            cost_per_kwh = float(match['Cost_CHF_per_kWh'].astype(float).mean())
+                        elif 'Cost_CHF_per_Quarter_Hour' in match.columns and match['Cost_CHF_per_Quarter_Hour'].notna().any():
+                            timestep_h = float(hyperparams.get('timestep_hours', 0.25)) if isinstance(hyperparams, dict) else 0.25
+                            cost_per_kwh = float(match['Cost_CHF_per_Quarter_Hour'].astype(float).mean()) / max(timestep_h, 1e-9)
+            except Exception:
+                cost_per_kwh = None
+
+        if cost_per_kwh is None:
+            # Final fallback: use a conservative default from hyperparams or constant
+            cost_per_kwh = float(hyperparams.get('wood_price_chf_per_kwh', 0.095))
         for (t, vol_MW) in metrics['production']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             production_cost += energy_MWh * cost_per_kwh * 1000  # Convert to kWh
@@ -1033,24 +1097,42 @@ def compute_cost_breakdown(technology_volume: Dict[str, Dict], spot_15min: pd.Se
         # Spot market transactions
         for (t, vol_MW) in metrics['spot_bought']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
-            spot_buy_cost += energy_MWh * spot_15min.iloc[t]
+            spot_price = 0.0
+            try:
+                if spot_series is not None and 0 <= int(t) < len(spot_series):
+                    spot_price = float(spot_series.iloc[int(t)])
+            except Exception:
+                spot_price = 0.0
+            cost_chf = energy_MWh * spot_price
+            spot_buy_cost += cost_chf
+            spot_buy_breakdown.append({'t': int(t), 'energy_MWh': float(energy_MWh), 'spot_price': float(spot_price), 'cost_CHF': float(cost_chf)})
 
         for (t, vol_MW) in metrics['spot_sold']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
-            spot_sell_revenue += energy_MWh * spot_15min.iloc[t]
+            spot_price = 0.0
+            try:
+                if spot_series is not None and 0 <= int(t) < len(spot_series):
+                    spot_price = float(spot_series.iloc[int(t)])
+            except Exception:
+                spot_price = 0.0
+            revenue_chf = energy_MWh * spot_price
+            spot_sell_revenue += revenue_chf
+            spot_sell_breakdown.append({'t': int(t), 'energy_MWh': float(energy_MWh), 'spot_price': float(spot_price), 'revenue_CHF': float(revenue_chf)})
 
         Cost_summary[tech_type] = {
             'production_cost_CHF': production_cost,
             'spot_buy_cost_CHF': spot_buy_cost,
             'spot_sell_revenue_CHF': spot_sell_revenue,
-            'net_cost_CHF': production_cost + spot_buy_cost - spot_sell_revenue
+            'net_cost_CHF': production_cost + spot_buy_cost - spot_sell_revenue,
+            'spot_buy_breakdown': spot_buy_breakdown,
+            'spot_sell_breakdown': spot_sell_breakdown
         }
 
     return Cost_summary
 
 
-def compute_portfolio_metrics(cost_summary: Dict[str, Dict], spot_15min: pd.Series,
-                             demand_15min: pd.Series, hyperparams: Dict) -> Dict[str, float]:
+def compute_portfolio_metrics(cost_summary: Dict[str, Dict], 
+                            hyperparams: Dict) -> Dict[str, float]:
     """
     Compute portfolio performance metrics.
 
@@ -1063,28 +1145,55 @@ def compute_portfolio_metrics(cost_summary: Dict[str, Dict], spot_15min: pd.Seri
     Returns:
         Portfolio metrics dictionary
     """
+    
     total_net_cost = sum(cost_summary[tech]['net_cost_CHF'] for tech in cost_summary)
 
-    # Compute spot-only baseline
+    # Load demand and spot from the global annual cache if available
+    annual_cache = None
+    try:
+        annual_cache = get_annual_data_cache()
+    except Exception:
+        annual_cache = None
+
+    demand_15min = None
+    spot_15min = None
+    if isinstance(annual_cache, dict):
+        demand_15min = annual_cache.get('demand_15min')
+        spot_15min = annual_cache.get('spot_15min')
+
+    # Compute spot-only baseline safely
     spot_only_cost = 0.0
-    num_timesteps = min(len(demand_15min), len(spot_15min))
+    num_timesteps = 0
+    if demand_15min is not None and spot_15min is not None:
+        try:
+            num_timesteps = min(len(demand_15min), len(spot_15min))
+        except Exception:
+            num_timesteps = 0
+
     for t in range(num_timesteps):
-        demand_MWh = demand_15min.iloc[t] * hyperparams['timestep_hours']
-        spot_only_cost += demand_MWh * spot_15min.iloc[t]
+        try:
+            demand_MWh = float(demand_15min.iloc[t]) * float(hyperparams.get('timestep_hours', 0.25))
+            spot_only_cost += demand_MWh * float(spot_15min.iloc[t])
+        except Exception:
+            continue
 
     savings = spot_only_cost - total_net_cost
-    margin_pct = (savings / spot_only_cost) * 100
+    margin_pct = (savings / spot_only_cost) * 100 if spot_only_cost != 0 else 0.0
 
-    # Calculate price volatility (coefficient of variation)
-    price_volatility_pct = (spot_15min.std() / spot_15min.mean()) * 100
-    price_volatility_pct = float(price_volatility_pct)  # type: ignore
+    # Calculate price volatility (coefficient of variation) safely
+    price_volatility_pct = 0.0
+    try:
+        if spot_15min is not None and getattr(spot_15min, 'mean', None) is not None and spot_15min.mean() != 0:
+            price_volatility_pct = (float(spot_15min.std()) / float(spot_15min.mean())) * 100
+    except Exception:
+        price_volatility_pct = 0.0
 
     return {
         'total_cost_CHF': total_net_cost,
         'spot_only_cost_CHF': spot_only_cost,
         'savings_CHF': savings,
         'margin_pct': margin_pct,
-        'volatility_pct': price_volatility_pct,
+        'volatility_pct': float(price_volatility_pct),
         'num_timesteps': num_timesteps
     }
 
@@ -1128,8 +1237,15 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         hyperparams = hyperparams
     )
     print("We ran the dispatch simulation")
-    cost_summary = compute_cost_breakdown(technology_volume, spot_15min, hyperparams, data_dir)
-    portfolio_metrics = compute_portfolio_metrics(cost_summary, spot_15min, demand_15min, hyperparams)
+    cost_summary = compute_cost_breakdown(
+                                        ppu_dictionary, 
+                                        technology_volume,
+                                        hyperparams
+                                        )
+    portfolio_metrics = compute_portfolio_metrics(
+                                            cost_summary, 
+                                            hyperparams
+                                            )
 
     print("\n" + "=" * 80)
     print("PORTFOLIO RESULT")
@@ -1448,8 +1564,8 @@ def calculate_incidence_production(ppu_dictionary: pd.DataFrame, raw_energy_inci
 
 
 def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List[Dict],
-                         overflow_MW: float, phi_smoothed: float, spot_price: float,
-                         spot_15min: pd.Series, t: int, hyperparams: Dict) -> Dict[str, Dict]:
+                        overflow_MW: float, phi_smoothed: float, 
+                        t: int, hyperparams: Dict) -> Dict[str, Dict]:
     """
     Calculate d_stor, u_dis, u_chg and m (monetary volatility-aware) indices for each PPU.
     Uses RELATIVE VALUES throughout to avoid dimension issues and stuck costs.
@@ -1459,155 +1575,116 @@ def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List
         raw_energy_storage: Storage systems
         overflow_MW: Current overflow (demand - supply)
         phi_smoothed: Smoothed overflow
-        spot_price: Current spot price
-        spot_15min: Full spot price time series
         t: Current timestep
-        hyperparams: Simulation hyperparameters
-
+                         overflow_MW: float, phi_smoothed: float, 
+                         t: int, hyperparams: Dict) -> Dict[str, Dict]:
     Returns:
         Dictionary mapping PPU names to their indices and costs
     """
-    ppu_indices = {}
-    
-    # Get hyperparameters
-    alpha_u = hyperparams.get('alpha_u', 5000.0)
-    alpha_m = hyperparams.get('alpha_m', 5.0)
-    deadband = hyperparams.get('stor_deadband', 0.05)
-    
-    # Define horizons in number of timesteps (15-min intervals)
-    # 1d=96, 3d=288, 7d=672, 30d=2880
+    # concise, robust implementation
+    ppu_indices: Dict[str, Dict] = {}
+    alpha_u = float(hyperparams.get('alpha_u', 5000.0))
+    alpha_m = float(hyperparams.get('alpha_m', 5.0))
+    deadband = float(hyperparams.get('stor_deadband', 0.05))
+
     horizon_steps = {'1d': 96, '3d': 288, '7d': 672, '30d': 2880}
     horizons_30d = ['1d', '3d', '7d', '30d']
-    
+
+    # Load spot series from annual cache (if available)
+    spot_series = None
+    try:
+        spot_series = get_annual_data_cache().get('spot_15min')
+    except Exception:
+        spot_series = None
+
+    spot_now = 0.0
+    if spot_series is not None and len(spot_series) > 0 and t < len(spot_series):
+        try:
+            spot_now = float(spot_series.iloc[t])
+        except Exception:
+            spot_now = float(spot_series.iloc[min(t, len(spot_series)-1)])
+
+    # helper for future-window average safely
+    def future_avg(start: int, steps: int) -> float:
+        if spot_series is None or len(spot_series) == 0:
+            return 0.0
+        end = min(start + steps, len(spot_series))
+        if start >= end:
+            return float(spot_series.iloc[-1]) if len(spot_series) > 0 else 0.0
+        try:
+            return float(spot_series.iloc[start:end].mean())
+        except Exception:
+            return 0.0
+
     for _, ppu_row in ppu_dictionary.iterrows():
         ppu_name = str(ppu_row['PPU_Name'])
-        ppu_category = str(ppu_row['PPU_Category'])
+        ppu_category = str(ppu_row.get('PPU_Category', ''))
 
-        # Initialize indices
+        # defaults
         d_stor = 0.0
         u_dis = 0.0
         u_chg = 0.0
         m_idx = 0.0
 
-        # ===== 1. Calculate disposition index (d_stor) for storage PPUs =====
-        # Use RELATIVE values: normalize by deadband and max excursion
+        # disposition for storage: normalized deviation from target SoC
         if ppu_category == 'Storage':
-            # Get storage name from can_extract_from
-            can_extract_from = ppu_row.get('can_extract_from', [])
-            if can_extract_from:
-                storage_name = can_extract_from[0]  # Use first storage
-                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-
+            can_extract = ppu_row.get('can_extract_from', []) or []
+            if can_extract:
+                storage_name = can_extract[0]
+                storage_item = next((s for s in raw_energy_storage if s.get('storage') == storage_name), None)
                 if storage_item:
-                    current_value = storage_item['current_value']
-                    max_value = storage_item['value']
-                    current_soc = current_value / max_value
-                    target_soc = storage_item.get('target_SoC', 0.6)
+                    max_v = storage_item.get('value', 1.0) or 1.0
+                    cur = storage_item.get('current_value', 0.0)
+                    target = storage_item.get('target_SoC', 0.6)
+                    soc = (cur / max_v) if max_v > 0 else 0.0
+                    d_stor = float(np.tanh((soc - target) / max(deadband, 1e-6)))
 
-                    # Calculate RELATIVE deviation from target (normalized by deadband)
-                    soc_deviation = (current_soc - target_soc) / deadband
-                    
-                    # Apply tanh to keep in [-1, 1] range
-                    d_stor = np.tanh(soc_deviation)
+        # utilities from overflow (phi_smoothed)
+        rel_over = (phi_smoothed / alpha_u) if alpha_u != 0 else 0.0
+        u_dis = float(np.tanh(rel_over))
+        u_chg = float(np.tanh(abs(rel_over))) if phi_smoothed < 0 else 0.0
 
-        # ===== 2. Calculate utility indices (u_dis, u_chg) =====
-        # Use RELATIVE values: normalize overflow by system scale
-        if phi_smoothed != 0:
-            # Relative overflow: normalize by alpha_u (system scale)
-            relative_overflow = phi_smoothed / alpha_u
-            
-            # Apply tanh for smooth [-1, 1] range
-            u_dis = np.tanh(relative_overflow)
-            
-            # Charge utility only non-zero during surplus (negative overflow)
-            if phi_smoothed < 0:
-                u_chg = np.tanh(abs(relative_overflow))
-            else:
-                u_chg = 0.0
-        else:
-            # No overflow - neutral utility
-            u_dis = 0.0
-            u_chg = 0.0
-
-        # ===== 3. Calculate monetary volatility-aware index (m) =====
-        # Use RELATIVE values throughout monetary calculation
+        # monetary index for storage PPUs based on future price spreads and variance
         if ppu_category == 'Storage':
-            ppu_cost_per_kWh = ppu_row.get('Cost_CHF_per_kWh', 0.1)
-            ppu_cost_per_MWh = ppu_cost_per_kWh * 1000.0  # Convert to CHF/MWh
-            efficiency = ppu_row.get('Efficiency', 1.0)
-            
-            # Compute RELATIVE future prices (normalized by current price)
-            future_prices_relative = {}
-            for horizon_name, steps in horizon_steps.items():
-                future_idx = min(t + steps, len(spot_15min) - 1)
-                future_window = spot_15min.iloc[t:min(t + steps, len(spot_15min))]
-                if len(future_window) > 0:
-                    future_price_avg = future_window.mean()
-                    # RELATIVE price: (future - current) / current
-                    future_prices_relative[horizon_name] = (future_price_avg - spot_price) / max(spot_price, 0.01)
-                else:
-                    future_prices_relative[horizon_name] = 0.0
-            
-            # Approximate RELATIVE co-state values
-            spreads_relative = []
-            for horizon_name in horizons_30d:
-                # Co-state relative to current price
-                lambda_relative = (efficiency * spot_15min.iloc[min(t + horizon_steps[horizon_name], len(spot_15min) - 1)] - spot_price) / max(spot_price, 0.01)
-                spread_relative = (spot_price - efficiency * spot_15min.iloc[min(t + horizon_steps[horizon_name], len(spot_15min) - 1)]) / max(spot_price, 0.01)
-                spreads_relative.append(spread_relative)
-            
-            # Average RELATIVE spread across horizons
-            S_relative = np.mean(spreads_relative)
-            
-            # RELATIVE volatility impact
-            future_price_values = [future_prices_relative[h] for h in horizons_30d]
-            price_variance_relative = np.var(future_price_values) if len(future_price_values) > 1 else 0.0
-            
-            # Normalize RELATIVE variance by volatility scale
-            volatility_scale = hyperparams.get('volatility_scale', 30.0)
-            V_relative = price_variance_relative / (volatility_scale ** 2) if volatility_scale > 0 else 0.0
-            
-            # Combine RELATIVE spread and volatility
-            weight_spread = hyperparams.get('weight_spread', 1.0)
-            weight_volatility = hyperparams.get('weight_volatility', 1.0)
-            X_relative = weight_spread * S_relative - weight_volatility * V_relative
-            
-            # Squash RELATIVE score to [-1, 1]
-            m_idx = np.tanh(X_relative / alpha_m)
-        else:
-            # Non-storage PPUs: neutral monetary index
-            m_idx = 0.0
+            efficiency = float(ppu_row.get('Efficiency', 1.0) or 1.0)
+            spreads = []
+            future_vals = []
+            for h in horizons_30d:
+                steps = horizon_steps[h]
+                favg = future_avg(t, steps)
+                future_vals.append((favg - spot_now) / max(abs(spot_now), 1e-6))
+                # spread = spot_now - efficiency * future_price (relative)
+                spreads.append((spot_now - efficiency * favg) / max(abs(spot_now), 1e-6))
 
-        # ===== 4. Calculate composite benefits and costs =====
-        # All components now use RELATIVE values in [-1, 1] range
-        
-        # Discharge benefit: B_dis = (d_stor + u_dis + m) / 3
+            S_rel = float(np.mean(spreads)) if len(spreads) > 0 else 0.0
+            V_rel = float(np.var(future_vals)) if len(future_vals) > 1 else 0.0
+            weight_spread = float(hyperparams.get('weight_spread', 1.0))
+            weight_vol = float(hyperparams.get('weight_volatility', 1.0))
+            X = weight_spread * S_rel - weight_vol * V_rel
+            m_idx = float(np.tanh(X / max(alpha_m, 1e-6)))
+
+        # benefits and costs (relative in [-1,1])
         B_dis = (d_stor + u_dis + m_idx) / 3.0
-        
-        # Charge benefit: B_chg = (-d_stor + u_chg + (-m)) / 3
         B_chg = (-d_stor + u_chg - m_idx) / 3.0
-        
-        # Convert benefits to costs (lower is better)
-        kappa_dis = 1.0 - B_dis  # Range: [0, 2]
-        kappa_chg = 1.0 - B_chg  # Range: [0, 2]
-        
+        kappa_dis = 1.0 - B_dis
+        kappa_chg = 1.0 - B_chg
+
         ppu_indices[ppu_name] = {
-            'd_stor': d_stor,
-            'u_dis': u_dis,
-            'u_chg': u_chg,
-            'm': m_idx,
-            'B_dis': B_dis,
-            'B_chg': B_chg,
-            'kappa_dis': kappa_dis,
-            'kappa_chg': kappa_chg
+            'd_stor': float(d_stor),
+            'u_dis': float(u_dis),
+            'u_chg': float(u_chg),
+            'm': float(m_idx),
+            'B_dis': float(B_dis),
+            'B_chg': float(B_chg),
+            'kappa_dis': float(kappa_dis),
+            'kappa_chg': float(kappa_chg)
         }
-    
     return ppu_indices
 
 
 def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
                          raw_energy_storage: List[Dict], Technology_volume: Dict,
-                         ppu_indices: Dict, spot_price: float, t: int,
+                         ppu_indices: Dict, t: int,
                          hyperparams: Dict) -> List[Dict]:
     """
     Handle energy deficit using 'Flex' PPUs that extract from raw_energy_storage.
@@ -1727,7 +1804,7 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
 
 def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
                         raw_energy_storage: List[Dict], Technology_volume: Dict,
-                        ppu_indices: Dict, spot_price: float, t: int,
+                        ppu_indices: Dict, t: int,
                         hyperparams: Dict) -> List[Dict]:
     """
     Handle energy surplus using 'Store' PPUs that store in raw_energy_storage.
