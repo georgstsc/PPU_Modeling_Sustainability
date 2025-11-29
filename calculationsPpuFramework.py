@@ -396,111 +396,6 @@ def update_all_storages(raw_storage: list, raw_incidence: list, updates: dict = 
     updated_incidence = update_incidence(raw_incidence, t or 0, lat, lon)
     return updated_storage, updated_incidence
 
-def get_component_data(component: str, cost_df: pd.DataFrame) -> Dict:
-    if component in cost_df.index:
-        row = cost_df.loc[component]
-        # ----  NEW:  force numeric, replace non-parsable by defaults  ----
-        eff   = pd.to_numeric(row['efficiency'], errors='coerce') if 'efficiency' in row else 1.0
-        cost  = pd.to_numeric(row['cost'],       errors='coerce') if 'cost'       in row else 0.0
-        w     = pd.to_numeric(row['w'],          errors='coerce') if 'w'          in row else 0.0
-        # fill NaN that to_numeric produced
-        eff, cost, w = [x if not pd.isna(x) else (1.0,0.0,0.0)[i] for i,x in enumerate((eff,cost,w))]
-        return {'efficiency': eff, 'cost': cost, 'w': w,
-                'component_type': row.get('component', 'unknown')}
-    else:
-        return {'efficiency': 1.0, 'cost': 0.0, 'w': 0.0, 'component_type': 'unknown'}
-
-def add_ppu(
-    ppu_name: str,
-    ppu_type: str,  # e.g., 'Production' or 'Storage'
-    quantity: int,
-    capacity_gw: float,
-    components: list = None,
-    cost_df: pd.DataFrame = None,
-    ppu_quantities_df: pd.DataFrame = None,
-    ppu_location_assignments_df: pd.DataFrame = None,
-    solar_locations_df: pd.DataFrame = None,
-    wind_locations_df: pd.DataFrame = None,
-    renewable_type: str = None,  # e.g., 'solar', 'wind_onshore', 'wind_offshore' if renewable
-    instance_id: int = 1,  # For multiple instances of same PPU
-    delta_t: float = 0.25,  # timestep hours (default 15min)
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Add a new PPU to quantities DF and assign location if renewable.
-    
-    - Computes efficiency/cost from components if provided.
-    - Adds row to ppu_quantities_df with total_capacity, metrics.
-    - If renewable, assigns best unassigned location and updates assignments DF.
-    - Returns updated: (ppu_quantities_df, ppu_location_assignments_df, solar_locations_df, wind_locations_df)
-    
-    Note: Mutates input DFs in place for simplicity; returns them for chaining.
-    """
-    if ppu_quantities_df is None:
-        ppu_quantities_df = pd.DataFrame()
-    if ppu_location_assignments_df is None:
-        ppu_location_assignments_df = pd.DataFrame(columns=[
-            'PPU', 'Instance', 'Type', 'Latitude', 'Longitude', 'Rank', 'Energy_Potential'
-        ])
-    if solar_locations_df is None:
-        solar_locations_df = raw_data['solar_locations'].copy()
-    if wind_locations_df is None:
-        wind_locations_df = raw_data['wind_locations'].copy()
-    
-    # Compute metrics if components provided
-    efficiency = 1.0
-    total_cost_chf_per_kwh = 0.0
-    cost_per_15min_chf = 0.0
-    if components and cost_df is not None:
-        efficiency = calculate_chain_efficiency(components, cost_df)
-        cost_data = calculate_chain_cost(components, cost_df)
-        total_cost_chf_per_kwh = cost_data['total_cost']
-        # Use explicit delta_t parameter instead of relying on a notebook-global `hyperparams`
-        cost_per_15min_chf = total_cost_chf_per_kwh * delta_t
-    
-    # Add to ppu_quantities_df
-    new_row = pd.DataFrame([{
-        'PPU': ppu_name,
-        'Type': ppu_type,
-        'Quantity': quantity,
-        'Capacity_GW': capacity_gw,
-        'Total_Capacity_GW': quantity * capacity_gw,
-        'Efficiency': efficiency,
-        'Total_Cost_CHF_per_kWh': total_cost_chf_per_kwh,
-        'Cost_Per_15min_CHF': cost_per_15min_chf,
-        'Components': components
-    }])
-    ppu_quantities_df = pd.concat([ppu_quantities_df, new_row], ignore_index=True)
-    
-    # Handle location assignment if renewable
-    if renewable_type:
-        locations_df = solar_locations_df if renewable_type == 'solar' else wind_locations_df
-        # Find best unassigned location (lowest rank)
-        unassigned = locations_df[locations_df['assigned'] == False].sort_values('rank')
-        if not unassigned.empty:
-            best_location = unassigned.iloc[0]
-            # Assign
-            new_assignment = pd.DataFrame([{
-                'PPU': ppu_name,
-                'Instance': instance_id,
-                'Type': renewable_type,
-                'Latitude': best_location['latitude'],
-                'Longitude': best_location['longitude'],
-                'Rank': best_location['rank'],
-                'Energy_Potential': best_location['potential']  # Uses standardized column from load_location_rankings
-            }])
-            ppu_location_assignments_df = pd.concat([ppu_location_assignments_df, new_assignment], ignore_index=True)
-            # Mark as assigned in locations DF
-            assign_idx = best_location.name
-            locations_df.loc[assign_idx, 'assigned'] = True
-            if renewable_type == 'solar':
-                solar_locations_df = locations_df
-            else:
-                wind_locations_df = locations_df
-        else:
-            print(f"Warning: No unassigned {renewable_type} locations available for {ppu_name}")
-    
-    return ppu_quantities_df, ppu_location_assignments_df, solar_locations_df, wind_locations_df
-
 
 # -------------------------
 # PPU Dictionary Management Functions
@@ -670,7 +565,6 @@ def select_storage_with_fewest_ppus(
     # Return first candidate (arbitrary choice if tie)
     return candidates[0] if candidates else available_storages[0]
 
-
 def add_ppu_to_dictionary(
     ppu_dictionary: pd.DataFrame,
     ppu_name: str,
@@ -685,193 +579,61 @@ def add_ppu_to_dictionary(
 ) -> pd.DataFrame:
     """
     Add a new PPU to the dictionary with all calculated metrics.
-    
-    This function:
-    1. Gives the PPU a unique incremental ID
-    2. Looks up PPU information from ppu_constructs_components.csv
-    3. Calculates chain efficiency and cost from cost_table_tidy.csv
-    4. Determines which raw energy storage this PPU uses based on DIRECT PPU-TO-STORAGE MAPPING
-    5. Assigns location ranking for solar/wind PPUs (NaN otherwise)
-    6. Adds the complete PPU entry to the dictionary
-    
-    Parameters:
-        ppu_dictionary (pd.DataFrame): Existing PPU dictionary (can be empty)
-        ppu_name (str): Name of the PPU to add (e.g., 'PV', 'HYD_S', 'WD_OFF')
-        ppu_constructs_df (pd.DataFrame): PPU constructs data (from ppu_constructs_components.csv)
-        cost_df (pd.DataFrame): Cost data (from cost_table_tidy.csv)
-        solar_locations_df (pd.DataFrame): Solar location rankings
-        wind_locations_df (pd.DataFrame): Wind location rankings
-        delta_t (float): Time slice duration in hours (default 0.25 for 15 minutes)
-        raw_energy_storage (List[Dict]): Raw energy storage definitions (not used with direct mapping)
-        raw_energy_incidence (List[Dict]): Raw energy incidence definitions (not used with direct mapping)
-    
-    Returns:
-        pd.DataFrame: Updated ppu_dictionary with the new PPU added
-    
-    Raises:
-        ValueError: If ppu_name not found in ppu_constructs_df
+    Uses ppu_constructs_components.csv for PPU type decision.
     """
-    
-    # =========================================================================
-    # DIRECT PPU-TO-STORAGE MAPPING
-    # =========================================================================
-    # This mapping explicitly defines which PPUs can extract from and input to
-    # which storages. No more component matching - direct and explicit.
-    
-    PPU_STORAGE_MAPPING = {
-        # Hydro PPUs
-        'HYD_S': {'extract_from': ['Lake'], 'input_to': []},  # Hydroelectric storage - ONLY extracts from Lake
-        'HYD_R': {'extract_from': ['River'], 'input_to': []},  # Run-of-river - extracts from River
-        'PHS': {'extract_from': [], 'input_to': ['Lake']},  # Pumped hydro storage - ONLY pumps into Lake
-        
-        # Hydrogen PPUs (gaseous 200bar)
-        'H2_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 turbine + electrolyzer
-        'H2P_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 turbine only (no input)
-        
-        # Hydrogen PPUs (liquid)
-        'H2_L': {'extract_from': [], 'input_to': ['Liquid storage']},  # Liquid H2 turbine + liquefier
-        'H2P_L': {'extract_from': ['Liquid storage'], 'input_to': []},  # Liquid H2 turbine only
-        
-        # Hydrogen PPUs (gaseous-liquid hybrid)
-        'H2_GL': {'extract_from': [], 'input_to': ['H2 Storage UG 200bar']},  # Extract liquid, store gaseous
-        
-        # Synthetic fuel PPUs
-        'SYN_FT': {'extract_from': [], 'input_to': ['Fuel Tank']},  # Fischer-Tropsch synthesis
-        'SYN_METH': {'extract_from': [], 'input_to': ['CH4 storage 200bar']},  # Methane synthesis
-        'SYN_CRACK': {'extract_from': [], 'input_to': ['Fuel Tank']},  # Fuel cracking
-        
-        # Ammonia PPUs
-        'NH3_FULL': {'extract_from': [], 'input_to': ['Ammonia storage']},  # Ammonia synthesis + ICE
-        'NH3_P': {'extract_from': ['Ammonia storage'], 'input_to': []},  # Ammonia ICE only
-        
-        # Biogas PPUs
-        'CH4_BIO': {'extract_from': [], 'input_to': ['Biogas (50% CH4)']},  # Biogas upgrade
-        'IMP_BIOG': {'extract_from': ['Biogas (50% CH4)'], 'input_to': []},  # Import biogas only
-        
-        # Biofuel PPUs
-        'BIO_OIL_ICE': {'extract_from': ['Biooil'], 'input_to': []},  # Biooil ICE
-        'BIO_WOOD': {'extract_from': ['Wood'], 'input_to': []},  # Wood gasification
-        'PALM_ICE': {'extract_from': ['Palm oil'], 'input_to': []},  # Palm oil ICE
-        
-        # Solar thermal PPUs
-        'SOL_SALT': {'extract_from': ['Solar concentrator salt'], 'input_to': []},  # CSP with salt storage
-        'SOL_STEAM': {'extract_from': ['Solar concentrator salt'], 'input_to': []},  # CSP without storage
-        
-        # Thermal PPUs (natural gas)
-        'THERM': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Gas turbine
-        'THERM_CH4': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Gas turbine with CH4
-        'THERM_G': {'extract_from': ['H2 Storage UG 200bar'], 'input_to': []},  # H2 gas turbine
-        'THERM_M': {'extract_from': ['CH4 storage 200bar'], 'input_to': []},  # Methane turbine
-        
-        # Renewables (Incidence sources - no storage)
-        'PV': {'extract_from': ['Solar'], 'input_to': []},  # Solar PV
-        'WD_ON': {'extract_from': ['Wind'], 'input_to': []},  # Wind onshore
-        'WD_OFF': {'extract_from': ['Wind'], 'input_to': []},  # Wind offshore
-    }
-    # =========================================================================
-    # Look up PPU information
+    import numpy as np
+    import pandas as pd
+
+    # 1. Look up PPU information
     ppu_row = ppu_constructs_df[ppu_constructs_df['PPU'] == ppu_name]
     if ppu_row.empty:
         raise ValueError(f"PPU '{ppu_name}' not found in ppu_constructs_df")
-    
     ppu_row = ppu_row.iloc[0]
     components = ppu_row['Components']
     category = ppu_row['Category']
-    
-    # Generate unique ID (increment from max existing ID, or start at 1)
+
+    # 2. Generate unique ID
     if ppu_dictionary.empty or 'PPU_ID' not in ppu_dictionary.columns:
         new_id = 1
     else:
         new_id = int(ppu_dictionary['PPU_ID'].max()) + 1
-    
-    # Calculate chain efficiency and cost
+
+    # 3. Calculate chain efficiency and cost
     efficiency = calculate_chain_efficiency(components, cost_df)
     cost_data = calculate_chain_cost(components, cost_df)
     cost_per_kwh = cost_data['total_cost']
-    
-    # Apply cost escalation based on existing PPUs of the same type
+
+    # 4. Apply cost escalation based on existing PPUs of the same type
     existing_count = 0
     if not ppu_dictionary.empty and 'PPU_Name' in ppu_dictionary.columns:
         existing_count = (ppu_dictionary['PPU_Name'] == ppu_name).sum()
-    
-    # Cost escalation: (1 + 0.1k) where k is the count of existing PPUs of this type
     escalation_factor = 1 + 0.1 * existing_count
     cost_per_kwh *= escalation_factor
-    
     cost_per_quarter_hour = cost_per_kwh * delta_t
-    
-    # =========================================================================
-    # USE DIRECT PPU-TO-STORAGE MAPPING
-    # =========================================================================
-    # Get storage capabilities from the mapping (no more component matching!)
+
+    # 5. Determine can_extract_from and can_input_to from storage dictionaries
     can_extract_from = []
     can_input_to = []
-    
-    if ppu_name in PPU_STORAGE_MAPPING:
-        mapping = PPU_STORAGE_MAPPING[ppu_name]
-        can_extract_from = mapping.get('extract_from', []).copy()
-        can_input_to = mapping.get('input_to', []).copy()
-    else:
-        # Fallback for PPUs not in mapping - assume no storage capabilities
-        print(f"Warning: PPU '{ppu_name}' not found in PPU_STORAGE_MAPPING. Assuming no storage capabilities.")
-        can_extract_from = []
-        can_input_to = []
-    
-    # For backward compatibility, determine available storages for storage assignment
-    available_storages = can_extract_from.copy()  # PPUs can be assigned to storages they can extract from
-    storage_distribution = {}
-    if available_storages:
-        # Already selected single storage above
-        storage_distribution = {available_storages[0]: 1.0}
-    
-    # Determine PPU_Extract based on extraction and input capabilities
-    ppu_extract = None
-    
-    # Define pure incidence sources (uncontrollable, non-storage energy sources)
-    # Note: 'River' and 'Lake' can be both incidence AND storage depending on PPU type
-    # - Solar, Wind: Pure incidence (no storage, uncontrollable)
-    # - River: Incidence for HYD_R (run-of-river), but storage-like for others
-    # - Lake: Storage for PHS (pumped hydro), incidence for HYD_S (regular hydro)
-    pure_incidence_sources = ['Solar', 'Wind', 'Wood']
-    
-    # Check if PPU can extract from pure incidence sources
-    extracts_from_pure_incidence = any(source in can_extract_from for source in pure_incidence_sources)
-    
-    # Check if PPU is specifically HYD_S or HYD_R (incidence-based hydro)
-    is_incidence_hydro = ppu_name in ['HYD_S', 'HYD_R']
-    
-    # Check if PPU can input to storage sources
-    inputs_to_storage = len(can_input_to) > 0
-    
-    # Check if PPU can extract from controllable storage sources
-    extracts_from_controllable_storage = len(can_extract_from) > 0 and not extracts_from_pure_incidence and not is_incidence_hydro
-    
-    # Priority order for classification:
-    # 1. Incidence: Extracts from uncontrollable sources (solar, wind, river from HYD_R, lake from HYD_S)
-    # 2. Store: Can INPUT to storage (charge/store energy) - prioritize this over Flex
-    # 3. Flex: Can EXTRACT from controllable storage (discharge/produce energy)
-    if extracts_from_pure_incidence or is_incidence_hydro:
-        ppu_extract = 'Incidence'  # Uncontrollable production from incidence sources
-    elif inputs_to_storage:
-        ppu_extract = 'Store'  # Storage PPUs that can charge storage (prioritize over Flex)
-    elif extracts_from_controllable_storage:
-        ppu_extract = 'Flex'  # Flexible production from storage sources
-    else:
-        ppu_extract = 'Flex'  # Default fallback for production PPUs
-    
-    # Determine if this is a renewable PPU that needs location assignment
+    if raw_energy_storage is not None:
+        for storage in raw_energy_storage:
+            if 'extracted_by' in storage and ppu_name in storage['extracted_by']:
+                can_extract_from.append(storage['storage'])
+            if 'input_by' in storage and ppu_name in storage['input_by']:
+                can_input_to.append(storage['storage'])
+    if raw_energy_incidence is not None:
+        for incidence in raw_energy_incidence:
+            if 'extracted_by' in incidence and ppu_name in incidence['extracted_by']:
+                can_extract_from.append(incidence['storage'])
+
+    # 6. Assign location ranking for solar/wind PPUs (if applicable)
     location_rank = np.nan
     renewable_type = None
-    
-    # Check components for renewable types
     if 'PV' in components:
         renewable_type = 'solar'
     elif 'Wind (onshore)' in components:
         renewable_type = 'wind_onshore'
     elif 'Wind (offshore)' in components:
         renewable_type = 'wind_offshore'
-    
-    # Assign location if renewable
     if renewable_type:
         location_info = next_available_location(
             ppu_dictionary,
@@ -881,24 +643,27 @@ def add_ppu_to_dictionary(
         )
         if location_info:
             location_rank = location_info['rank']
-            # Optionally store full location info in a comment or additional columns
-            # For now, just storing the rank as per requirements
-        else:
-            print(f"Warning: No available location for {ppu_name} ({renewable_type})")
-    
-    # Initialize empty tracking dictionaries for dispatch indices
-    # These will be populated during simulation/optimization
-    d_stor_dict = {}  # Disposition index (storage willingness to discharge)
-    u_dis_dict = {}   # Discharge utility index (system-wide shortfall signal)
-    u_chg_dict = {}   # Charge utility index (system-wide surplus signal)
-    c_dict = {}       # Cost index (price vs future value comparison)
-    
-    # Create new PPU entry
+
+    # 7. Get PPU type directly from ppu_constructs_components.csv
+    # Use 'Extract_Type' or 'Type' column (adjust column name if needed)
+    ppu_extract = ppu_row.get('Extract', None)
+    if ppu_extract is None:
+        # Fallback to 'Type' or default logic if not present
+        print(f"there is an issue with the just checking flex, incidence, store type assignment for {ppu_name}, defaulting to 'Flex")
+        ppu_extract = ppu_row.get('Type', 'Flex')
+
+    # 8. Initialize tracking dictionaries for dispatch indices
+    d_stor_dict = {}
+    u_dis_dict = {}
+    u_chg_dict = {}
+    c_dict = {}
+
+    # 9. Create new PPU entry
     new_ppu = pd.DataFrame([{
         'PPU_ID': new_id,
         'PPU_Name': ppu_name,
         'PPU_Category': category,
-        'PPU_Extract': ppu_extract,
+        'PPU_Extract': ppu_extract,                # Now from CSV
         'can_extract_from': can_extract_from,
         'can_input_to': can_input_to,
         'Chain_Efficiency': efficiency,
@@ -911,8 +676,8 @@ def add_ppu_to_dictionary(
         'u_chg': u_chg_dict,
         'c': c_dict
     }])
-    
-    # Add to dictionary
+
+    # 10. Add to dictionary
     updated_dictionary = pd.concat([ppu_dictionary, new_ppu], ignore_index=True)
     return updated_dictionary
 

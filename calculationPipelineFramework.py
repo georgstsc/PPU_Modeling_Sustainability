@@ -249,15 +249,28 @@ def scale_storage_capacities_by_unit_counts(
             if not name or name in do_not_scale_set:
                 continue
 
-            # Save base per-unit capacity the first time
+            # Save base per-unit capacity and initial current_value the first time
             if 'base_value' not in storage:
                 storage['base_value'] = storage.get('value', 0.0)
+                # CRITICAL FIX: Save initial current_value to preserve user's assigned starting value
+                if 'initial_current_value' not in storage:
+                    storage['initial_current_value'] = storage.get('current_value', 0.0)
 
             unit_count = storage_unit_counts.get(name, 0)
             if unit_count > 0:
+                old_max = storage.get('value', storage.get('base_value', 0.0))
                 new_max = float(storage['base_value']) * float(unit_count)
                 storage['value'] = new_max
-                if storage.get('current_value', 0.0) > new_max:
+                
+                # CRITICAL FIX: Scale current_value proportionally when capacity is scaled
+                # This preserves the initial state of charge (SoC)
+                if old_max > 0 and 'initial_current_value' in storage:
+                    # Scale proportionally: new_current = (old_current / old_max) * new_max
+                    initial_cv = storage['initial_current_value']
+                    soc_ratio = initial_cv / old_max if old_max > 0 else 0.0
+                    storage['current_value'] = soc_ratio * new_max
+                elif storage.get('current_value', 0.0) > new_max:
+                    # Cap if exceeds new maximum
                     storage['current_value'] = new_max
     except Exception as e:
         print(f"[WARN] Failed to scale storage capacities by unit counts: {e}")
@@ -866,21 +879,20 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
     """
     
     # Precompute renewable productions (MAJOR SPEEDUP)
-    print("Precomputing renewable productions...")
-    precomputed = precompute_renewable_productions(
-        ppu_dictionary, scenario['selected_days']
-    )
+    # print("Precomputing renewable productions...")
+    # precomputed = precompute_renewable_productions(
+    #     ppu_dictionary, scenario['selected_days']
+    # )
     
-    # Initialize technology tracking
+    # Initialize tracking
     Technology_volume = initialize_technology_tracking(ppu_dictionary)
     phi_smoothed = 0.0
-    
-    # Track how often the system is in deficit (overflow>+epsilon), surplus (overflow<-epsilon), or balanced
     overflow_count = 0
     surplus_count = 0
     balanced_count = 0
+    overflow_series = []  # Track overflow/deficit/surplus over time
     
-    # Iterate over the scenario-selected days and their 96 timesteps.
+    # Scenario-selected days and their 96 timesteps.
     sel_days = list(scenario.get('selected_days', []))
     DAY_STEPS = 96
     total_timesteps = len(sel_days) * DAY_STEPS
@@ -889,112 +901,86 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
     cached_annual = get_annual_data_cache('data') or {}
     demand_15min = cached_annual.get('demand_15min') if isinstance(cached_annual, dict) else None
 
-    # Create progress bar across all selected timesteps
-    progress = tqdm(iterable=total_timesteps, desc="⚡ Dispatch Simulation",
+    # Cosmetic, tqdm progress bar
+    print(f"  ⚡ Running dispatch simulation for {total_timesteps:,} timesteps...")
+    progress = tqdm(iterable=range(total_timesteps), desc="⚡ Dispatch Simulation",
                     unit="timestep", ncols=100,
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
+    # Heart of the simulation: loop over selected days and their 15-min steps
     for day_idx, day in enumerate(sel_days):
         for sub in range(DAY_STEPS):
             # Global timestep index in the full-year series
             t_global = int(day) * DAY_STEPS + int(sub)
             progress.update(1)
             # Provide the precomputed row index for lookups (concatenated days)
-            precomputed_row = day_idx * DAY_STEPS + sub
             raw_energy_incidence = update_raw_energy_incidence(
-                ppu_dictionary,
-                raw_energy_incidence,
-                Technology_volume,
-                t_global
-            )
+                                                            ppu_dictionary,
+                                                            raw_energy_incidence,
+                                                            Technology_volume,
+                                                            t_global
+                                                        )
 
-            # Get energy produced by incidence PPUs (stored in "Grid")
-            grid_energy = 0.0
-            for incidence_item in raw_energy_incidence:
-                if incidence_item['storage'] == 'Grid':
-                    # Get current value directly (already updated in update_raw_energy_incidence)
-                    grid_energy = incidence_item.get('current_value', 0.0)
-                    break
-
-            # 4) Compute overflow = demand - energy in "Grid"
-            if demand_15min is not None and 0 <= t_global < len(demand_15min):
-                demand_MW = float(demand_15min.iloc[t_global])
-            else:
-                demand_MW = 0.0
-            overflow_MW = demand_MW - grid_energy
-
-            # Count state occurrence for this timestep
-            if overflow_MW > hyperparams['epsilon']:
-                overflow_count += 1
-            elif overflow_MW < -hyperparams['epsilon']:
-                surplus_count += 1
-            else:
-                balanced_count += 1
-            # First compute the d_stor, u_dis, u_chg and m for each PPU
-            ppu_indices = calculate_ppu_indices(
-                ppu_dictionary, 
-                raw_energy_storage, 
-                overflow_MW, 
-                phi_smoothed,
-                t_global, 
-                hyperparams
-            )
+            overflow_MW, overflow_count, surplus_count, balanced_count = compute_overflow_and_state(
+                                                            raw_energy_incidence, 
+                                                            demand_15min, 
+                                                            t_global, 
+                                                            hyperparams,
+                                                            overflow_count, 
+                                                            surplus_count, 
+                                                            balanced_count
+                                                        )
+            # Track overflow for plotting
+            overflow_series.append(overflow_MW)
+            # Compute the d_stor, u_dis, u_chg and m for each PPU
+            ppu_indices = calculate_ppu_indices( 
+                                                ppu_dictionary, 
+                                                raw_energy_storage, 
+                                                overflow_MW, 
+                                                phi_smoothed,
+                                                t_global, 
+                                                hyperparams
+                                            )
             # Update EMA of shortfall for utility index
-            phi_smoothed = exponential_moving_average(overflow_MW, phi_smoothed, hyperparams['ema_beta'])
-
-            # Store cost indices in Technology_volume
-            for ppu_name, indices in ppu_indices.items():
-                if ppu_name not in Technology_volume:
-                    Technology_volume[ppu_name] = {
-                        'production': [],
-                        'spot_bought': [],
-                        'spot_sold': [],
-                        'cost_indices': []
-                    }
-                Technology_volume[ppu_name]['cost_indices'].append((
-                    t_global,
-                    indices['d_stor'],
-                    indices['u_dis'],
-                    indices['u_chg'],
-                    indices['m'],
-                    indices.get('kappa_dis', 1.0),
-                    indices.get('kappa_chg', 1.0)
-                ))
-
-            if t_global % 5000 == 0:
-                print("[DEBUG] Storage state BEFORE handling:")
-                for storage in raw_energy_storage:
-                    print(f"  {storage['storage']}: {storage['current_value']:.2f} MW")
-
+            phi_smoothed = exponential_moving_average(overflow_MW, 
+                                                      phi_smoothed, 
+                                                      hyperparams['ema_beta'])
+            # Store cost indices for later cost breakdown
+            store_cost_indices(Technology_volume, 
+                               ppu_indices, 
+                               t_global
+                            )
             # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
-            if overflow_MW > hyperparams['epsilon']:
-                raw_energy_storage = handle_energy_deficit(
-                    overflow_MW, 
-                    ppu_dictionary, 
-                    raw_energy_storage, 
-                    Technology_volume,
-                    ppu_indices, 
-                    t_global, 
-                    hyperparams
-                )
             # 4.2) If overflow < 0: use 'Store' PPUs
-            elif overflow_MW < -hyperparams['epsilon']:
-                surplus_MW = abs(overflow_MW)
-                raw_energy_storage = handle_energy_surplus(
-                    surplus_MW, 
-                    ppu_dictionary, 
-                    raw_energy_storage, 
-                    Technology_volume,
-                    ppu_indices, 
-                    t_global, 
-                    hyperparams
-                )
+            if overflow_MW > hyperparams['epsilon']: 
+                raw_energy_storage, raw_energy_incidence = handle_energy_deficit(
+                                                        overflow_MW, 
+                                                        ppu_dictionary, 
+                                                        raw_energy_storage,
+                                                        raw_energy_incidence,
+                                                        Technology_volume,
+                                                        ppu_indices, 
+                                                        t_global, 
+                                                        hyperparams
+                                                    )
+            elif overflow_MW < -hyperparams['epsilon']: 
+                raw_energy_storage, raw_energy_incidence = handle_energy_surplus(
+                                                        abs(overflow_MW), 
+                                                        ppu_dictionary, 
+                                                        raw_energy_storage,
+                                                        raw_energy_incidence,
+                                                        Technology_volume,
+                                                        ppu_indices, 
+                                                        t_global, 
+                                                        hyperparams
+                                                    )
     # Attach pipeline state statistics for later reporting
     Technology_volume['__pipeline_stats__'] = {
         'overflow_count': overflow_count,
         'surplus_count': surplus_count,
         'balanced_count': balanced_count,
-        'total_timesteps': total_timesteps
+        'total_timesteps': total_timesteps,
+        'overflow_series': np.array(overflow_series) if overflow_series else None
     }
 
     print(f"  ✓ Simulation complete: {total_timesteps:,} timesteps")
@@ -1003,6 +989,70 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
     print(f"    - Balanced steps:           {balanced_count:,}")
     return Technology_volume, phi_smoothed
 
+def compute_overflow_and_state(raw_energy_incidence: List[Dict], demand_15min, t_global: int, hyperparams: Dict,
+                              overflow_count: int, surplus_count: int, balanced_count: int) -> Tuple[float, int, int, int]:
+    """
+    Compute overflow and update state counters for the current timestep.
+
+    Args:
+        raw_energy_incidence: List of incidence dicts.
+        demand_15min: Demand time series.
+        t_global: Global timestep index.
+        hyperparams: Simulation hyperparameters.
+        overflow_count: Current overflow counter.
+        surplus_count: Current surplus counter.
+        balanced_count: Current balanced counter.
+
+    Returns:
+        Tuple of (overflow_MW, overflow_count, surplus_count, balanced_count)
+    """
+    grid_energy = 0.0
+    for incidence_item in raw_energy_incidence:
+        if incidence_item['storage'] == 'Grid':
+            grid_energy = incidence_item.get('current_value', 0.0)
+            break
+
+    if demand_15min is not None and 0 <= t_global < len(demand_15min):
+        demand_MW = float(demand_15min.iloc[t_global])
+    else:
+        demand_MW = 0.0
+    overflow_MW = demand_MW - grid_energy
+
+    if overflow_MW > hyperparams['epsilon']:
+        overflow_count += 1
+    elif overflow_MW < -hyperparams['epsilon']:
+        surplus_count += 1
+    else:
+        balanced_count += 1
+
+    return overflow_MW, overflow_count, surplus_count, balanced_count
+
+def store_cost_indices(Technology_volume: Dict, ppu_indices: Dict, t_global: int) -> None:
+    """
+    Store cost indices for each PPU in Technology_volume.
+
+    Args:
+        Technology_volume: Dictionary tracking technology volumes and indices.
+        ppu_indices: Dictionary of indices for each PPU.
+        t_global: Global timestep index.
+    """
+    for ppu_name, indices in ppu_indices.items():
+        if ppu_name not in Technology_volume:
+            Technology_volume[ppu_name] = {
+                'production': [],
+                'spot_bought': [],
+                'spot_sold': [],
+                'cost_indices': []
+            }
+        Technology_volume[ppu_name]['cost_indices'].append((
+            t_global,
+            indices['d_stor'],
+            indices['u_dis'],
+            indices['u_chg'],
+            indices['m'],
+            indices.get('kappa_dis', 1.0),
+            indices.get('kappa_chg', 1.0)
+        ))
 
 def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame, 
                         technology_volume: Dict[str, Dict], 
@@ -1019,9 +1069,6 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
     Returns:
         Cost summary dictionary
     """
-    # Derive technology-specific costs from the provided PPU dictionary.
-    # Prefer `Cost_CHF_per_kWh` (CHF/kWh). If only `Cost_CHF_per_Quarter_Hour`
-    # is available, convert to CHF/kWh by dividing by the timestep hours.
     tech_costs: Dict[str, float] = {}
     try:
         if isinstance(ppu_dictionnary, pd.DataFrame) and 'PPU_Name' in ppu_dictionnary.columns:
@@ -1031,20 +1078,15 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
                 if 'Cost_CHF_per_kWh' in group.columns and group['Cost_CHF_per_kWh'].notna().any():
                     val = float(group['Cost_CHF_per_kWh'].astype(float).mean())
                 elif 'Cost_CHF_per_Quarter_Hour' in group.columns and group['Cost_CHF_per_Quarter_Hour'].notna().any():
-                    # convert CHF per quarter-hour -> CHF per kWh using timestep hours
                     timestep_h = float(hyperparams.get('timestep_hours', 0.25)) if isinstance(hyperparams, dict) else 0.25
-                    # Cost_CHF_per_Quarter_Hour was stored as cost_per_kwh * delta_t in add_ppu_to_dictionary
                     val = float(group['Cost_CHF_per_Quarter_Hour'].astype(float).mean()) / max(timestep_h, 1e-9)
                 else:
                     val = None
-
                 if val is not None:
                     tech_costs[str(name)] = float(val)
     except Exception:
-        # If anything goes wrong, leave tech_costs empty and fall back to defaults below
         tech_costs = {}
 
-    # Load spot price series from the annual cache for accurate per-timestep pricing
     annual_cache = None
     try:
         annual_cache = get_annual_data_cache()
@@ -1057,7 +1099,6 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
 
     Cost_summary = {}
     for tech_type, metrics in technology_volume.items():
-        # Skip non-PPU entries (e.g., attached pipeline stats) or malformed entries
         if isinstance(tech_type, str) and tech_type.startswith('__'):
             continue
         if not isinstance(metrics, dict):
@@ -1067,20 +1108,18 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
         production_cost = 0.0
         spot_buy_cost = 0.0
         spot_sell_revenue = 0.0
-        # Detailed per-timestep breakdowns (list of dicts)
         spot_buy_breakdown = []
         spot_sell_breakdown = []
+        total_volume_MWh = 0.0
 
-        # Production cost: prefer cost from PPU dictionary, else sensible fallback
         cost_per_kwh = tech_costs.get(tech_type)
         if cost_per_kwh is None:
-            # Try to lookup single-row match in the DataFrame (robust fallback)
             try:
                 if isinstance(ppu_dictionnary, pd.DataFrame) and 'PPU_Name' in ppu_dictionnary.columns:
                     match = ppu_dictionnary[ppu_dictionnary['PPU_Name'] == tech_type]
                     if not match.empty:
-                        if 'Cost_CHF_per_kWh' in match.columns and match['Cost_CHF_per_kWh'].notna().any():
-                            cost_per_kwh = float(match['Cost_CHF_per_kWh'].astype(float).mean())
+                        if 'Cost_CHF_per_kWh' in match.columns and match['Cost_CHF_per_KWh'].notna().any():
+                            cost_per_kwh = float(match['Cost_CHF_per_KWh'].astype(float).mean())
                         elif 'Cost_CHF_per_Quarter_Hour' in match.columns and match['Cost_CHF_per_Quarter_Hour'].notna().any():
                             timestep_h = float(hyperparams.get('timestep_hours', 0.25)) if isinstance(hyperparams, dict) else 0.25
                             cost_per_kwh = float(match['Cost_CHF_per_Quarter_Hour'].astype(float).mean()) / max(timestep_h, 1e-9)
@@ -1088,13 +1127,12 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
                 cost_per_kwh = None
 
         if cost_per_kwh is None:
-            # Final fallback: use a conservative default from hyperparams or constant
             cost_per_kwh = float(hyperparams.get('wood_price_chf_per_kwh', 0.095))
         for (t, vol_MW) in metrics['production']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             production_cost += energy_MWh * cost_per_kwh * 1000  # Convert to kWh
+            total_volume_MWh += energy_MWh
 
-        # Spot market transactions
         for (t, vol_MW) in metrics['spot_bought']:
             energy_MWh = vol_MW * hyperparams['timestep_hours']
             spot_price = 0.0
@@ -1125,13 +1163,13 @@ def compute_cost_breakdown(ppu_dictionnary: pd.DataFrame,
             'spot_sell_revenue_CHF': spot_sell_revenue,
             'net_cost_CHF': production_cost + spot_buy_cost - spot_sell_revenue,
             'spot_buy_breakdown': spot_buy_breakdown,
-            'spot_sell_breakdown': spot_sell_breakdown
+            'spot_sell_breakdown': spot_sell_breakdown,
+            'total_volume_MWh': total_volume_MWh
         }
 
     return Cost_summary
 
-
-def compute_portfolio_metrics(cost_summary: Dict[str, Dict], 
+def compute_financial_metrics(cost_summary: Dict[str, Dict], 
                             hyperparams: Dict) -> Dict[str, float]:
     """
     Compute portfolio performance metrics.
@@ -1197,6 +1235,537 @@ def compute_portfolio_metrics(cost_summary: Dict[str, Dict],
         'num_timesteps': num_timesteps
     }
 
+def plot_scenario_evolution(pipeline_results, raw_energy_storage, name: str = "scenario1", output_dir="data/result_plots/scenario_evolution"):
+    """
+    Plots demand, spot price, storage levels, deficit/surplus, and spot bought/sold over the scenario.
+    Stores PNGs in output_dir.
+    """
+    import os
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import numpy as np
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Extract time series from pipeline results
+    scenario = pipeline_results.get("scenario", {})
+    demand_15min = pipeline_results.get("demand_15min")
+    spot_15min = pipeline_results.get("spot_15min")
+    overflow_series = pipeline_results.get("overflow_series")
+    technology_volume = pipeline_results.get("technology_volume", {})
+    hyperparams = pipeline_results.get("hyperparams", {})
+    
+    # Get scenario selected days to determine time range
+    selected_days = scenario.get("selected_days", [])
+    
+    # CRITICAL FIX: Create mapping from global timestep (t_global) to scenario-local timestep index
+    # This is needed because production is recorded with t_global, but plots use scenario-local indices
+    global_to_local_map = {}
+    if selected_days:
+        DAY_STEPS = 96
+        local_idx = 0
+        for day in selected_days:
+            day_start_global = int(day) * DAY_STEPS
+            for sub in range(DAY_STEPS):
+                t_global = day_start_global + sub
+                global_to_local_map[t_global] = local_idx
+                local_idx += 1
+    else:
+        # If no selected days, assume full year - mapping is identity
+        # This shouldn't happen in normal operation, but handle gracefully
+        pass
+    
+    if selected_days:
+        # Scenario uses selected days, extract corresponding demand/spot
+        DAY_STEPS = 96
+        total_timesteps = len(selected_days) * DAY_STEPS
+        
+        # Extract demand and spot for selected days
+        if demand_15min is not None and isinstance(demand_15min, pd.Series):
+            demand = []
+            for day in selected_days:
+                start_idx = int(day) * DAY_STEPS
+                end_idx = start_idx + DAY_STEPS
+                if 0 <= start_idx < len(demand_15min):
+                    day_demand = demand_15min.iloc[start_idx:min(end_idx, len(demand_15min))]
+                    demand.extend(day_demand.values)
+            demand = np.array(demand) if demand else None
+        else:
+            demand = None
+            
+        if spot_15min is not None and isinstance(spot_15min, pd.Series):
+            spot = []
+            for day in selected_days:
+                start_idx = int(day) * DAY_STEPS
+                end_idx = start_idx + DAY_STEPS
+                if 0 <= start_idx < len(spot_15min):
+                    day_spot = spot_15min.iloc[start_idx:min(end_idx, len(spot_15min))]
+                    spot.extend(day_spot.values)
+            spot = np.array(spot) if spot else None
+        else:
+            spot = None
+    else:
+        # Use full series if available
+        demand = demand_15min.values if demand_15min is not None and isinstance(demand_15min, pd.Series) else None
+        spot = spot_15min.values if spot_15min is not None and isinstance(spot_15min, pd.Series) else None
+        total_timesteps = len(demand) if demand is not None else (len(spot) if spot is not None else 0)
+    
+    timesteps = np.arange(total_timesteps) if total_timesteps > 0 else None
+
+    # Plot demand
+    if demand is not None and len(demand) > 0:
+        plt.figure(figsize=(14, 5))
+        plt.plot(timesteps, demand, label="Demand (MW)", color="blue", linewidth=1.5)
+        plt.xlabel("Timestep (15-min intervals)", fontsize=11)
+        plt.ylabel("MW", fontsize=11)
+        plt.title(f"Demand Over Scenario: {name}", fontsize=13, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/demand_{name}.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Plot spot price
+    if spot is not None and len(spot) > 0:
+        plt.figure(figsize=(14, 5))
+        plt.plot(timesteps, spot, label="Spot Price (CHF/MWh)", color="orange", linewidth=1.5)
+        plt.xlabel("Timestep (15-min intervals)", fontsize=11)
+        plt.ylabel("CHF/MWh", fontsize=11)
+        plt.title(f"Spot Price Over Scenario: {name}", fontsize=13, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/spot_{name}.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Extract overflow_series from pipeline_stats if not directly in results
+    if overflow_series is None:
+        pipeline_stats = technology_volume.get('__pipeline_stats__', {})
+        if 'overflow_series' in pipeline_stats and pipeline_stats['overflow_series'] is not None:
+            overflow_series = pipeline_stats['overflow_series']
+        # Fallback: reconstruct from Grid history if not available
+        else:
+            raw_energy_incidence = pipeline_results.get("raw_energy_incidence", [])
+            if raw_energy_incidence and demand is not None:
+                for item in raw_energy_incidence:
+                    if item.get('storage') == 'Grid' and 'history' in item:
+                        grid_history = item.get('history', [])
+                        if grid_history:
+                            overflow_series = []
+                            for t, grid_energy in grid_history:
+                                t_idx = int(t)
+                                if 0 <= t_idx < len(demand):
+                                    demand_val = float(demand[t_idx])
+                                    grid_val = float(grid_energy)
+                                    overflow_val = demand_val - grid_val
+                                    overflow_series.append(overflow_val)
+                            overflow_series = np.array(overflow_series) if overflow_series else None
+                            break
+
+    # Plot deficit/surplus
+    if overflow_series is not None and len(overflow_series) > 0:
+        # Align timesteps with overflow series
+        overflow_timesteps = np.arange(len(overflow_series))
+        plt.figure(figsize=(14, 5))
+        # Color code: red for deficit (positive), green for surplus (negative)
+        colors = np.where(overflow_series > 0, 'red', 'green')
+        plt.bar(overflow_timesteps, overflow_series, color=colors, alpha=0.6, width=1.0, label="Deficit/Surplus")
+        plt.axhline(0, color="black", linestyle="--", alpha=0.5, linewidth=1)
+        plt.xlabel("Timestep (15-min intervals)", fontsize=11)
+        plt.ylabel("MW", fontsize=11)
+        plt.title(f"Deficit/Surplus Over Scenario: {name}\n(Red=Deficit, Green=Surplus)", fontsize=13, fontweight='bold')
+        plt.grid(True, alpha=0.3, axis='y')
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/deficit_surplus_{name}.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Extract and aggregate spot bought/sold from technology_volume
+    spot_bought_series = np.zeros(total_timesteps) if total_timesteps > 0 else None
+    spot_sold_series = np.zeros(total_timesteps) if total_timesteps > 0 else None
+    
+    if technology_volume and total_timesteps > 0:
+        for tech_name, tech_data in technology_volume.items():
+            if not isinstance(tech_data, dict) or tech_name == '__pipeline_stats__':
+                continue
+                
+            # Aggregate spot_bought
+            for t_global, vol_MW in tech_data.get('spot_bought', []):
+                # CRITICAL FIX: Map global timestep to scenario-local timestep
+                t_idx = global_to_local_map.get(int(t_global), None)
+                if t_idx is not None and 0 <= t_idx < total_timesteps:
+                    spot_bought_series[t_idx] += float(vol_MW)
+            
+            # Aggregate spot_sold
+            for t_global, vol_MW in tech_data.get('spot_sold', []):
+                # CRITICAL FIX: Map global timestep to scenario-local timestep
+                t_idx = global_to_local_map.get(int(t_global), None)
+                if t_idx is not None and 0 <= t_idx < total_timesteps:
+                    spot_sold_series[t_idx] += float(vol_MW)
+
+    # Plot spot bought/sold
+    if spot_bought_series is not None and (spot_bought_series.sum() > 0 or (spot_sold_series is not None and spot_sold_series.sum() > 0)):
+        plt.figure(figsize=(14, 5))
+        if spot_bought_series.sum() > 0:
+            plt.bar(timesteps, spot_bought_series, alpha=0.7, color='red', label='Spot Bought (MW)', width=1.0)
+        if spot_sold_series is not None and spot_sold_series.sum() > 0:
+            plt.bar(timesteps, -spot_sold_series, alpha=0.7, color='green', label='Spot Sold (MW)', width=1.0)
+        plt.axhline(0, color="black", linestyle="--", alpha=0.5, linewidth=1)
+        plt.xlabel("Timestep (15-min intervals)", fontsize=11)
+        plt.ylabel("MW", fontsize=11)
+        plt.title(f"Spot Market Transactions Over Scenario: {name}\n(Red=Buy, Green=Sell)", fontsize=13, fontweight='bold')
+        plt.grid(True, alpha=0.3, axis='y')
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/spot_transactions_{name}.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Plot storage levels
+    if raw_energy_storage and isinstance(raw_energy_storage, (list, tuple)):
+        for rec in raw_energy_storage:
+            storage_name = rec.get("storage", "Storage")
+            cap = float(rec.get("value", 0.0))
+            final_val = float(rec.get("current_value", 0.0))
+            history = rec.get("history") or []
+            
+            # Determine length from demand or total_timesteps
+            if demand is not None:
+                L = len(demand)
+            else:
+                L = total_timesteps if total_timesteps > 0 else 1
+                
+            # CRITICAL FIX: Map global timesteps to scenario-local indices
+            deltas = np.zeros(L)
+            for item in history:
+                try:
+                    t_global, delta = item
+                    # Map global timestep to scenario-local index
+                    t_local = global_to_local_map.get(int(t_global), None)
+                    if t_local is not None and 0 <= t_local < L:
+                        deltas[t_local] += float(delta)
+                except Exception:
+                    continue
+            
+            # CRITICAL FIX: Use initial_current_value if available, otherwise calculate from final value
+            # This ensures storages start at their assigned initial current_value (e.g., 75000.0)
+            initial_val = rec.get('initial_current_value', None)
+            if initial_val is not None:
+                baseline = float(initial_val)
+            else:
+                # Fallback: calculate baseline from final value and deltas
+                baseline = final_val - deltas.sum()
+            
+            level = baseline + np.cumsum(deltas)
+            if cap > 0:
+                level = np.clip(level, 0, cap)
+                
+            plt.figure(figsize=(14, 5))
+            plt.plot(np.arange(L), level, label=f"{storage_name} Level (MWh)", color="green", linewidth=1.5)
+            if cap > 0:
+                plt.axhline(cap, color="red", linestyle="--", label=f"Capacity ({cap:.0f} MWh)", linewidth=1.5)
+            plt.xlabel("Timestep (15-min intervals)", fontsize=11)
+            plt.ylabel("MWh", fontsize=11)
+            plt.title(f"{storage_name} Storage Level Over Scenario: {name}", fontsize=13, fontweight='bold')
+            plt.legend(fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/storage_{storage_name.replace(' ', '_')}_{name}.png", dpi=150, bbox_inches='tight')
+            plt.close()
+
+    # Plot stacked energy sources (production by source type)
+    if technology_volume and total_timesteps > 0:
+        # Typical efficiency values for storage-based PPUs (used if not available in data)
+        # These are approximate - actual values come from Chain_Efficiency in ppu_dictionary
+        default_efficiencies = {
+            'H2P_G': 0.6, 'H2P_L': 0.6,  # Fuel cells ~60%
+            'HYD_S': 0.9,  # Hydro storage ~90%
+            'ICE': 0.4, 'THERM': 0.4,  # ICE/Thermal ~40%
+            'BIO_OIL_ICE': 0.4, 'PALM_ICE': 0.4,
+            'CH4_BIO': 0.5, 'THERM_CH4': 0.5,
+            'NH3_P': 0.5, 'NH3_FULL': 0.5,
+            'SOL_STEAM': 0.35, 'SOL_SALT': 0.35
+        }
+        
+        # Initialize source categories
+        source_categories = {
+            'Solar': np.zeros(total_timesteps),
+            'Wind': np.zeros(total_timesteps),
+            'Hydro (River)': np.zeros(total_timesteps),
+            'Hydro (Storage)': np.zeros(total_timesteps),
+            'H2 (Gaseous)': np.zeros(total_timesteps),
+            'H2 (Liquid)': np.zeros(total_timesteps),
+            'Fuel (Bio/Fossil)': np.zeros(total_timesteps),
+            'Other Storage': np.zeros(total_timesteps),
+            'Spot Market': np.zeros(total_timesteps)
+        }
+        
+        # Try to get efficiency info from cost_summary if available
+        cost_summary = pipeline_results.get('cost_summary', {})
+        
+        # Categorize PPUs by their name patterns and production characteristics
+        for tech_name, tech_data in technology_volume.items():
+            if not isinstance(tech_data, dict) or tech_name == '__pipeline_stats__':
+                continue
+            
+            # Determine if this is an incidence-based source (production = energy delivered)
+            # or storage-based source (production = extraction, need efficiency)
+            tech_upper = tech_name.upper()
+            is_incidence_source = ('PV' in tech_upper or 'SOL' in tech_upper or 
+                                  'WD_ON' in tech_upper or 'WD_OFF' in tech_upper or 
+                                  'WIND' in tech_upper or 'HYD_R' in tech_upper or 'RIVER' in tech_upper)
+            
+            # Get efficiency for storage-based sources
+            efficiency = 1.0
+            if not is_incidence_source:
+                # Try to get from cost_summary or use default
+                if tech_name in cost_summary:
+                    # Efficiency might be stored somewhere, but for now use defaults
+                    pass
+                efficiency = default_efficiencies.get(tech_name, 0.5)  # Default 50% if unknown
+            
+            # Get production and convert to energy delivered to grid
+            for t_global, prod_MW in tech_data.get('production', []):
+                # CRITICAL FIX: Map global timestep to scenario-local timestep
+                t_idx = global_to_local_map.get(int(t_global), None)
+                if t_idx is not None and 0 <= t_idx < total_timesteps:
+                    # For incidence sources, production is already energy delivered
+                    # For storage sources, multiply by efficiency to get energy delivered
+                    energy_delivered = prod_MW if is_incidence_source else prod_MW * efficiency
+                    
+                    # Categorize based on PPU name
+                    if 'PV' in tech_upper or 'SOL' in tech_upper:
+                        source_categories['Solar'][t_idx] += energy_delivered
+                    elif 'WD_ON' in tech_upper or 'WD_OFF' in tech_upper or 'WIND' in tech_upper:
+                        source_categories['Wind'][t_idx] += energy_delivered
+                    elif 'HYD_R' in tech_upper or 'RIVER' in tech_upper:
+                        source_categories['Hydro (River)'][t_idx] += energy_delivered
+                    elif 'HYD_S' in tech_upper:
+                        source_categories['Hydro (Storage)'][t_idx] += energy_delivered
+                    elif 'H2P_G' in tech_upper or 'H2_G' in tech_upper:
+                        source_categories['H2 (Gaseous)'][t_idx] += energy_delivered
+                    elif 'H2P_L' in tech_upper or 'H2_L' in tech_upper:
+                        source_categories['H2 (Liquid)'][t_idx] += energy_delivered
+                    elif 'ICE' in tech_upper or 'THERM' in tech_upper or 'BIO' in tech_upper or 'PALM' in tech_upper:
+                        source_categories['Fuel (Bio/Fossil)'][t_idx] += energy_delivered
+                    else:
+                        # Other storage-based or unknown
+                        source_categories['Other Storage'][t_idx] += energy_delivered
+            
+            # Add spot market purchases (already energy delivered)
+            # CRITICAL FIX: Map global timestep to scenario-local timestep (same as spot transactions plot)
+            for t_global, spot_MW in tech_data.get('spot_bought', []):
+                t_idx = global_to_local_map.get(int(t_global), None)
+                if t_idx is not None and 0 <= t_idx < total_timesteps:
+                    source_categories['Spot Market'][t_idx] += float(spot_MW)
+        
+        # Filter out empty categories and create stacked plot
+        active_categories = {k: v for k, v in source_categories.items() if v.sum() > 0}
+        
+        if active_categories:
+            fig, ax = plt.subplots(figsize=(16, 8))
+            
+            # Prepare data for stacking
+            category_names = list(active_categories.keys())
+            category_data = [active_categories[name] for name in category_names]
+            
+            # Define colors for each category
+            color_map = {
+                'Solar': '#FFD700',  # Gold
+                'Wind': '#87CEEB',    # Sky blue
+                'Hydro (River)': '#4169E1',  # Royal blue
+                'Hydro (Storage)': '#1E90FF',  # Dodger blue
+                'H2 (Gaseous)': '#FF69B4',  # Hot pink
+                'H2 (Liquid)': '#FF1493',  # Deep pink
+                'Fuel (Bio/Fossil)': '#8B4513',  # Saddle brown
+                'Other Storage': '#9370DB',  # Medium purple
+                'Spot Market': '#FF4500'  # Orange red
+            }
+            colors = [color_map.get(name, '#808080') for name in category_names]
+            
+            # Create stacked area plot
+            ax.stackplot(timesteps, *category_data, labels=category_names, colors=colors, alpha=0.7)
+            
+            # Add demand line for reference
+            if demand is not None and len(demand) > 0:
+                ax.plot(timesteps, demand, 'k--', linewidth=2, label='Demand', alpha=0.8)
+            
+            ax.set_xlabel("Timestep (15-min intervals)", fontsize=12)
+            ax.set_ylabel("Power (MW)", fontsize=12)
+            ax.set_title(f"Energy Production by Source - Scenario: {name}\n(Stacked Area Chart)", 
+                        fontsize=14, fontweight='bold')
+            ax.legend(loc='upper left', fontsize=9, ncol=2, framealpha=0.9)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_xlim(0, total_timesteps - 1)
+            
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/energy_sources_stacked_{name}.png", dpi=150, bbox_inches='tight')
+            plt.close()
+    
+    # Plot incidence-based resources production (Solar, Wind, River/Hydro)
+    if technology_volume and total_timesteps > 0:
+        # Initialize incidence resource categories
+        incidence_categories = {
+            'Solar': np.zeros(total_timesteps),
+            'Wind': np.zeros(total_timesteps),
+            'Hydro (River)': np.zeros(total_timesteps),
+            'Other Incidence': np.zeros(total_timesteps)
+        }
+        
+        # Extract production from incidence-based PPUs only
+        for tech_name, tech_data in technology_volume.items():
+            if not isinstance(tech_data, dict) or tech_name == '__pipeline_stats__':
+                continue
+            
+            tech_upper = tech_name.upper()
+            # Identify incidence-based sources (uncontrollable renewables)
+            is_incidence_source = ('PV' in tech_upper or 'SOL' in tech_upper or 
+                                  'WD_ON' in tech_upper or 'WD_OFF' in tech_upper or 
+                                  'WIND' in tech_upper or 'HYD_R' in tech_upper or 'RIVER' in tech_upper)
+            
+            if is_incidence_source:
+                # Get production (for incidence sources, production = energy delivered directly)
+                # CRITICAL FIX: Create a complete time series by initializing all timesteps to 0
+                # Then fill in actual production values
+                production_series = np.zeros(total_timesteps)
+                for t_global, prod_MW in tech_data.get('production', []):
+                    # Map global timestep to scenario-local timestep
+                    t_idx = global_to_local_map.get(int(t_global), None)
+                    if t_idx is not None and 0 <= t_idx < total_timesteps:
+                        production_series[t_idx] += prod_MW
+                
+                # Add to appropriate category (all timesteps, including zeros)
+                if 'PV' in tech_upper or 'SOL' in tech_upper:
+                    incidence_categories['Solar'] += production_series
+                elif 'WD_ON' in tech_upper or 'WD_OFF' in tech_upper or 'WIND' in tech_upper:
+                    incidence_categories['Wind'] += production_series
+                elif 'HYD_R' in tech_upper or 'RIVER' in tech_upper:
+                    incidence_categories['Hydro (River)'] += production_series
+                else:
+                    incidence_categories['Other Incidence'] += production_series
+        
+        # Filter out empty categories
+        active_incidence = {k: v for k, v in incidence_categories.items() if v.sum() > 0}
+        
+        if active_incidence:
+            fig, ax = plt.subplots(figsize=(16, 8))
+            
+            # Prepare data for plotting
+            category_names = list(active_incidence.keys())
+            category_data = [active_incidence[name] for name in category_names]
+            
+            # Define colors for incidence resources
+            incidence_color_map = {
+                'Solar': '#FFD700',  # Gold
+                'Wind': '#87CEEB',    # Sky blue
+                'Hydro (River)': '#4169E1',  # Royal blue
+                'Other Incidence': '#9370DB'  # Medium purple
+            }
+            colors = [incidence_color_map.get(name, '#808080') for name in category_names]
+            
+            # Create stacked area plot for incidence resources
+            ax.stackplot(timesteps, *category_data, labels=category_names, colors=colors, alpha=0.7)
+            
+            # Add total incidence production line
+            total_incidence = sum(category_data)
+            ax.plot(timesteps, total_incidence, 'k-', linewidth=2, label='Total Incidence Production', alpha=0.9)
+            
+            # Add demand line for reference (to see how much incidence covers)
+            if demand is not None and len(demand) > 0:
+                ax.plot(timesteps, demand, 'r--', linewidth=2, label='Demand', alpha=0.8)
+            
+            ax.set_xlabel("Timestep (15-min intervals)", fontsize=12)
+            ax.set_ylabel("Power (MW)", fontsize=12)
+            ax.set_title(f"Incidence-Based Energy Production - Scenario: {name}\n(Solar, Wind, Hydro River - Uncontrollable Resources)", 
+                        fontsize=14, fontweight='bold')
+            ax.legend(loc='upper left', fontsize=10, framealpha=0.9)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_xlim(0, total_timesteps - 1)
+            
+            # Add statistics text box
+            if len(total_incidence) > 0:
+                avg_prod = np.mean(total_incidence)
+                max_prod = np.max(total_incidence)
+                min_prod = np.min(total_incidence)
+                total_energy = np.sum(total_incidence) * (hyperparams.get('timestep_hours', 0.25))
+                stats_text = f'Avg: {avg_prod:.1f} MW\nMax: {max_prod:.1f} MW\nMin: {min_prod:.1f} MW\nTotal: {total_energy:.1f} MWh'
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                       fontsize=9, verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/incidence_production_{name}.png", dpi=150, bbox_inches='tight')
+            plt.close()
+
+    print(f"Plots saved to {output_dir} for scenario: {name}")
+
+def analyze_pipeline_results(results: Dict) -> Tuple[float, float, float, float]:
+    """
+    Compute mean cost, CVaR (95%), HHI index, and spot dependence directly from pipeline results.
+
+    Args:
+        results: Output dictionary from run_complete_pipeline.
+
+    Returns:
+        Tuple of (mean_cost_CHF, cvar_95_CHF, hhi_index, spot_dependence)
+        - spot_dependence: Fraction of total demand met via spot market purchases.
+    """
+    import numpy as np
+
+    cost_summary = results.get('cost_summary', {})
+    technology_volume = results.get('technology_volume', {})
+    hyperparams = results.get('hyperparams', {})
+    # Try to get demand series from scenario or annual cache
+    scenario = results.get('scenario', {})
+    demand_15min = None
+    if isinstance(scenario, dict):
+        demand_15min = scenario.get('demand_15min')
+    if demand_15min is None and 'demand_15min' in hyperparams:
+        demand_15min = hyperparams['demand_15min']
+
+    # Gather all per-technology net costs
+    all_costs = [
+        summary.get('net_cost_CHF', 0.0)
+        for summary in cost_summary.values()
+        if isinstance(summary, dict)
+    ]
+    all_costs = np.array(all_costs, dtype=np.float64)
+
+    mean_cost = np.mean(all_costs) if len(all_costs) > 0 else 0.0
+
+    # CVaR at 95%
+    alpha = 0.95
+    if len(all_costs) > 0:
+        var_threshold = np.percentile(all_costs, alpha * 100)
+        cvar = np.mean(all_costs[all_costs >= var_threshold])
+    else:
+        cvar = 0.0
+
+    # HHI index for storage-based production cost shares
+    storage_costs = {}
+    total_cost = np.sum(all_costs)
+    for tech, metrics in technology_volume.items():
+        if isinstance(metrics, dict) and 'production' in metrics:
+            storage_prod = sum(abs(vol) for t, vol in metrics['production'] if vol < 0)
+            tech_cost = cost_summary.get(tech, {}).get('production_cost_CHF', 0.0)
+            storage_costs[tech] = storage_prod * tech_cost
+
+    storage_shares = [
+        storage_costs[tech] / total_cost if total_cost > 0 else 0.0
+        for tech in storage_costs
+    ]
+    hhi_index = sum(share ** 2 for share in storage_shares)
+
+    # Spot dependence: fraction of total demand met via spot purchases
+    total_spot_bought = 0.0
+    for summary in cost_summary.values():
+        if isinstance(summary, dict):
+            total_spot_bought += summary.get('spot_buy_cost_CHF', 0.0)
+    total_demand = None
+    if demand_15min is not None:
+        total_demand = float(np.sum(demand_15min))
+    spot_dependence = (total_spot_bought / total_demand) if (total_demand and total_demand > 0) else 0.0
+
+    return float(mean_cost), float(cvar), float(hhi_index), float(spot_dependence)
 
 def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
                         raw_energy_incidence: List[Dict], 
@@ -1216,36 +1785,39 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         Complete pipeline results dictionary
     """
     # Initialize history tracking for raw_energy_storage and raw_energy_incidence
+    # CRITICAL FIX: Preserve initial current_value before simulation starts
     for storage in raw_energy_storage:
         if 'history' not in storage:
             storage['history'] = []
+        # Save initial value if not already saved (for baseline calculation in plots)
+        if 'initial_current_value' not in storage:
+            storage['initial_current_value'] = storage.get('current_value', 0.0)
     
     for incidence in raw_energy_incidence:
         if 'history' not in incidence:
             incidence['history'] = []
 
     hyperparams = provide_hyper_parameters(hyperparams=hyperparams)
-
-    ppu_dictionary = build_ppu_dictionary(
-        ppu_counts, raw_energy_storage, raw_energy_incidence
-    )
-    print("We build the PPU dictionnary for this run")
+    ppu_dictionary = build_ppu_dictionary(ppu_counts, 
+                                        raw_energy_storage, 
+                                        raw_energy_incidence
+                                        )
     technology_volume, phi_smoothed = run_dispatch_simulation(
-        scenario = scenario, ppu_dictionary = ppu_dictionary, 
-        raw_energy_storage = raw_energy_storage, 
-        raw_energy_incidence = raw_energy_incidence, 
-        hyperparams = hyperparams
-    )
-    print("We ran the dispatch simulation")
+                                        scenario = scenario, 
+                                        ppu_dictionary = ppu_dictionary, 
+                                        raw_energy_storage = raw_energy_storage, 
+                                        raw_energy_incidence = raw_energy_incidence, 
+                                        hyperparams = hyperparams
+                                        )
     cost_summary = compute_cost_breakdown(
                                         ppu_dictionary, 
                                         technology_volume,
                                         hyperparams
                                         )
-    portfolio_metrics = compute_portfolio_metrics(
-                                            cost_summary, 
-                                            hyperparams
-                                            )
+    portfolio_metrics = compute_financial_metrics(
+                                        cost_summary, 
+                                        hyperparams
+                                        )
 
     print("\n" + "=" * 80)
     print("PORTFOLIO RESULT")
@@ -1264,6 +1836,32 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         print(f"  Balanced steps:           {pipeline_stats.get('balanced_count', 0):,}")
         print("=" * 80)
 
+    # Get demand and spot price series for plotting
+    cached_annual = get_annual_data_cache('data') or {}
+    demand_15min = cached_annual.get('demand_15min') if isinstance(cached_annual, dict) else None
+    spot_15min = cached_annual.get('spot_15min') if isinstance(cached_annual, dict) else None
+    
+    # Extract overflow/deficit series from pipeline stats (tracked during simulation)
+    overflow_series = None
+    pipeline_stats = technology_volume.get('__pipeline_stats__', {})
+    if 'overflow_series' in pipeline_stats and pipeline_stats['overflow_series'] is not None:
+        overflow_series = pipeline_stats['overflow_series']
+    # Fallback: reconstruct from Grid history if not available
+    elif raw_energy_incidence:
+        for item in raw_energy_incidence:
+            if item.get('storage') == 'Grid' and 'history' in item:
+                # Reconstruct overflow series from Grid and demand
+                grid_history = item.get('history', [])
+                if grid_history and demand_15min is not None:
+                    overflow_series = []
+                    for t, grid_energy in grid_history:
+                        if 0 <= int(t) < len(demand_15min):
+                            demand_val = float(demand_15min.iloc[int(t)])
+                            overflow_val = demand_val - float(grid_energy)
+                            overflow_series.append(overflow_val)
+                    overflow_series = np.array(overflow_series) if overflow_series else None
+                break
+    
     # Compile complete results
     results = {
         'portfolio_result': {
@@ -1278,13 +1876,12 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         'technology_volume': technology_volume,
         'pipeline_stats': technology_volume.get('__pipeline_stats__', {}),
         'hyperparams': hyperparams,
-        'data_shapes': {
-            'demand': len(demand_15min),
-            'spot': len(spot_15min),
-            'ror': len(ror_df),
-            'solar': len(solar_15min),
-            'wind': len(wind_15min)
-        }
+        'scenario': scenario,
+        'demand_15min': demand_15min,
+        'spot_15min': spot_15min,
+        'overflow_series': overflow_series,
+        'raw_energy_storage': raw_energy_storage,
+        'raw_energy_incidence': raw_energy_incidence
     }
 
     print("\n✓ PIPELINE EXECUTION COMPLETE")
@@ -1329,7 +1926,6 @@ def provide_hyper_parameters(hyperparams: Optional[Dict] = None) -> Dict:
         merged[k] = v
 
     return merged
-    
 
 
 def build_ppu_dictionary(ppu_counts, raw_energy_storage, raw_energy_incidence):
@@ -1359,7 +1955,8 @@ def build_ppu_dictionary(ppu_counts, raw_energy_storage, raw_energy_incidence):
                 solar_locations_df,
                 wind_locations_df,
                 raw_energy_storage=raw_energy_storage,
-                raw_energy_incidence=raw_energy_incidence
+                raw_energy_incidence=raw_energy_incidence, 
+                delta_t = 0.25
             )
     scale_storage_capacities_by_unit_counts(ppu_dict, raw_energy_storage, do_not_scale=['Lake'])
     return ppu_dict
@@ -1434,12 +2031,22 @@ def update_raw_energy_incidence(ppu_dictionary : pd.DataFrame,
                     try:
                         if _SOLAR_MAPPER is not None:
                             col = _SOLAR_MAPPER.col_for_rank(int(loc_rank))
-                            irr = _SOLAR_MAPPER.irradiance(int(t), int(col))
-                            prod = float(_solar_prod_fast(float(irr), float(area_m2)))
+                            # Check bounds: t must be within mapper data range
+                            if 0 <= int(t) < _SOLAR_MAPPER.data.shape[0]:
+                                irr = _SOLAR_MAPPER.irradiance(int(t), int(col))
+                                prod = float(_solar_prod_fast(float(irr), float(area_m2)))
+                            else:
+                                # Out of bounds - use 0 production
+                                prod = 0.0
                         else:
                             prod = calculate_solar_production(int(loc_rank), area_m2, t)
-                    except Exception:
+                    except Exception as e:
+                        # Debug: print error for first few occurrences
+                        if t < 10:
+                            print(f"Warning: Solar production error at t={t}: {e}")
                         prod = 0.0
+                # CRITICAL FIX: Always record production for every timestep, even if 0
+                # This ensures we have a complete time series for plotting
                 Technology_volume[ppu_name]['production'].append((t, prod))
                 acc += prod
             incidence_item['current_value'] = acc
@@ -1462,12 +2069,22 @@ def update_raw_energy_incidence(ppu_dictionary : pd.DataFrame,
                     try:
                         if _WIND_MAPPER is not None:
                             col = _WIND_MAPPER.col_for_rank(int(loc_rank))
-                            wspd = _WIND_MAPPER.speed(int(t), int(col))
-                            prod = float(_wind_power_fast(float(wspd), int(num_turbs)))
+                            # Check bounds: t must be within mapper data range
+                            if 0 <= int(t) < _WIND_MAPPER.data.shape[0]:
+                                wspd = _WIND_MAPPER.speed(int(t), int(col))
+                                prod = float(_wind_power_fast(float(wspd), int(num_turbs)))
+                            else:
+                                # Out of bounds - use 0 production
+                                prod = 0.0
                         else:
                             prod = calculate_wind_production(int(loc_rank), num_turbs, t)
-                    except Exception:
+                    except Exception as e:
+                        # Debug: print error for first few occurrences
+                        if t < 10:
+                            print(f"Warning: Wind production error at t={t}: {e}")
                         prod = 0.0
+                # CRITICAL FIX: Always record production for every timestep, even if 0
+                # This ensures we have a complete time series for plotting
                 Technology_volume[ppu_name]['production'].append((t, prod))
                 acc += prod
             incidence_item['current_value'] = acc
@@ -1683,24 +2300,26 @@ def calculate_ppu_indices(ppu_dictionary: pd.DataFrame, raw_energy_storage: List
 
 
 def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
-                         raw_energy_storage: List[Dict], Technology_volume: Dict,
+                         raw_energy_storage: List[Dict], raw_energy_incidence: List[Dict],
+                         Technology_volume: Dict,
                          ppu_indices: Dict, t: int,
-                         hyperparams: Dict) -> List[Dict]:
+                         hyperparams: Dict) -> Tuple[List[Dict], List[Dict]]:
     """
     Handle energy deficit using 'Flex' PPUs that extract from raw_energy_storage.
+    Energy produced is added to Grid to satisfy demand.
 
     Parameters:
         deficit_MW: Energy deficit to cover
         ppu_dictionary: PPU configuration
         raw_energy_storage: Storage systems
+        raw_energy_incidence: Incidence systems (including Grid)
         Technology_volume: Technology tracking
         ppu_indices: PPU indices for cost calculation
-        spot_price: Current spot price
         t: Timestep index
         hyperparams: Simulation hyperparameters
 
     Returns:
-        Updated raw_energy_storage
+        Tuple of (Updated raw_energy_storage, Updated raw_energy_incidence)
     """
     
     # Find Flex PPUs
@@ -1716,7 +2335,12 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
         spot_buy_per_tech = deficit_MW / tech_count
         for tech_type in Technology_volume:
             Technology_volume[tech_type]['spot_bought'].append((t, spot_buy_per_tech))
-        return raw_energy_storage
+        # Add spot market energy to Grid to satisfy demand
+        for incidence_item in raw_energy_incidence:
+            if incidence_item.get('storage') == 'Grid':
+                incidence_item['current_value'] += deficit_MW
+                break
+        return raw_energy_storage, raw_energy_incidence
 
     # Calculate discharge benefits and priorities
     discharge_benefits = []
@@ -1742,11 +2366,20 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
 
         B_dis_total += B_dis
 
+    # Track total energy produced (after efficiency) to add to Grid
+    total_energy_produced_MW = 0.0
+    total_spot_buy_MW = 0.0
+
     for each_flex_ppu in discharge_benefits:
         allocation = each_flex_ppu['B_dis'] / max(B_dis_total, hyperparams['epsilon'])
         efficiency = each_flex_ppu['ppu_row'].get('Chain_Efficiency', 1.0)
-        target_discharge_MW = deficit_MW * allocation / efficiency  # Divide by efficiency for extraction
-        spot_buy = 0.0
+        
+        # Each PPU is allocated a share of the deficit (in terms of grid energy needed)
+        target_grid_energy_MW = deficit_MW * allocation
+        
+        # To deliver target_grid_energy_MW to grid, we need to extract target_discharge_MW from storage
+        # (accounting for efficiency losses)
+        target_discharge_MW = target_grid_energy_MW / efficiency if efficiency > 0 else 0.0
         
         # Find available capacity in storage linked to each_flex_ppu 
         can_extract_from = each_flex_ppu['ppu_row'].get('can_extract_from', [])
@@ -1757,10 +2390,22 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
             for storage_item in raw_energy_storage 
             if storage_item['storage'] in can_extract_from
         )
-        # Limit by the smallest: 1 GW PPU capacity, available storage, and target
-        actual_discharge_MW = min(target_discharge_MW, available_capacity_MW, 1000 / efficiency)
         
+        # Limit by the smallest: 1 GW PPU capacity, available storage, and target
+        # PPU capacity is 1000 MW, but we need to account for efficiency when extracting
+        max_ppu_discharge_MW = 1000.0 / efficiency if efficiency > 0 else 1000.0
+        actual_discharge_MW = min(target_discharge_MW, available_capacity_MW, max_ppu_discharge_MW)
+        
+        # Calculate energy actually delivered to Grid (after efficiency conversion)
+        energy_delivered_to_grid_MW = actual_discharge_MW * efficiency
+        
+        # CRITICAL FIX: Each PPU decides independently whether to buy from spot
+        # Spot buy = difference between allocated grid energy and actual delivered energy
+        spot_buy_MW = max(0.0, target_grid_energy_MW - energy_delivered_to_grid_MW)
+        
+        # Discharge from storage
         if actual_discharge_MW == target_discharge_MW:
+            # Can meet full target - discharge proportionally from storages
             for storage_name in can_extract_from:
                 storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
                 if storage_item and storage_item['current_value'] > 0:
@@ -1768,13 +2413,11 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
                     if available_capacity_MW > 0:
                         fraction = storage_item['current_value'] / available_capacity_MW
                         discharge_amount = actual_discharge_MW * fraction
-                        old_value = storage_item['current_value']
                         storage_item['current_value'] -= discharge_amount
                         storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
                         
         elif actual_discharge_MW == available_capacity_MW:
-            # Storage capacity is the limiting factor - empty storage completely, buy rest
-            spot_buy = target_discharge_MW - actual_discharge_MW
+            # Storage capacity is the limiting factor - empty storage completely
             for storage_name in can_extract_from:
                 storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
                 if storage_item:
@@ -1784,7 +2427,6 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
                     
         else:
             # PPU capacity is the limiting factor - partial discharge
-            spot_buy = target_discharge_MW - actual_discharge_MW
             for storage_name in can_extract_from:
                 storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
                 if storage_item and storage_item['current_value'] > 0:
@@ -1794,34 +2436,49 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
                         storage_item['current_value'] -= discharge_amount
                         storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
         
-        # Record production
+        # Track totals
+        total_energy_produced_MW += energy_delivered_to_grid_MW
+        total_spot_buy_MW += spot_buy_MW
+        
+        # Record production (amount extracted from storage)
         Technology_volume[each_flex_ppu['ppu_name']]['production'].append((t, actual_discharge_MW))
-        # Record spot market buy if needed
-        Technology_volume[each_flex_ppu['ppu_name']]['spot_bought'].append((t, spot_buy))
-
-    return raw_energy_storage
+        
+        # Record spot market buy at PPU level (each PPU makes its own decision)
+        if spot_buy_MW > hyperparams['epsilon']:
+            Technology_volume[each_flex_ppu['ppu_name']]['spot_bought'].append((t, spot_buy_MW))
+    
+    # CRITICAL FIX: Add energy produced from storage-based PPUs and spot purchases to Grid
+    # This ensures demand is satisfied and energy balance is maintained
+    for incidence_item in raw_energy_incidence:
+        if incidence_item.get('storage') == 'Grid':
+            incidence_item['current_value'] += total_energy_produced_MW + total_spot_buy_MW
+            break
+        
+    return raw_energy_storage, raw_energy_incidence
 
 
 def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
-                        raw_energy_storage: List[Dict], Technology_volume: Dict,
+                        raw_energy_storage: List[Dict], raw_energy_incidence: List[Dict],
+                        Technology_volume: Dict,
                         ppu_indices: Dict, t: int,
-                        hyperparams: Dict) -> List[Dict]:
+                        hyperparams: Dict) -> Tuple[List[Dict], List[Dict]]:
     """
     Handle energy surplus using 'Store' PPUs that store in raw_energy_storage.
     Takes energy from grid and pushes it into storage systems.
+    Energy consumed from Grid is subtracted to maintain energy balance.
 
     Parameters:
         surplus_MW: Energy surplus to store
         ppu_dictionary: PPU configuration
         raw_energy_storage: Storage systems
+        raw_energy_incidence: Incidence systems (including Grid)
         Technology_volume: Technology tracking
         ppu_indices: PPU indices for cost calculation
-        spot_price: Current spot price
         t: Timestep index
         hyperparams: Simulation hyperparameters
 
     Returns:
-        Updated raw_energy_storage
+        Tuple of (Updated raw_energy_storage, Updated raw_energy_incidence)
     """
     
     # Find Store PPUs
@@ -1837,7 +2494,12 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
         spot_sell_per_tech = surplus_MW / tech_count
         for tech_type in Technology_volume:
             Technology_volume[tech_type]['spot_sold'].append((t, spot_sell_per_tech))
-        return raw_energy_storage
+        # Remove energy sold to spot market from Grid
+        for incidence_item in raw_energy_incidence:
+            if incidence_item.get('storage') == 'Grid':
+                incidence_item['current_value'] -= surplus_MW
+                break
+        return raw_energy_storage, raw_energy_incidence
 
     # Calculate charge benefits and priorities
     charge_benefits = []
@@ -1876,6 +2538,20 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
     # Special PPUs that convert electricity → commodity → biooil (unlimited flow)
     special_biooil_ppus = ['BIO_OIL_FROM_WOOD', 'BIO_OIL_FROM_PALM', 'PALM_STORE_IMPORT']
     
+    # Track total energy consumed from Grid (before efficiency losses in storage)
+    total_energy_consumed_from_grid_MW = 0.0
+    total_spot_sell_MW = 0.0
+    
+    # Get spot price for special biooil PPUs
+    spot_price = 0.0
+    try:
+        cached_annual = get_annual_data_cache('data') or {}
+        spot_15min = cached_annual.get('spot_15min') if isinstance(cached_annual, dict) else None
+        if spot_15min is not None and 0 <= t < len(spot_15min):
+            spot_price = float(spot_15min.iloc[t])
+    except Exception:
+        spot_price = 0.0
+    
     for each_store_ppu in charge_benefits:
         ppu_name = each_store_ppu['ppu_name']
         allocation = each_store_ppu['B_chg'] / max(B_chg_total, hyperparams['epsilon'])
@@ -1886,6 +2562,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
             # SPECIAL LOGIC: Sell electricity on spot, buy commodity, convert to biooil
             # 1. Allocated energy (MW) to this PPU
             allocated_energy_MW = surplus_MW * allocation
+            total_energy_consumed_from_grid_MW += allocated_energy_MW  # Track energy consumed from Grid
             
             # 2. Convert to energy (MWh for this 15-min timestep)
             energy_MWh = allocated_energy_MW * hyperparams['timestep_hours']
@@ -1932,7 +2609,7 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
                             Technology_volume[ppu_name]['production'].append((t, -actual_stored_MW))
                             
                             # If storage was full, the excess is lost (net loss recorded via production)
-                            # Note: We don't mark spot_sold because we already used that money to buy commodity
+                            # Note: Energy was already consumed from Grid above, no need to subtract again
                             break
                 
                 # Continue to next PPU
@@ -1994,9 +2671,23 @@ def handle_energy_surplus(surplus_MW: float, ppu_dictionary: pd.DataFrame,
                         storage_item['current_value'] += charge_amount
                         storage_item['history'].append((t, charge_amount))  # Positive for charge
         
+        # Calculate energy consumed from Grid (before efficiency, since we're storing)
+        # For normal storage: energy consumed = actual_charge_MW / efficiency
+        energy_consumed_from_grid_MW = actual_charge_MW / max(efficiency, hyperparams['epsilon'])
+        total_energy_consumed_from_grid_MW += energy_consumed_from_grid_MW
+        total_spot_sell_MW += spot_sell
+        
         # Record consumption (negative production for storage charging)
         Technology_volume[each_store_ppu['ppu_name']]['production'].append((t, -actual_charge_MW))
         # Record spot market sell if needed
         Technology_volume[each_store_ppu['ppu_name']]['spot_sold'].append((t, spot_sell))
-
-    return raw_energy_storage
+    
+    # CRITICAL FIX: Subtract energy consumed by storage PPUs from Grid
+    # Also subtract energy sold to spot market
+    # This maintains energy balance: Grid energy decreases when we store or sell
+    for incidence_item in raw_energy_incidence:
+        if incidence_item.get('storage') == 'Grid':
+            incidence_item['current_value'] -= (total_energy_consumed_from_grid_MW + total_spot_sell_MW)
+            break
+        
+    return raw_energy_storage, raw_energy_incidence
