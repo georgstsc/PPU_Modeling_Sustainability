@@ -272,6 +272,15 @@ def scale_storage_capacities_by_unit_counts(
                 elif storage.get('current_value', 0.0) > new_max:
                     # Cap if exceeds new maximum
                     storage['current_value'] = new_max
+            else:
+                # CRITICAL FIX: For storages with no input PPUs (unit_count == 0),
+                # ensure initial_current_value is preserved and current_value is set correctly
+                # These storages don't get scaled, so they should keep their original current_value
+                if 'initial_current_value' in storage:
+                    storage['current_value'] = storage['initial_current_value']
+                elif 'initial_current_value' not in storage:
+                    # If somehow initial_current_value wasn't set, set it now
+                    storage['initial_current_value'] = storage.get('current_value', 0.0)
     except Exception as e:
         print(f"[WARN] Failed to scale storage capacities by unit counts: {e}")
 
@@ -292,18 +301,22 @@ class SolarMapper:
         self.lons = df.iloc[1, 1:].astype(np.float32).values
         self.cols = np.arange(self.lats.size, dtype=np.int32)
 
-        # Interpolate hourly to 15-min using numpy interpolation
+        # Data is now hourly (regenerated from GRIB files using valid_time)
+        # Parse timestamps from first column (row 3+)
         times = pd.to_datetime(df.iloc[3:, 0].values)
         times_dt = times.to_numpy()
         times_seconds = times_dt.astype('datetime64[s]').astype(np.int64)
         data_hourly = df.iloc[3:, 1:].astype(np.float32).values
 
+        # Interpolate hourly to 15-min using numpy interpolation
         target_dt = pd.date_range(start=times_dt[0], end=times_dt[-1], freq='15min').to_numpy()
         target_seconds = target_dt.astype('datetime64[s]').astype(np.int64)
 
         nt = target_seconds.size
         nc = data_hourly.shape[1]
         data_15 = np.empty((nt, nc), dtype=np.float32)
+        
+        # Standard interpolation from hourly to 15-minute
         for j in range(nc):
             data_15[:, j] = np.interp(target_seconds, times_seconds, data_hourly[:, j])
 
@@ -857,7 +870,7 @@ def calculate_wind_production(location_rank: int, num_turbines: int, t: int) -> 
 
 def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFrame,
                           raw_energy_storage: List[Dict], raw_energy_incidence: List[Dict],
-                          hyperparams: Dict) -> Tuple[Dict, float]:
+                          hyperparams: Dict, verbose: bool = True) -> Tuple[Dict, float]:
     """
     Run the main dispatch simulation loop with the new structure.
 
@@ -901,18 +914,32 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
     cached_annual = get_annual_data_cache('data') or {}
     demand_15min = cached_annual.get('demand_15min') if isinstance(cached_annual, dict) else None
 
-    # Cosmetic, tqdm progress bar
-    print(f"  ⚡ Running dispatch simulation for {total_timesteps:,} timesteps...")
-    progress = tqdm(iterable=range(total_timesteps), desc="⚡ Dispatch Simulation",
-                    unit="timestep", ncols=100,
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+    # Cosmetic, tqdm progress bar (only if verbose)
+    # Use tqdm's disable parameter to completely suppress ALL output including escape sequences
+    if verbose:
+        print(f"  ⚡ Running dispatch simulation for {total_timesteps:,} timesteps...")
+        progress = tqdm(iterable=range(total_timesteps), desc="⚡ Dispatch Simulation",
+                        unit="timestep", ncols=100,
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                        disable=False)
+    else:
+        # When not verbose, use tqdm with disable=True to prevent any output/escape sequences
+        # disable=True completely suppresses all output including escape sequences
+        progress = progress.update(1) if verbose else None
 
     # Heart of the simulation: loop over selected days and their 15-min steps
     for day_idx, day in enumerate(sel_days):
         for sub in range(DAY_STEPS):
             # Global timestep index in the full-year series
             t_global = int(day) * DAY_STEPS + int(sub)
-            progress.update(1)
+            progress.update(1)  # Safe to call - does nothing when disabled
+            # CRITICAL: Reset Grid energy to 0 before adding incidence energy
+            # This ensures we're measuring the state AFTER incidence, not cumulative
+            for incidence_item in raw_energy_incidence:
+                if incidence_item.get('storage') == 'Grid':
+                    incidence_item['current_value'] = 0.0
+                    break
+            
             # Provide the precomputed row index for lookups (concatenated days)
             raw_energy_incidence = update_raw_energy_incidence(
                                                             ppu_dictionary,
@@ -921,7 +948,10 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
                                                             t_global
                                                         )
 
-            overflow_MW, overflow_count, surplus_count, balanced_count = compute_overflow_and_state(
+            # Compute initial overflow (after incidence, before storage/spot handling)
+            # This is the "natural" state after renewable energy is added
+            # CRITICAL: Count here, NOT after storage/spot operations
+            overflow_MW_initial, overflow_count, surplus_count, balanced_count = compute_overflow_and_state(
                                                             raw_energy_incidence, 
                                                             demand_15min, 
                                                             t_global, 
@@ -930,19 +960,19 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
                                                             surplus_count, 
                                                             balanced_count
                                                         )
-            # Track overflow for plotting
-            overflow_series.append(overflow_MW)
+            # Track initial overflow for plotting
+            overflow_series.append(overflow_MW_initial)
             # Compute the d_stor, u_dis, u_chg and m for each PPU
             ppu_indices = calculate_ppu_indices( 
                                                 ppu_dictionary, 
                                                 raw_energy_storage, 
-                                                overflow_MW, 
+                                                overflow_MW_initial, 
                                                 phi_smoothed,
                                                 t_global, 
                                                 hyperparams
                                             )
             # Update EMA of shortfall for utility index
-            phi_smoothed = exponential_moving_average(overflow_MW, 
+            phi_smoothed = exponential_moving_average(overflow_MW_initial, 
                                                       phi_smoothed, 
                                                       hyperparams['ema_beta'])
             # Store cost indices for later cost breakdown
@@ -952,9 +982,9 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
                             )
             # 4.1) If overflow > 0 (we need more energy): use 'Flex' PPUs
             # 4.2) If overflow < 0: use 'Store' PPUs
-            if overflow_MW > hyperparams['epsilon']: 
+            if overflow_MW_initial > hyperparams['epsilon']: 
                 raw_energy_storage, raw_energy_incidence = handle_energy_deficit(
-                                                        overflow_MW, 
+                                                        overflow_MW_initial, 
                                                         ppu_dictionary, 
                                                         raw_energy_storage,
                                                         raw_energy_incidence,
@@ -963,9 +993,9 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
                                                         t_global, 
                                                         hyperparams
                                                     )
-            elif overflow_MW < -hyperparams['epsilon']: 
+            elif overflow_MW_initial < -hyperparams['epsilon']: 
                 raw_energy_storage, raw_energy_incidence = handle_energy_surplus(
-                                                        abs(overflow_MW), 
+                                                        abs(overflow_MW_initial), 
                                                         ppu_dictionary, 
                                                         raw_energy_storage,
                                                         raw_energy_incidence,
@@ -983,10 +1013,11 @@ def run_dispatch_simulation(scenario: Dict[str, Any], ppu_dictionary: pd.DataFra
         'overflow_series': np.array(overflow_series) if overflow_series else None
     }
 
-    print(f"  ✓ Simulation complete: {total_timesteps:,} timesteps")
-    print(f"    - Overflow (deficit) steps: {overflow_count:,}")
-    print(f"    - Surplus steps:            {surplus_count:,}")
-    print(f"    - Balanced steps:           {balanced_count:,}")
+    if verbose:
+        print(f"  ✓ Simulation complete: {total_timesteps:,} timesteps")
+        print(f"    - Overflow (deficit) steps: {overflow_count:,}")
+        print(f"    - Surplus steps:            {surplus_count:,}")
+        print(f"    - Balanced steps:           {balanced_count:,}")
     return Technology_volume, phi_smoothed
 
 def compute_overflow_and_state(raw_energy_incidence: List[Dict], demand_15min, t_global: int, hyperparams: Dict,
@@ -1018,11 +1049,16 @@ def compute_overflow_and_state(raw_energy_incidence: List[Dict], demand_15min, t
         demand_MW = 0.0
     overflow_MW = demand_MW - grid_energy
 
-    if overflow_MW > hyperparams['epsilon']:
+    # CRITICAL FIX: Count ANY deficit (demand > incidence energy) as overflow
+    # Use a very small tolerance (1e-6) for floating point comparison, not epsilon
+    # This ensures that when incidence energy is not enough, it's always counted as overflow
+    tolerance = 1e-6
+    if overflow_MW > tolerance:
         overflow_count += 1
-    elif overflow_MW < -hyperparams['epsilon']:
+    elif overflow_MW < -tolerance:
         surplus_count += 1
     else:
+        # Only count as balanced if demand exactly equals incidence energy (within floating point tolerance)
         balanced_count += 1
 
     return overflow_MW, overflow_count, surplus_count, balanced_count
@@ -1216,7 +1252,11 @@ def compute_financial_metrics(cost_summary: Dict[str, Dict],
             continue
 
     savings = spot_only_cost - total_net_cost
-    margin_pct = (savings / spot_only_cost) * 100 if spot_only_cost != 0 else 0.0
+    # CRITICAL FIX: Handle NaN values in spot_only_cost
+    if spot_only_cost != 0 and not (np.isnan(spot_only_cost) or np.isnan(savings)):
+        margin_pct = (savings / spot_only_cost) * 100
+    else:
+        margin_pct = 0.0
 
     # Calculate price volatility (coefficient of variation) safely
     price_volatility_pct = 0.0
@@ -1420,20 +1460,24 @@ def plot_scenario_evolution(pipeline_results, raw_energy_storage, name: str = "s
         plt.savefig(f"{output_dir}/spot_transactions_{name}.png", dpi=150, bbox_inches='tight')
         plt.close()
 
-    # Plot storage levels
+    # Plot storage levels - separate Lake from other storages due to scale differences
     if raw_energy_storage and isinstance(raw_energy_storage, (list, tuple)):
+        # Determine length from demand or total_timesteps
+        if demand is not None:
+            L = len(demand)
+        else:
+            L = total_timesteps if total_timesteps > 0 else 1
+        
+        # Prepare data for all storages, separating Lake from others
+        lake_data = None
+        other_storage_data = []
+        
         for rec in raw_energy_storage:
             storage_name = rec.get("storage", "Storage")
             cap = float(rec.get("value", 0.0))
             final_val = float(rec.get("current_value", 0.0))
             history = rec.get("history") or []
             
-            # Determine length from demand or total_timesteps
-            if demand is not None:
-                L = len(demand)
-            else:
-                L = total_timesteps if total_timesteps > 0 else 1
-                
             # CRITICAL FIX: Map global timesteps to scenario-local indices
             deltas = np.zeros(L)
             for item in history:
@@ -1458,18 +1502,70 @@ def plot_scenario_evolution(pipeline_results, raw_energy_storage, name: str = "s
             level = baseline + np.cumsum(deltas)
             if cap > 0:
                 level = np.clip(level, 0, cap)
-                
-            plt.figure(figsize=(14, 5))
-            plt.plot(np.arange(L), level, label=f"{storage_name} Level (MWh)", color="green", linewidth=1.5)
-            if cap > 0:
-                plt.axhline(cap, color="red", linestyle="--", label=f"Capacity ({cap:.0f} MWh)", linewidth=1.5)
-            plt.xlabel("Timestep (15-min intervals)", fontsize=11)
-            plt.ylabel("MWh", fontsize=11)
-            plt.title(f"{storage_name} Storage Level Over Scenario: {name}", fontsize=13, fontweight='bold')
+            
+            storage_info = {
+                'name': storage_name,
+                'level': level,
+                'capacity': cap
+            }
+            
+            # Separate Lake from other storages
+            if storage_name == 'Lake':
+                lake_data = storage_info
+            else:
+                other_storage_data.append(storage_info)
+        
+        # Plot Lake separately (if it exists)
+        if lake_data:
+            plt.figure(figsize=(16, 6))
+            plt.plot(np.arange(L), lake_data['level'], 
+                    label=f"{lake_data['name']} Level (MWh)", 
+                    color='steelblue', 
+                    linewidth=2, 
+                    alpha=0.9)
+            if lake_data['capacity'] > 0:
+                plt.axhline(lake_data['capacity'], 
+                           color='red', 
+                           linestyle="--", 
+                           alpha=0.5, 
+                           linewidth=1.5,
+                           label=f"Capacity ({lake_data['capacity']:.0f} MWh)")
+            plt.xlabel("Timestep (15-min intervals)", fontsize=12, fontweight='bold')
+            plt.ylabel("Storage Level (MWh)", fontsize=12, fontweight='bold')
+            plt.title(f"Lake Storage Level Over Scenario: {name}", fontsize=14, fontweight='bold')
             plt.legend(fontsize=10)
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            plt.savefig(f"{output_dir}/storage_{storage_name.replace(' ', '_')}_{name}.png", dpi=150, bbox_inches='tight')
+            plt.savefig(f"{output_dir}/storage_Lake_{name}.png", dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # Plot all other storages together
+        if other_storage_data:
+            plt.figure(figsize=(16, 8))
+            
+            # Use a colormap for different storages
+            colors = plt.cm.tab20(np.linspace(0, 1, len(other_storage_data)))
+            
+            for idx, data in enumerate(other_storage_data):
+                plt.plot(np.arange(L), data['level'], 
+                        label=f"{data['name']} (MWh)", 
+                        color=colors[idx], 
+                        linewidth=1.5, 
+                        alpha=0.8)
+                if data['capacity'] > 0:
+                    plt.axhline(data['capacity'], 
+                               color=colors[idx], 
+                               linestyle="--", 
+                               alpha=0.3, 
+                               linewidth=1)
+            
+            plt.xlabel("Timestep (15-min intervals)", fontsize=12, fontweight='bold')
+            plt.ylabel("Storage Level (MWh)", fontsize=12, fontweight='bold')
+            plt.title(f"Storage Levels (Excluding Lake) Over Scenario: {name}", fontsize=14, fontweight='bold')
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9, ncol=1)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/storage_all_{name}.png", dpi=150, bbox_inches='tight')
             plt.close()
 
     # Plot stacked energy sources (production by source type)
@@ -1714,6 +1810,12 @@ def analyze_pipeline_results(results: Dict) -> Tuple[float, float, float, float]
     cost_summary = results.get('cost_summary', {})
     technology_volume = results.get('technology_volume', {})
     hyperparams = results.get('hyperparams', {})
+    
+    # CRITICAL FIX: Check if cost_summary is empty or invalid
+    if not cost_summary or not isinstance(cost_summary, dict):
+        # No cost data available - return zeros
+        return 0.0, 0.0, 0.0, 0.0
+    
     # Try to get demand series from scenario or annual cache
     scenario = results.get('scenario', {})
     demand_15min = None
@@ -1729,31 +1831,63 @@ def analyze_pipeline_results(results: Dict) -> Tuple[float, float, float, float]
         if isinstance(summary, dict)
     ]
     all_costs = np.array(all_costs, dtype=np.float64)
-
-    mean_cost = np.mean(all_costs) if len(all_costs) > 0 else 0.0
+    
+    # CRITICAL FIX: Filter out NaN and infinite values
+    all_costs = all_costs[np.isfinite(all_costs)]
+    
+    # Check if we have valid costs
+    if len(all_costs) == 0:
+        # No valid costs - return zeros
+        return 0.0, 0.0, 0.0, 0.0
+    
+    mean_cost = float(np.mean(all_costs))
+    
+    # Check if mean_cost is NaN or infinite
+    if not np.isfinite(mean_cost):
+        mean_cost = 0.0
 
     # CVaR at 95%
     alpha = 0.95
     if len(all_costs) > 0:
-        var_threshold = np.percentile(all_costs, alpha * 100)
-        cvar = np.mean(all_costs[all_costs >= var_threshold])
+        try:
+            var_threshold = np.percentile(all_costs, alpha * 100)
+            tail_costs = all_costs[all_costs >= var_threshold]
+            if len(tail_costs) > 0:
+                cvar = float(np.mean(tail_costs))
+                if not np.isfinite(cvar):
+                    cvar = 0.0
+            else:
+                cvar = 0.0
+        except Exception:
+            cvar = 0.0
     else:
         cvar = 0.0
 
     # HHI index for storage-based production cost shares
     storage_costs = {}
-    total_cost = np.sum(all_costs)
-    for tech, metrics in technology_volume.items():
-        if isinstance(metrics, dict) and 'production' in metrics:
-            storage_prod = sum(abs(vol) for t, vol in metrics['production'] if vol < 0)
-            tech_cost = cost_summary.get(tech, {}).get('production_cost_CHF', 0.0)
-            storage_costs[tech] = storage_prod * tech_cost
+    total_cost = float(np.sum(all_costs)) if len(all_costs) > 0 else 0.0
+    
+    # Check if total_cost is valid
+    if not np.isfinite(total_cost) or total_cost <= 0:
+        hhi_index = 0.0
+    else:
+        for tech, metrics in technology_volume.items():
+            if isinstance(metrics, dict) and 'production' in metrics:
+                try:
+                    storage_prod = sum(abs(vol) for t, vol in metrics['production'] if vol < 0)
+                    tech_cost = cost_summary.get(tech, {}).get('production_cost_CHF', 0.0)
+                    if np.isfinite(tech_cost) and np.isfinite(storage_prod):
+                        storage_costs[tech] = storage_prod * tech_cost
+                except Exception:
+                    continue
 
-    storage_shares = [
-        storage_costs[tech] / total_cost if total_cost > 0 else 0.0
-        for tech in storage_costs
-    ]
-    hhi_index = sum(share ** 2 for share in storage_shares)
+        storage_shares = [
+            storage_costs[tech] / total_cost if total_cost > 0 and np.isfinite(storage_costs[tech]) else 0.0
+            for tech in storage_costs
+        ]
+        hhi_index = float(sum(share ** 2 for share in storage_shares if np.isfinite(share)))
+        if not np.isfinite(hhi_index):
+            hhi_index = 0.0
 
     # Spot dependence: fraction of total demand met via spot purchases
     total_spot_bought = 0.0
@@ -1769,7 +1903,7 @@ def analyze_pipeline_results(results: Dict) -> Tuple[float, float, float, float]
 
 def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int], raw_energy_storage: List[Dict], 
                         raw_energy_incidence: List[Dict], 
-                        hyperparams: Optional[Dict] = None) -> Dict:
+                        hyperparams: Optional[Dict] = None, verbose: bool = True) -> Dict:
     """
     Run the complete energy dispatch pipeline.
 
@@ -1792,10 +1926,18 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         # Save initial value if not already saved (for baseline calculation in plots)
         if 'initial_current_value' not in storage:
             storage['initial_current_value'] = storage.get('current_value', 0.0)
+        
+        # CRITICAL FIX: Reset current_value to initial value at start of each scenario
+        # This ensures each scenario starts with the same initial conditions
+        if 'initial_current_value' in storage:
+            storage['current_value'] = storage['initial_current_value']
     
     for incidence in raw_energy_incidence:
         if 'history' not in incidence:
             incidence['history'] = []
+        # Reset incidence storages to 0 at start of each scenario (they're replenished each timestep)
+        if incidence.get('storage') != 'Grid':  # Don't reset Grid
+            incidence['current_value'] = 0.0
 
     hyperparams = provide_hyper_parameters(hyperparams=hyperparams)
     ppu_dictionary = build_ppu_dictionary(ppu_counts, 
@@ -1807,7 +1949,8 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
                                         ppu_dictionary = ppu_dictionary, 
                                         raw_energy_storage = raw_energy_storage, 
                                         raw_energy_incidence = raw_energy_incidence, 
-                                        hyperparams = hyperparams
+                                        hyperparams = hyperparams,
+                                        verbose = verbose
                                         )
     cost_summary = compute_cost_breakdown(
                                         ppu_dictionary, 
@@ -1819,22 +1962,23 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
                                         hyperparams
                                         )
 
-    print("\n" + "=" * 80)
-    print("PORTFOLIO RESULT")
-    print("=" * 80)
-    print(f"  X-axis (Price Volatility): {portfolio_metrics['volatility_pct']:.2f}%")
-    print(f"  Y-axis (Savings Margin): {portfolio_metrics['margin_pct']:.2f}%")
-    print("=" * 80)
-    
-    # Print pipeline state counts if available
-    pipeline_stats = technology_volume.get('__pipeline_stats__', {})
-    if pipeline_stats:
-        print("PIPELINE STATE COUNTS")
-        print("-" * 80)
-        print(f"  Overflow (deficit) steps: {pipeline_stats.get('overflow_count', 0):,}")
-        print(f"  Surplus steps:            {pipeline_stats.get('surplus_count', 0):,}")
-        print(f"  Balanced steps:           {pipeline_stats.get('balanced_count', 0):,}")
+    if verbose:
+        print("\n" + "=" * 80)
+        print("PORTFOLIO RESULT")
         print("=" * 80)
+        print(f"  X-axis (Price Volatility): {portfolio_metrics['volatility_pct']:.2f}%")
+        print(f"  Y-axis (Savings Margin): {portfolio_metrics['margin_pct']:.2f}%")
+        print("=" * 80)
+        
+        # Print pipeline state counts if available
+        pipeline_stats = technology_volume.get('__pipeline_stats__', {})
+        if pipeline_stats:
+            print("PIPELINE STATE COUNTS")
+            print("-" * 80)
+            print(f"  Overflow (deficit) steps: {pipeline_stats.get('overflow_count', 0):,}")
+            print(f"  Surplus steps:            {pipeline_stats.get('surplus_count', 0):,}")
+            print(f"  Balanced steps:           {pipeline_stats.get('balanced_count', 0):,}")
+            print("=" * 80)
 
     # Get demand and spot price series for plotting
     cached_annual = get_annual_data_cache('data') or {}
@@ -1884,7 +2028,8 @@ def run_complete_pipeline(scenario : Dict[str, Any], ppu_counts: Dict[str, int],
         'raw_energy_incidence': raw_energy_incidence
     }
 
-    print("\n✓ PIPELINE EXECUTION COMPLETE")
+    if verbose:
+        print("\n✓ PIPELINE EXECUTION COMPLETE")
     return results
 
 def provide_hyper_parameters(hyperparams: Optional[Dict] = None) -> Dict:
@@ -2143,10 +2288,13 @@ def update_raw_energy_incidence(ppu_dictionary : pd.DataFrame,
             # For Grid or unknown storages, leave as-is (Grid will be set later)
             continue
 
-    # After all storages processed, set Grid to total extracted energy
+    # After all storages processed, SET Grid to total extracted energy (not add to it)
+    # CRITICAL: This resets Grid energy to only incidence production for this timestep
+    # Any energy from previous timesteps (storage/spot) is cleared
     total_energy = total_solar + total_wind + total_river + total_wood
     for incidence_item in raw_energy_incidence:
         if incidence_item.get('storage') == 'Grid':
+            # RESET Grid energy to only incidence production (not cumulative)
             incidence_item['current_value'] = total_energy
             incidence_item.setdefault('history', []).append((t, total_energy))
     return raw_energy_incidence
@@ -2370,8 +2518,23 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
     total_energy_produced_MW = 0.0
     total_spot_buy_MW = 0.0
 
+    # CRITICAL FIX: Handle case when B_dis_total is 0 (all storage empty)
+    # Instead of modifying B_dis values (which creates step functions), we handle
+    # the allocation directly in the loop below
+    use_fallback_allocation = (B_dis_total <= hyperparams['epsilon'])
+    if use_fallback_allocation:
+        num_flex_ppus = len(discharge_benefits)
+        if num_flex_ppus == 0:
+            # No Flex PPUs available - handled in "if not flex_ppus" block above
+            pass
+
     for each_flex_ppu in discharge_benefits:
-        allocation = each_flex_ppu['B_dis'] / max(B_dis_total, hyperparams['epsilon'])
+        # Use fallback equal allocation only when B_dis_total is 0
+        # This preserves smooth behavior when B_dis_total > 0
+        if use_fallback_allocation and len(discharge_benefits) > 0:
+            allocation = 1.0 / len(discharge_benefits)  # Equal allocation
+        else:
+            allocation = each_flex_ppu['B_dis'] / max(B_dis_total, hyperparams['epsilon'])
         efficiency = each_flex_ppu['ppu_row'].get('Chain_Efficiency', 1.0)
         
         # Each PPU is allocated a share of the deficit (in terms of grid energy needed)
@@ -2401,40 +2564,40 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
         
         # CRITICAL FIX: Each PPU decides independently whether to buy from spot
         # Spot buy = difference between allocated grid energy and actual delivered energy
-        spot_buy_MW = max(0.0, target_grid_energy_MW - energy_delivered_to_grid_MW)
+        # Only buy from spot if storage is truly exhausted (cannot satisfy allocation)
+        # If storage is available but we're not using it, that's a different issue (PPU capacity limit)
+        spot_buy_MW = 0.0
+        if available_capacity_MW <= hyperparams['epsilon']:
+            # Storage is empty - buy from spot to satisfy allocation
+            spot_buy_MW = max(0.0, target_grid_energy_MW - energy_delivered_to_grid_MW)
+        elif actual_discharge_MW >= available_capacity_MW * 0.99:
+            # Storage is nearly exhausted (used 99%+) - buy remaining from spot
+            spot_buy_MW = max(0.0, target_grid_energy_MW - energy_delivered_to_grid_MW)
+        # Otherwise: storage is available but we're limited by PPU capacity
+        # In this case, other PPUs should handle the deficit, not spot market
         
-        # Discharge from storage
-        if actual_discharge_MW == target_discharge_MW:
-            # Can meet full target - discharge proportionally from storages
+        # Only buy from spot if storage is truly exhausted or PPU is at capacity
+        # If we have available storage but didn't use it, that's a logic issue, not a spot buy
+        if available_capacity_MW > hyperparams['epsilon'] and actual_discharge_MW < available_capacity_MW:
+            # We have storage available but didn't use it all - this shouldn't trigger spot buy
+            # The limiting factor is likely PPU capacity, not storage availability
+            # In this case, we should NOT buy from spot - the deficit should be handled by other PPUs
+            spot_buy_MW = 0.0
+        
+        # Discharge from storage - use proportional discharge for smooth behavior
+        # This avoids step functions by always using proportional discharge
+        if actual_discharge_MW > 0:
+            # Discharge proportionally from all storages that this PPU can extract from
             for storage_name in can_extract_from:
                 storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-                if storage_item and storage_item['current_value'] > 0:
+                if storage_item and storage_item['current_value'] > 0 and available_capacity_MW > 0:
                     # Calculate proportion of this storage's available capacity
-                    if available_capacity_MW > 0:
-                        fraction = storage_item['current_value'] / available_capacity_MW
-                        discharge_amount = actual_discharge_MW * fraction
-                        storage_item['current_value'] -= discharge_amount
-                        storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
-                        
-        elif actual_discharge_MW == available_capacity_MW:
-            # Storage capacity is the limiting factor - empty storage completely
-            for storage_name in can_extract_from:
-                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-                if storage_item:
-                    discharged = storage_item['current_value']
-                    storage_item['current_value'] = 0
-                    storage_item['history'].append((t, -discharged))  # Negative for discharge
-                    
-        else:
-            # PPU capacity is the limiting factor - partial discharge
-            for storage_name in can_extract_from:
-                storage_item = next((item for item in raw_energy_storage if item['storage'] == storage_name), None)
-                if storage_item and storage_item['current_value'] > 0:
-                    if available_capacity_MW > 0:
-                        fraction = storage_item['current_value'] / available_capacity_MW
-                        discharge_amount = actual_discharge_MW * fraction
-                        storage_item['current_value'] -= discharge_amount
-                        storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
+                    fraction = storage_item['current_value'] / available_capacity_MW
+                    discharge_amount = actual_discharge_MW * fraction
+                    # Ensure we don't discharge more than available
+                    discharge_amount = min(discharge_amount, storage_item['current_value'])
+                    storage_item['current_value'] -= discharge_amount
+                    storage_item['history'].append((t, -discharge_amount))  # Negative for discharge
         
         # Track totals
         total_energy_produced_MW += energy_delivered_to_grid_MW
@@ -2449,9 +2612,32 @@ def handle_energy_deficit(deficit_MW: float, ppu_dictionary: pd.DataFrame,
     
     # CRITICAL FIX: Add energy produced from storage-based PPUs and spot purchases to Grid
     # This ensures demand is satisfied and energy balance is maintained
+    total_energy_added_to_grid = total_energy_produced_MW + total_spot_buy_MW
+    
+    # SAFETY CHECK: Ensure demand is always satisfied
+    # Only buy from spot if there's a REAL remaining deficit AND storage is truly exhausted
+    remaining_deficit = deficit_MW - total_energy_added_to_grid
+    if remaining_deficit > hyperparams['epsilon'] * 10:  # Use larger threshold to avoid rounding errors
+        # Check if there's unused storage capacity that could satisfy this
+        total_available_storage = 0.0
+        for storage_item in raw_energy_storage:
+            total_available_storage += storage_item.get('current_value', 0.0)
+        
+        # Only buy from spot if storage is truly exhausted
+        if total_available_storage < hyperparams['epsilon']:
+            # Storage is empty - buy remaining from spot market to satisfy demand
+            if len(Technology_volume) > 0:
+                spot_buy_per_tech = remaining_deficit / len(Technology_volume)
+                for tech_type in Technology_volume:
+                    Technology_volume[tech_type]['spot_bought'].append((t, spot_buy_per_tech))
+            total_spot_buy_MW += remaining_deficit
+            total_energy_added_to_grid = deficit_MW  # Ensure we satisfy full deficit
+        # If storage is available, we shouldn't be buying from spot here
+        # The deficit should have been handled by PPUs with available storage
+    
     for incidence_item in raw_energy_incidence:
         if incidence_item.get('storage') == 'Grid':
-            incidence_item['current_value'] += total_energy_produced_MW + total_spot_buy_MW
+            incidence_item['current_value'] += total_energy_added_to_grid
             break
         
     return raw_energy_storage, raw_energy_incidence

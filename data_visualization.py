@@ -441,6 +441,136 @@ def analyze_wind_incidence(csv_path="data/wind_incidence_hourly_2024.csv", start
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+    
+    # Random Day Wind Incidence Visualization
+    # Plot average wind speed across all locations for a randomly selected day in 2024
+    # X-axis: Hours of the day (0-23)
+    # Y-axis: Average wind speed (m/s) across all coordinates
+    import random
+    
+    # Filter for 2024 only
+    df_2024 = df[df["datetime"].dt.year == 2024].copy()
+    df_2024 = df_2024.dropna(subset=['datetime'])
+    
+    if len(df_2024) == 0:
+        print("ERROR: No valid 2024 data found. Please regenerate wind_incidence_hourly_2024.csv using regenerate_wind_hourly.py")
+    else:
+        # Check if data is hourly or daily
+        # If hourly, there should be 24 rows per day
+        sample_date = df_2024['datetime'].iloc[0].date()
+        rows_for_sample = df_2024[df_2024['datetime'].dt.date == sample_date]
+        is_hourly = len(rows_for_sample) >= 20  # At least 20 rows suggests hourly data
+        
+        if not is_hourly:
+            print("WARNING: Data appears to be daily, not hourly.")
+            print("Please regenerate wind_incidence_hourly_2024.csv using regenerate_wind_hourly.py")
+            print("to get proper hourly data.")
+            print()
+            print("For now, plotting daily average (single value per day):")
+            
+            # Get unique dates in 2024
+            unique_dates = list(df_2024['datetime'].dt.date.unique())
+            selected_date = random.choice(unique_dates)
+            
+            # Get data for selected date
+            day_data = df_2024[df_2024['datetime'].dt.date == selected_date]
+            
+            if len(day_data) > 0:
+                # Calculate average across all locations (skip datetime column)
+                data_cols = [col for col in day_data.columns if col != 'datetime']
+                avg_wind = day_data[data_cols].mean(axis=1).values[0]  # Single value for daily
+                
+                # Create plot
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.bar([12], [avg_wind], width=12, alpha=0.7, color='lightblue', 
+                       label=f'Daily Average: {avg_wind:.4f} m/s')
+                ax.set_xlabel('Hour of Day', fontsize=12)
+                ax.set_ylabel('Average Wind Speed (m/s)', fontsize=12)
+                ax.set_title(f'Average Wind Speed - {selected_date}\n(Daily Data - Single Value)', 
+                            fontsize=14, fontweight='bold')
+                ax.set_xlim(0, 24)
+                ax.set_xticks(range(0, 25, 2))
+                ax.grid(True, alpha=0.3, axis='y')
+                ax.legend()
+                plt.tight_layout()
+                plt.show()
+        else:
+            # Data is hourly - proceed with hourly plot
+            # Get unique dates in 2024
+            unique_dates = sorted([d for d in df_2024['datetime'].dt.date.unique() if d.year == 2024])
+            
+            # Randomly select a day
+            selected_date = random.choice(unique_dates)
+            print(f"Selected random day: {selected_date}")
+            
+            # Filter data for selected day
+            day_data = df_2024[df_2024['datetime'].dt.date == selected_date].copy()
+            day_data = day_data.sort_values('datetime')
+            
+            # Extract hours
+            day_data['hour'] = day_data['datetime'].dt.hour
+            
+            # Calculate average across all locations for each hour
+            data_cols = [col for col in day_data.columns if col not in ['datetime', 'hour']]
+            hourly_avg = []
+            hours = []
+            
+            for hour in range(24):
+                hour_data = day_data[day_data['hour'] == hour]
+                if len(hour_data) > 0:
+                    # Calculate mean across all locations, ignoring NaN values
+                    avg = hour_data[data_cols].mean(axis=1).mean()
+                    hourly_avg.append(avg if not np.isnan(avg) else 0.0)
+                    hours.append(hour)
+                else:
+                    # No data for this hour
+                    hourly_avg.append(0.0)
+                    hours.append(hour)
+            
+            # Create plot
+            fig, ax = plt.subplots(figsize=(14, 7))
+            
+            # Plot line
+            ax.plot(hours, hourly_avg, 'o-', linewidth=2, markersize=8, 
+                   color='lightblue', label='Average Wind Speed', alpha=0.8)
+            
+            # Fill area under curve
+            ax.fill_between(hours, hourly_avg, alpha=0.3, color='lightblue')
+            
+            # Formatting
+            ax.set_xlabel('Hour of Day', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Average Wind Speed (m/s)', fontsize=12, fontweight='bold')
+            ax.set_title(f'Average Wind Speed Across All Locations\n{selected_date} (Randomly Selected Day in 2024)', 
+                        fontsize=14, fontweight='bold')
+            ax.set_xlim(-0.5, 23.5)
+            ax.set_xticks(range(0, 24, 2))
+            ax.set_xticklabels([f'{h:02d}:00' for h in range(0, 24, 2)])
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.legend(loc='upper left', fontsize=10)
+            
+            # Add statistics text box
+            max_wind = max(hourly_avg)
+            max_hour = hours[hourly_avg.index(max_wind)]
+            min_wind = min(hourly_avg)
+            min_hour = hours[hourly_avg.index(min_wind)]
+            avg_wind = np.mean(hourly_avg)
+            
+            stats_text = f'Max: {max_wind:.4f} m/s at {max_hour:02d}:00\n'
+            stats_text += f'Min: {min_wind:.4f} m/s at {min_hour:02d}:00\n'
+            stats_text += f'Daily Average: {avg_wind:.4f} m/s'
+            
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                   fontsize=9, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+            
+            plt.tight_layout()
+            plt.show()
+            
+            print(f"\nStatistics for {selected_date}:")
+            print(f"  Maximum wind speed: {max_wind:.4f} m/s at {max_hour:02d}:00")
+            print(f"  Minimum wind speed: {min_wind:.4f} m/s at {min_hour:02d}:00")
+            print(f"  Daily average: {avg_wind:.4f} m/s")
+            print(f"  Number of locations: {len(data_cols)}")
 
 
 def analyze_solar_incidence(csv_path="data/solar_incidence_hourly_2024.csv", start_date=None, end_date=None, background_img_path=None):

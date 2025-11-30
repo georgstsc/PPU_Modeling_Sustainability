@@ -17,11 +17,13 @@ PALM_ICE,"['Palm oil', 'Pyrolysis', 'Biooil', 'Cracking', 'Refining', 'ICE']",Pr
 BIO_WOOD,"['Wood', 'Pyrolysis', 'Biooil', 'Steam reforming', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
 IMP_BIOG,"['Biogas (50% CH4)', 'Pipeline', 'Biogas purification', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
 NH3_P,"['Ammonia cracking', 'H2 Storage UG 200bar', 'Hydrogen Transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
+THERM_G,"['Biogas', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
+THERM_M,"['Biomass', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
 THERM_CH4,"['CH4 storage 200bar', 'Methane compression', 'Methane transport', 'Combined cycle power plant', 'Electricity', 'Grid']",Production,Flex
 
 
 H2_G,"['Electrolyzer', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage,Store
-H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",,Store
+H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage,Store
 H2_L,"['Electrolyzer', 'Liquifaction', 'Liquid storage']",Storage,Store
 SYN_FT,"['Electrolyzer', 'CO2 Capture 400 ppm', 'H2, CO2 compression', 'FT-Synthesis', 'Refining', 'Fuel Tank']",Storage,Store
 SYN_METH,"['Electrolyzer', 'CO2 Capture 400 ppm', 'Sabatier reaction', 'Methane compression', 'CH4 storage 200bar']",Storage,Store
@@ -32,5 +34,4 @@ PHS,"['Electricity', 'Hydro pump', 'Lake']",Storage,Store
 SOL_SALT_STORE,"['Electricity', 'Solar concentrator salt']",Storage,Store
 BIO_OIL_FROM_WOOD,"['Wood', 'Pyrolysis', 'Biooil']",Storage,Store
 BIO_OIL_FROM_PALM,"['Palm oil', 'Pyrolysis', 'Biooil']",Storage,Store
-PALM_STORE_IMPORT,"['Palm oil', 'Fuel Taransport']",Storage,Store
-
+PALM_STORE_IMPORT,"['Palm oil', 'Fuel Transport']",Storage,Store
