@@ -30,7 +30,7 @@ class PPUCostData:
     """Cost and efficiency data for a PPU component chain."""
     
     efficiency: float  # Overall chain efficiency [0, 1]
-    cost_per_mwh: float  # CHF per MWh output
+    cost_per_mwh: float  # NOTE: Actually stored in CHF/kWh (misleading field name for historical reasons)
     cost_per_hour: float  # CHF per MW-hour of capacity
     components: List[str]  # Component chain
     
@@ -50,11 +50,14 @@ class PPUDefinition:
     
     # Computed cost data
     efficiency: float = 1.0
-    cost_per_mwh: float = 0.0
+    cost_per_mwh: float = 0.0  # NOTE: Actually stored in CHF/kWh (misleading field name)
     
     # Storage relationships
     can_extract_from: List[str] = field(default_factory=list)
     can_input_to: List[str] = field(default_factory=list)
+    
+    # Location rank for renewables (assigned during optimization)
+    location_rank: int = 0
 
 
 # =============================================================================
@@ -202,7 +205,7 @@ def calculate_chain_cost(
     
     return PPUCostData(
         efficiency=cumulative_efficiency,
-        cost_per_mwh=total_cost,  # CHF per MWh
+        cost_per_mwh=total_cost,  # NOTE: Actually stored in CHF/kWh (misleading field name)
         cost_per_hour=total_cost * 0.25,  # CHF per 15-min timestep per MW
         components=components,
         component_efficiencies=component_efficiencies,
@@ -421,6 +424,314 @@ def check_energy_sovereignty(
 
 
 # =============================================================================
+# CUMULATIVE ENERGY BALANCE CHECK (Using Real Incidence Data)
+# =============================================================================
+
+def calculate_cumulative_renewable_production(
+    portfolio: Portfolio,
+    ppu_definitions: Dict[str, PPUDefinition],
+    solar_data: np.ndarray,
+    wind_data: np.ndarray,
+    solar_ranking: np.ndarray,
+    wind_ranking: np.ndarray,
+    config: Config = DEFAULT_CONFIG,
+    precomputed_sums: Optional[Dict[str, np.ndarray]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Calculate ACTUAL cumulative renewable production using real incidence data.
+    
+    OPTIMIZED VERSION: Uses pre-computed location sums to avoid repeated calculations.
+    
+    Args:
+        portfolio: Portfolio with PPU counts
+        ppu_definitions: PPU definitions
+        solar_data: Solar irradiance array (n_hours, n_locations) [kWh/m²/h]
+        wind_data: Wind speed array (n_hours, n_locations) [m/s]
+        solar_ranking: Location indices sorted by quality (best first)
+        wind_ranking: Location indices sorted by quality (best first)
+        config: Configuration
+        precomputed_sums: Optional dict with pre-computed location sums for speed
+        
+    Returns:
+        Tuple of (total_production_mwh, breakdown_by_type)
+    """
+    mw_per_unit = config.ppu.MW_PER_UNIT
+    n_hours = len(solar_data)
+    
+    # Production breakdown
+    production_by_type = {
+        'solar': 0.0,
+        'wind_onshore': 0.0,
+        'wind_offshore': 0.0,
+        'hydro_ror': 0.0,
+    }
+    
+    # --- Solar PV (OPTIMIZED: use pre-computed sums or vectorized) ---
+    pv_count = portfolio.get_count('PV')
+    if pv_count > 0:
+        pv_def = ppu_definitions.get('PV')
+        pv_efficiency = pv_def.efficiency if pv_def else 0.84
+        area_m2 = mw_per_unit * 1000  # m² per unit
+        
+        if precomputed_sums and 'solar_location_sums' in precomputed_sums:
+            # Use pre-computed sums (FAST)
+            solar_sums = precomputed_sums['solar_location_sums']
+            n_locs = min(pv_count, len(solar_ranking), len(solar_sums))
+            # Sum the best n_locs locations
+            ranked_sums = solar_sums[solar_ranking[:n_locs]]
+            production_by_type['solar'] = np.sum(ranked_sums) * area_m2 * pv_efficiency / 1000
+        else:
+            # Vectorized fallback (still fast)
+            n_locs = min(pv_count, len(solar_ranking), solar_data.shape[1])
+            loc_indices = solar_ranking[:n_locs]
+            # Sum over hours for selected locations, then sum across locations
+            location_sums = np.sum(solar_data[:, loc_indices], axis=0)
+            production_by_type['solar'] = np.sum(location_sums) * area_m2 * pv_efficiency / 1000
+    
+    # --- Wind Onshore (OPTIMIZED) ---
+    wind_on_count = portfolio.get_count('WD_ON')
+    if wind_on_count > 0:
+        wind_def = ppu_definitions.get('WD_ON')
+        wind_efficiency = wind_def.efficiency if wind_def else 0.84
+        num_turbines = int(mw_per_unit / 3)
+        
+        if precomputed_sums and 'wind_location_production' in precomputed_sums:
+            # Use pre-computed wind production (FAST)
+            wind_prod = precomputed_sums['wind_location_production']
+            n_locs = min(wind_on_count, len(wind_ranking), len(wind_prod))
+            ranked_prod = wind_prod[wind_ranking[:n_locs]]
+            production_by_type['wind_onshore'] = np.sum(ranked_prod) * wind_efficiency
+        else:
+            # Vectorized: process all locations at once
+            n_locs = min(wind_on_count, len(wind_ranking), wind_data.shape[1])
+            loc_indices = wind_ranking[:n_locs]
+            wind_speeds = wind_data[:, loc_indices]  # (n_hours, n_locs)
+            
+            # Vectorized wind power calculation
+            hourly_power = _wind_power_vectorized(wind_speeds, num_turbines)
+            production_by_type['wind_onshore'] = np.sum(hourly_power) * wind_efficiency
+    
+    # --- Wind Offshore (OPTIMIZED) ---
+    wind_off_count = portfolio.get_count('WD_OFF')
+    if wind_off_count > 0:
+        wind_def = ppu_definitions.get('WD_OFF')
+        wind_efficiency = wind_def.efficiency if wind_def else 0.84
+        num_turbines = int(mw_per_unit / 5)  # Larger offshore turbines
+        
+        start_idx = wind_on_count
+        n_locs = min(wind_off_count, len(wind_ranking) - start_idx, wind_data.shape[1])
+        if n_locs > 0:
+            loc_indices = wind_ranking[start_idx:start_idx + n_locs]
+            wind_speeds = wind_data[:, loc_indices]
+            hourly_power = _wind_power_vectorized(wind_speeds, num_turbines, rated_power_mw=5.0)
+            production_by_type['wind_offshore'] = np.sum(hourly_power) * wind_efficiency
+    
+    # --- Hydro Run-of-River (unchanged - already fast) ---
+    hyd_r_count = portfolio.get_count('HYD_R')
+    if hyd_r_count > 0:
+        hyd_def = ppu_definitions.get('HYD_R')
+        hyd_efficiency = hyd_def.efficiency if hyd_def else 0.88
+        cf_ror = 0.45
+        production_by_type['hydro_ror'] = (
+            hyd_r_count * mw_per_unit * n_hours * cf_ror * hyd_efficiency
+        )
+    
+    total_production = sum(production_by_type.values())
+    
+    return total_production, production_by_type
+
+
+def _wind_power_vectorized(
+    wind_speeds: np.ndarray,
+    num_turbines: int,
+    rated_power_mw: float = 3.0,
+    cut_in: float = 3.0,
+    rated_speed: float = 12.0,
+    cut_out: float = 25.0
+) -> np.ndarray:
+    """
+    Fully vectorized wind power calculation for 2D array (n_hours, n_locations).
+    """
+    power = np.zeros_like(wind_speeds)
+    
+    # Cubic region
+    cubic_mask = (wind_speeds >= cut_in) & (wind_speeds < rated_speed)
+    ratio = np.where(cubic_mask, (wind_speeds - cut_in) / (rated_speed - cut_in), 0)
+    power = np.where(cubic_mask, rated_power_mw * num_turbines * (ratio ** 3), power)
+    
+    # Rated region
+    rated_mask = (wind_speeds >= rated_speed) & (wind_speeds <= cut_out)
+    power = np.where(rated_mask, rated_power_mw * num_turbines, power)
+    
+    return power
+
+
+def _wind_power_array(
+    wind_speeds: np.ndarray,
+    num_turbines: int,
+    rated_power_mw: float = 3.0,
+    cut_in: float = 3.0,
+    rated_speed: float = 12.0,
+    cut_out: float = 25.0
+) -> np.ndarray:
+    """
+    Vectorized wind power calculation for an array of wind speeds.
+    
+    Returns array of power in MW for each timestep.
+    """
+    power = np.zeros_like(wind_speeds)
+    
+    # Cubic region (between cut-in and rated)
+    cubic_mask = (wind_speeds >= cut_in) & (wind_speeds < rated_speed)
+    ratio = (wind_speeds[cubic_mask] - cut_in) / (rated_speed - cut_in)
+    power[cubic_mask] = rated_power_mw * num_turbines * (ratio ** 3)
+    
+    # Rated region (between rated and cut-out)
+    rated_mask = (wind_speeds >= rated_speed) & (wind_speeds <= cut_out)
+    power[rated_mask] = rated_power_mw * num_turbines
+    
+    return power
+
+
+def check_cumulative_energy_balance(
+    portfolio: Portfolio,
+    ppu_definitions: Dict[str, PPUDefinition],
+    solar_data: np.ndarray,
+    wind_data: np.ndarray,
+    demand_data: np.ndarray,
+    solar_ranking: np.ndarray,
+    wind_ranking: np.ndarray,
+    config: Config = DEFAULT_CONFIG,
+    storage_efficiency: float = 0.75,
+    precomputed_sums: Optional[Dict[str, np.ndarray]] = None,
+) -> Tuple[bool, float, float, float, Dict[str, float]]:
+    """
+    Check if renewable production can cover total demand over the period.
+    
+    This is a NECESSARY condition for energy sovereignty:
+    - Storage can shift energy in time but cannot create it
+    - Total production must be >= Total demand / storage_efficiency
+    
+    Args:
+        portfolio: Portfolio to check
+        ppu_definitions: PPU definitions
+        solar_data: Solar irradiance data
+        wind_data: Wind speed data
+        demand_data: Demand time series (MW)
+        solar_ranking: Solar location rankings
+        wind_ranking: Wind location rankings
+        config: Configuration
+        storage_efficiency: Round-trip storage efficiency (default 75%)
+        
+    Returns:
+        Tuple of:
+        - is_balanced: True if production >= demand (accounting for storage losses)
+        - total_production_mwh: Total renewable production
+        - total_demand_mwh: Total demand
+        - balance_ratio: production / required_production (>= 1.0 means OK)
+        - production_breakdown: Dict with production by source type
+    """
+    # Calculate cumulative renewable production (using precomputed sums if available)
+    total_production, breakdown = calculate_cumulative_renewable_production(
+        portfolio, ppu_definitions, solar_data, wind_data,
+        solar_ranking, wind_ranking, config, precomputed_sums
+    )
+    
+    # Calculate total demand (sum of MW over hours = MWh)
+    total_demand = np.sum(demand_data)
+    
+    # Account for storage round-trip losses
+    # We need to produce MORE than demand because some energy is lost in storage
+    required_production = total_demand / storage_efficiency
+    
+    # Check balance
+    balance_ratio = total_production / required_production if required_production > 0 else float('inf')
+    is_balanced = balance_ratio >= 1.0
+    
+    return is_balanced, total_production, total_demand, balance_ratio, breakdown
+
+
+def find_minimum_renewable_portfolio(
+    ppu_definitions: Dict[str, PPUDefinition],
+    solar_data: np.ndarray,
+    wind_data: np.ndarray,
+    demand_data: np.ndarray,
+    solar_ranking: np.ndarray,
+    wind_ranking: np.ndarray,
+    config: Config = DEFAULT_CONFIG,
+    storage_efficiency: float = 0.75,
+    pv_fraction: float = 0.6,
+    wind_fraction: float = 0.3,
+    hydro_fraction: float = 0.1,
+) -> Tuple[Portfolio, float]:
+    """
+    Find the minimum portfolio that can cover total demand.
+    
+    Uses binary search to find the smallest portfolio where
+    cumulative production >= cumulative demand / storage_efficiency.
+    
+    Args:
+        ppu_definitions: PPU definitions
+        solar_data: Solar irradiance data
+        wind_data: Wind speed data
+        demand_data: Demand time series
+        solar_ranking: Solar location rankings
+        wind_ranking: Wind location rankings
+        config: Configuration
+        storage_efficiency: Round-trip storage efficiency
+        pv_fraction: Fraction of capacity from PV (default 60%)
+        wind_fraction: Fraction of capacity from wind (default 30%)
+        hydro_fraction: Fraction of capacity from hydro RoR (default 10%)
+        
+    Returns:
+        Tuple of (minimum_portfolio, balance_ratio)
+    """
+    # Binary search for minimum scale factor
+    min_scale = 1
+    max_scale = 1000  # Maximum units per type
+    
+    def test_scale(scale: int) -> float:
+        """Test a portfolio at given scale and return balance ratio."""
+        portfolio = Portfolio(ppu_counts={
+            'PV': int(scale * pv_fraction),
+            'WD_ON': int(scale * wind_fraction),
+            'HYD_R': int(scale * hydro_fraction),
+        })
+        
+        is_balanced, _, _, ratio, _ = check_cumulative_energy_balance(
+            portfolio, ppu_definitions, solar_data, wind_data,
+            demand_data, solar_ranking, wind_ranking, config, storage_efficiency
+        )
+        return ratio
+    
+    # Binary search
+    while max_scale - min_scale > 1:
+        mid_scale = (min_scale + max_scale) // 2
+        ratio = test_scale(mid_scale)
+        
+        if ratio >= 1.0:
+            max_scale = mid_scale
+        else:
+            min_scale = mid_scale
+    
+    # Use max_scale to ensure we meet the requirement
+    final_scale = max_scale
+    final_portfolio = Portfolio(ppu_counts={
+        'PV': int(final_scale * pv_fraction),
+        'WD_ON': int(final_scale * wind_fraction),
+        'HYD_R': int(final_scale * hydro_fraction),
+    })
+    
+    # Get final balance ratio
+    _, _, _, final_ratio, _ = check_cumulative_energy_balance(
+        final_portfolio, ppu_definitions, solar_data, wind_data,
+        demand_data, solar_ranking, wind_ranking, config, storage_efficiency
+    )
+    
+    return final_portfolio, final_ratio
+
+
+# =============================================================================
 # PPU DICTIONARY (RUNTIME STATE)
 # =============================================================================
 
@@ -468,8 +779,8 @@ def create_ppu_dictionary(
                 'can_extract_from': ppu_def.can_extract_from.copy(),
                 'can_input_to': ppu_def.can_input_to.copy(),
                 'Chain_Efficiency': ppu_def.efficiency,
-                'Cost_CHF_per_kWh': cost_per_mwh / 1000,  # Convert to kWh
-                'Cost_CHF_per_MWh': cost_per_mwh,
+                'Cost_CHF_per_kWh': cost_per_mwh,  # cost_per_mwh is actually in CHF/kWh
+                'Cost_CHF_per_MWh': cost_per_mwh * 1000,  # Convert CHF/kWh to CHF/MWh
                 'Cost_CHF_per_Quarter_Hour': cost_per_mwh * 0.25,
                 'Components': ppu_def.components.copy(),
                 'Location_Rank': np.nan,  # Set for renewables
@@ -566,6 +877,8 @@ if __name__ == "__main__":
     
     print("\nPPU Definitions:")
     for name, ppu_def in ppu_defs.items():
+        # cost_per_mwh is actually stored in CHF/kWh, convert for display
+        cost_chf_per_mwh = ppu_def.cost_per_mwh * 1000
         print(f"  {name}: {ppu_def.category}, η={ppu_def.efficiency:.3f}, "
-              f"cost={ppu_def.cost_per_mwh:.2f} CHF/MWh")
+              f"cost={cost_chf_per_mwh:.2f} CHF/MWh")
 

@@ -25,13 +25,15 @@ import time
 import pickle
 from pathlib import Path
 import copy
+from tqdm import tqdm
 
 from config import Config, DEFAULT_CONFIG
 from data_loader import load_all_data, sample_scenario_indices, get_scenario_data, CachedData
 from ppu_framework import (
     Portfolio, PPUDefinition, load_all_ppu_data, 
     create_ppu_dictionary, assign_renewable_locations,
-    estimate_annual_production, check_energy_sovereignty
+    estimate_annual_production, check_energy_sovereignty,
+    check_cumulative_energy_balance, find_minimum_renewable_portfolio
 )
 from dispatch_engine import (
     run_dispatch_simulation, compute_scenario_cost, compute_portfolio_metrics
@@ -147,6 +149,117 @@ def generate_initial_population(
 
 
 # =============================================================================
+# PROGRESSIVE COST CALCULATION
+# =============================================================================
+
+def calculate_progressive_cost_penalty(
+    portfolio: Portfolio,
+    ppu_definitions: Dict[str, PPUDefinition],
+    config: Config,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Calculate progressive cost penalty for exceeding soft caps.
+    
+    For each PPU type, if units > soft_cap:
+        penalty_multiplier = 1 + factor * (units - soft_cap)
+        penalty = base_cost * (multiplier - 1) * excess_units
+    
+    Args:
+        portfolio: Portfolio to evaluate
+        ppu_definitions: PPU definitions with base costs
+        config: Configuration with progressive cost caps
+        
+    Returns:
+        Tuple of (total_penalty_chf_per_year, breakdown_by_ppu)
+    """
+    progressive_caps = config.ppu.PROGRESSIVE_COST_CAPS
+    mw_per_unit = config.ppu.MW_PER_UNIT
+    hours_per_year = 8760
+    
+    total_penalty = 0.0
+    breakdown = {}
+    
+    for ppu_name, count in portfolio.ppu_counts.items():
+        if count <= 0 or ppu_name not in progressive_caps:
+            continue
+        
+        cap_info = progressive_caps[ppu_name]
+        soft_cap = cap_info.get('soft_cap', 9999)
+        factor = cap_info.get('factor', 0.0)
+        
+        if count <= soft_cap or factor <= 0:
+            continue
+        
+        # Get base cost for this PPU (CHF/MWh)
+        base_cost = 50.0  # Default
+        if ppu_name in ppu_definitions:
+            ppu_def = ppu_definitions[ppu_name]
+            base_cost = getattr(ppu_def, 'cost_per_mwh', 50.0)
+        
+        # Calculate excess units
+        excess_units = count - soft_cap
+        
+        # Progressive penalty: each excess unit costs more
+        # Unit 1 over cap: base_cost * (1 + factor*1)
+        # Unit 2 over cap: base_cost * (1 + factor*2)
+        # etc.
+        # Sum of penalties = base_cost * factor * (1 + 2 + ... + excess)
+        #                  = base_cost * factor * excess * (excess + 1) / 2
+        penalty_multiplier = factor * excess_units * (excess_units + 1) / 2
+        
+        # Convert to annual cost (assume 50% capacity factor average)
+        capacity_factor = 0.5
+        annual_mwh = excess_units * mw_per_unit * hours_per_year * capacity_factor
+        penalty = base_cost * penalty_multiplier * annual_mwh / excess_units
+        
+        total_penalty += penalty
+        breakdown[ppu_name] = {
+            'count': count,
+            'soft_cap': soft_cap,
+            'excess': excess_units,
+            'factor': factor,
+            'penalty_chf': penalty,
+        }
+    
+    return total_penalty, breakdown
+
+
+def get_portfolio_cost_multiplier(
+    portfolio: Portfolio,
+    config: Config,
+) -> Dict[str, float]:
+    """
+    Get cost multipliers for each PPU type based on current counts.
+    
+    Returns dictionary of {ppu_name: multiplier} where multiplier >= 1.0
+    """
+    progressive_caps = config.ppu.PROGRESSIVE_COST_CAPS
+    multipliers = {}
+    
+    for ppu_name, count in portfolio.ppu_counts.items():
+        if count <= 0:
+            multipliers[ppu_name] = 1.0
+            continue
+        
+        if ppu_name not in progressive_caps:
+            multipliers[ppu_name] = 1.0
+            continue
+        
+        cap_info = progressive_caps[ppu_name]
+        soft_cap = cap_info.get('soft_cap', 9999)
+        factor = cap_info.get('factor', 0.0)
+        
+        if count <= soft_cap or factor <= 0:
+            multipliers[ppu_name] = 1.0
+        else:
+            excess = count - soft_cap
+            # Average multiplier for all units above soft cap
+            multipliers[ppu_name] = 1.0 + factor * excess
+    
+    return multipliers
+
+
+# =============================================================================
 # FITNESS EVALUATION
 # =============================================================================
 
@@ -164,6 +277,11 @@ def evaluate_individual(
     This runs dispatch simulation across multiple scenarios and computes
     the aggregate cost metric.
     
+    Checks performed (in order):
+    1. Capacity factor estimate (fast, rough check)
+    2. Cumulative energy balance (accurate, uses real incidence data)
+    3. Dispatch simulation (detailed cost calculation)
+    
     Args:
         individual: Individual to evaluate
         data: Cached data
@@ -177,14 +295,14 @@ def evaluate_individual(
     """
     portfolio = individual.portfolio
     
-    # Check energy sovereignty first
+    # --- STEP 1: Quick capacity factor check ---
     is_sovereign, annual_prod, target = check_energy_sovereignty(
         portfolio, ppu_definitions, config
     )
     individual.annual_production_twh = annual_prod
     individual.is_sovereign = is_sovereign
     
-    # Heavy penalty if not sovereign
+    # Heavy penalty if capacity factor estimate fails
     if not is_sovereign:
         deficit = target - annual_prod
         penalty = config.fitness.SOVEREIGNTY_PENALTY_MULTIPLIER * deficit
@@ -193,6 +311,43 @@ def evaluate_individual(
         individual.cvar = penalty
         return individual
     
+    # --- STEP 2: Cumulative energy balance check (using real incidence data) ---
+    # This ensures total renewable production >= total demand (with storage losses)
+    # NOTE: This check is expensive! Disabled by default (config.fitness.CHECK_CUMULATIVE_BALANCE)
+    if config.fitness.CHECK_CUMULATIVE_BALANCE:
+        # Use pre-computed sums for speed (computed once during data loading)
+        precomputed = data.get_precomputed_sums() if hasattr(data, 'get_precomputed_sums') else None
+        
+        is_balanced, total_prod_mwh, total_demand_mwh, balance_ratio, prod_breakdown = \
+            check_cumulative_energy_balance(
+                portfolio, ppu_definitions,
+                data.get_solar_incidence(copy=False),  # Read-only, no copy needed
+                data.get_wind_incidence(copy=False),   # Read-only, no copy needed
+                data.get_demand(copy=False),           # Read-only, no copy needed
+                data.solar_ranking,
+                data.wind_ranking,
+                config,
+                storage_efficiency=config.fitness.STORAGE_ROUND_TRIP_EFFICIENCY,
+                precomputed_sums=precomputed,
+            )
+        
+        # Store balance info
+        individual.annual_production_twh = total_prod_mwh / 1e6  # Update with actual calculation
+        
+        # Penalty if cumulative production can't cover demand
+        if not is_balanced:
+            # Penalty proportional to how far below requirement
+            shortfall_ratio = 1.0 - balance_ratio
+            penalty = config.fitness.SOVEREIGNTY_PENALTY_MULTIPLIER * shortfall_ratio * 10
+            individual.fitness = penalty
+            individual.mean_cost = penalty
+            individual.cvar = penalty
+            individual.is_sovereign = False
+            if verbose:
+                print(f"  ⚠️ Cumulative balance ratio: {balance_ratio:.2f} (need ≥ 1.0)")
+            return individual
+    
+    # --- STEP 3: Detailed dispatch simulation ---
     # Create PPU dictionary
     ppu_dict = create_ppu_dictionary(portfolio, ppu_definitions, config)
     
@@ -237,7 +392,9 @@ def evaluate_individual(
         
         # Compute cost
         cost = compute_scenario_cost(results, ppu_dict, config)
-        scenario_results.append({'net_spot_cost_chf': cost, **results})
+        # NOTE: **results must come FIRST so that our computed 'cost' overrides
+        # the raw 'net_spot_cost_chf' from dispatch_engine
+        scenario_results.append({**results, 'net_spot_cost_chf': cost})
         individual.scenario_costs.append(cost)
     
     # Compute aggregate metrics
@@ -245,13 +402,30 @@ def evaluate_individual(
     individual.mean_cost = metrics['mean_cost']
     individual.cvar = metrics['cvar']
     
+    # --- STEP 4: Add progressive cost penalty for exceeding soft caps ---
+    progressive_penalty, penalty_breakdown = calculate_progressive_cost_penalty(
+        portfolio, ppu_definitions, config
+    )
+    
+    # Add penalty to mean cost (annual basis)
+    individual.mean_cost += progressive_penalty
+    
+    # Store penalty info for debugging
+    individual.progressive_penalty = progressive_penalty
+    individual.penalty_breakdown = penalty_breakdown
+    
+    if verbose and progressive_penalty > 0:
+        print(f"  Progressive cost penalty: {progressive_penalty:,.0f} CHF/year")
+        for ppu, info in penalty_breakdown.items():
+            print(f"    {ppu}: {info['count']} units (cap: {info['soft_cap']}, +{info['excess']} excess)")
+    
     # Fitness: use combined cost (harmonic mean approach optional)
     if config.fitness.COST_AGGREGATION == 'harmonic_mean':
         # Harmonic mean is more sensitive to high costs
-        costs = [max(c, 1e-6) for c in individual.scenario_costs]  # Avoid division by zero
+        costs = [max(c + progressive_penalty, 1e-6) for c in individual.scenario_costs]
         individual.fitness = len(costs) / sum(1/c for c in costs)
     else:
-        individual.fitness = metrics['combined_cost']
+        individual.fitness = metrics['combined_cost'] + progressive_penalty
     
     return individual
 
@@ -278,10 +452,16 @@ def evaluate_population(
     Returns:
         Population with updated fitness values
     """
-    for i, ind in enumerate(population):
-        if verbose and i % 10 == 0:
-            print(f"  Evaluating individual {i+1}/{len(population)}...")
-        
+    pop_iter = tqdm(
+        population,
+        desc="Evaluating population",
+        unit="ind",
+        disable=not verbose,
+        ncols=80,
+        leave=False
+    )
+    
+    for ind in pop_iter:
         evaluate_individual(ind, data, ppu_definitions, config, rng)
     
     return population
@@ -464,7 +644,9 @@ def run_genetic_algorithm(
     # Initialize stats
     stats = GAStats()
     stats.best_fitness = population[0].fitness
+    stats.mean_fitness = float(np.mean([ind.fitness for ind in population]))
     stats.best_fitness_history.append(stats.best_fitness)
+    stats.mean_fitness_history.append(stats.mean_fitness)  # Include initial mean
     
     best_ever = population[0].copy()
     
@@ -476,8 +658,17 @@ def run_genetic_algorithm(
             print(f"  NOT SOVEREIGN: {best_ever.annual_production_twh:.1f} TWh/year")
         print()
     
-    # Evolution loop
-    for generation in range(n_generations):
+    # Evolution loop with progress bar
+    pbar = tqdm(
+        range(n_generations),
+        desc="Evolving",
+        unit="gen",
+        disable=not verbose,
+        ncols=100,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+    )
+    
+    for generation in pbar:
         stats.generation = generation + 1
         gen_start = time.time()
         
@@ -525,7 +716,7 @@ def run_genetic_algorithm(
         
         # Update stats
         current_best = population[0].fitness
-        stats.mean_fitness = np.mean([ind.fitness for ind in population])
+        stats.mean_fitness = float(np.mean([ind.fitness for ind in population]))
         stats.worst_fitness = population[-1].fitness
         
         # Check for improvement
@@ -534,16 +725,16 @@ def run_genetic_algorithm(
             stats.best_fitness = current_best
             stats.generations_without_improvement = 0
             best_ever = population[0].copy()
-            
-            if verbose:
-                print(f"Gen {stats.generation:3d}: ↓ New best! {stats.best_fitness:,.0f} "
-                      f"(improved by {improvement:,.0f})")
+            status = f"↓ NEW BEST! -{improvement:,.0f}"
         else:
             stats.generations_without_improvement += 1
-            
-            if verbose and generation % 5 == 0:
-                print(f"Gen {stats.generation:3d}: {stats.best_fitness:,.0f} "
-                      f"(plateau: {stats.generations_without_improvement})")
+            status = f"plateau: {stats.generations_without_improvement}/{plateau_generations}"
+        
+        # Update progress bar with current status
+        pbar.set_postfix({
+            'best': f'{stats.best_fitness:,.0f}',
+            'status': status,
+        }, refresh=True)
         
         stats.best_fitness_history.append(stats.best_fitness)
         stats.mean_fitness_history.append(stats.mean_fitness)
@@ -554,13 +745,15 @@ def run_genetic_algorithm(
         
         # Check stopping criteria
         if stats.generations_without_improvement >= plateau_generations:
-            if verbose:
-                print(f"\n🛑 Plateau detected: No improvement for {plateau_generations} generations")
+            pbar.set_description("🛑 Plateau detected")
             break
         
         # Time check for overnight mode
         elapsed = time.time() - start_time
         stats.elapsed_time_s = elapsed
+    
+    # Close progress bar
+    pbar.close()
         
     # Final summary
     stats.elapsed_time_s = time.time() - start_time
@@ -599,6 +792,187 @@ def run_genetic_algorithm(
             print(f"\nResults saved to {results_path}")
     
     return best_ever, stats
+
+
+# =============================================================================
+# FULL YEAR EVALUATION
+# =============================================================================
+
+@dataclass
+class FullYearResults:
+    """Results from a full year evaluation."""
+    # Time series (hourly resolution)
+    demand: np.ndarray
+    total_production: np.ndarray
+    spot_prices: np.ndarray
+    spot_bought: np.ndarray
+    spot_sold: np.ndarray
+    deficit: np.ndarray
+    surplus: np.ndarray
+    
+    # Production breakdown (hourly)
+    renewable_production: np.ndarray = field(default_factory=lambda: np.array([]))
+    dispatchable_production: np.ndarray = field(default_factory=lambda: np.array([]))
+    
+    # Per-PPU production (dict: ppu_name -> total MWh or hourly array)
+    ppu_production: Dict[str, Any] = field(default_factory=dict)
+    
+    # Storage states (dict: storage_name -> hourly SoC array)
+    storage_soc: Dict[str, np.ndarray] = field(default_factory=dict)
+    
+    # Aggregate metrics
+    total_production_twh: float = 0.0
+    total_demand_twh: float = 0.0
+    total_spot_cost_chf: float = 0.0
+    total_spot_bought_mwh: float = 0.0
+    total_spot_sold_mwh: float = 0.0
+    coverage_ratio: float = 0.0
+    peak_deficit_mw: float = 0.0
+    hours_in_deficit: int = 0
+    
+    # Monthly breakdowns
+    monthly_production: Optional[np.ndarray] = None
+    monthly_demand: Optional[np.ndarray] = None
+
+
+def evaluate_portfolio_full_year(
+    individual: Individual,
+    config: Config = DEFAULT_CONFIG,
+    verbose: bool = True,
+) -> FullYearResults:
+    """
+    Evaluate a portfolio across the entire year (all 8760 hours).
+    
+    This is the final validation step after optimization to test
+    robustness across non-random data.
+    
+    Args:
+        individual: Optimized portfolio individual
+        config: Configuration
+        verbose: Print progress
+        
+    Returns:
+        FullYearResults with detailed time series and metrics
+    """
+    from dispatch_engine import run_dispatch_simulation
+    from ppu_framework import load_all_ppu_data, assign_renewable_locations
+    
+    if verbose:
+        print("=" * 60)
+        print("FULL YEAR EVALUATION")
+        print("=" * 60)
+        print()
+    
+    # Load data
+    if verbose:
+        print("Loading full year data...")
+    data = load_all_data(config)
+    
+    # Load PPU definitions
+    if verbose:
+        print("Loading PPU definitions...")
+    _, _, ppu_definitions = load_all_ppu_data(config)
+    
+    # Create PPU dictionary DataFrame from portfolio
+    ppu_dict = create_ppu_dictionary(individual.portfolio, ppu_definitions, config)
+    
+    # Assign renewable locations
+    ppu_dict = assign_renewable_locations(
+        ppu_dict,
+        data.solar_ranking,
+        data.wind_ranking,
+    )
+    
+    # Get full year data
+    n_hours = data.n_hours
+    demand = data.get_demand()
+    spot = data.get_spot_prices()
+    solar = data.get_solar_incidence()
+    wind = data.get_wind_incidence()
+    
+    if verbose:
+        print(f"Simulating {n_hours} hours ({n_hours / 24:.0f} days)...")
+    
+    # Run dispatch for entire year
+    _, results = run_dispatch_simulation(
+        scenario_indices=np.arange(n_hours),
+        ppu_dictionary=ppu_dict,
+        demand_data=demand,
+        spot_data=spot,
+        solar_data=solar,
+        wind_data=wind,
+        portfolio_counts=individual.portfolio.ppu_counts,
+        config=config,
+        verbose=False,
+    )
+    
+    # Extract results
+    full_year = FullYearResults(
+        demand=demand,
+        total_production=results.get('total_production', np.zeros(n_hours)),
+        spot_prices=spot,
+        spot_bought=results.get('spot_bought', np.zeros(n_hours)),
+        spot_sold=results.get('spot_sold', np.zeros(n_hours)),
+        deficit=results.get('deficit', np.zeros(n_hours)),
+        surplus=results.get('surplus', np.zeros(n_hours)),
+        renewable_production=results.get('renewable_production', np.zeros(n_hours)),
+        dispatchable_production=results.get('dispatchable_production', np.zeros(n_hours)),
+        ppu_production=results.get('ppu_production', {}),
+        storage_soc=results.get('storage_soc', {}),
+    )
+    
+    # Compute aggregate metrics
+    full_year.total_demand_twh = np.sum(demand) / 1e6
+    full_year.total_production_twh = np.sum(full_year.total_production) / 1e6
+    full_year.total_spot_bought_mwh = np.sum(full_year.spot_bought)
+    full_year.total_spot_sold_mwh = np.sum(full_year.spot_sold)
+    
+    # Spot market cost (buy - sell)
+    full_year.total_spot_cost_chf = (
+        np.sum(full_year.spot_bought * spot) - 
+        np.sum(full_year.spot_sold * spot)
+    )
+    
+    # Coverage and deficit stats
+    full_year.coverage_ratio = full_year.total_production_twh / max(full_year.total_demand_twh, 1e-9)
+    full_year.peak_deficit_mw = float(np.max(full_year.deficit))
+    full_year.hours_in_deficit = int(np.sum(full_year.deficit > 0))
+    
+    # Monthly breakdowns (assuming hourly data, 2024 = 366 days)
+    hours_per_month = [744, 696, 744, 720, 744, 720, 744, 744, 720, 744, 720, 744]
+    monthly_prod = []
+    monthly_dem = []
+    idx = 0
+    for h in hours_per_month:
+        end_idx = min(idx + h, n_hours)
+        monthly_prod.append(np.sum(full_year.total_production[idx:end_idx]) / 1e6)
+        monthly_dem.append(np.sum(demand[idx:end_idx]) / 1e6)
+        idx = end_idx
+        if idx >= n_hours:
+            break
+    
+    full_year.monthly_production = np.array(monthly_prod)
+    full_year.monthly_demand = np.array(monthly_dem)
+    
+    if verbose:
+        print()
+        print("=" * 60)
+        print("FULL YEAR RESULTS")
+        print("=" * 60)
+        print(f"Total Demand:     {full_year.total_demand_twh:,.1f} TWh")
+        print(f"Total Production: {full_year.total_production_twh:,.1f} TWh")
+        print(f"Coverage Ratio:   {full_year.coverage_ratio*100:.1f}%")
+        print()
+        print(f"Spot Market:")
+        print(f"  Bought: {full_year.total_spot_bought_mwh/1e6:,.2f} TWh")
+        print(f"  Sold:   {full_year.total_spot_sold_mwh/1e6:,.2f} TWh")
+        print(f"  Net Cost: {full_year.total_spot_cost_chf/1e6:,.1f} M CHF")
+        print()
+        print(f"Deficit Analysis:")
+        print(f"  Hours in deficit: {full_year.hours_in_deficit} ({full_year.hours_in_deficit/n_hours*100:.1f}%)")
+        print(f"  Peak deficit: {full_year.peak_deficit_mw:,.0f} MW")
+    
+    return full_year
 
 
 # =============================================================================

@@ -19,7 +19,7 @@ import numpy as np
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import warnings
 
 from config import Config, DEFAULT_CONFIG
@@ -56,21 +56,58 @@ class CachedData:
     n_solar_locations: int = 0
     n_wind_locations: int = 0
     
-    def get_solar_incidence(self) -> np.ndarray:
-        """Return a copy of solar incidence data."""
-        return self.solar_incidence.copy()
+    # PRE-COMPUTED SUMS for fast cumulative calculations (computed once on load)
+    _solar_location_sums: Optional[np.ndarray] = None  # Sum over hours per location
+    _wind_location_production: Optional[np.ndarray] = None  # Wind production per location
     
-    def get_wind_incidence(self) -> np.ndarray:
-        """Return a copy of wind incidence data."""
-        return self.wind_incidence.copy()
+    def __post_init__(self):
+        """Pre-compute location sums for fast cumulative calculations."""
+        if self._solar_location_sums is None and self.solar_incidence is not None:
+            self._solar_location_sums = np.sum(self.solar_incidence, axis=0)
+        if self._wind_location_production is None and self.wind_incidence is not None:
+            # Pre-compute wind production using vectorized power curve
+            self._wind_location_production = self._compute_wind_production()
     
-    def get_spot_prices(self) -> np.ndarray:
-        """Return a copy of spot prices."""
-        return self.spot_prices.copy()
+    def _compute_wind_production(self) -> np.ndarray:
+        """Pre-compute annual wind production per location (MWh per unit)."""
+        wind = self.wind_incidence
+        num_turbines = 333  # Default: 1000 MW / 3 MW per turbine
+        rated_power = 3.0
+        cut_in, rated_speed, cut_out = 3.0, 12.0, 25.0
+        
+        # Vectorized power calculation
+        power = np.zeros_like(wind)
+        cubic_mask = (wind >= cut_in) & (wind < rated_speed)
+        ratio = np.where(cubic_mask, (wind - cut_in) / (rated_speed - cut_in), 0)
+        power = np.where(cubic_mask, rated_power * num_turbines * (ratio ** 3), power)
+        rated_mask = (wind >= rated_speed) & (wind <= cut_out)
+        power = np.where(rated_mask, rated_power * num_turbines, power)
+        
+        # Sum over hours for each location
+        return np.sum(power, axis=0)
     
-    def get_demand(self) -> np.ndarray:
-        """Return a copy of demand data."""
-        return self.demand.copy()
+    def get_precomputed_sums(self) -> Dict[str, np.ndarray]:
+        """Return pre-computed sums for fast cumulative calculations."""
+        return {
+            'solar_location_sums': self._solar_location_sums,
+            'wind_location_production': self._wind_location_production,
+        }
+    
+    def get_solar_incidence(self, copy: bool = True) -> np.ndarray:
+        """Return solar incidence data. Set copy=False for read-only operations."""
+        return self.solar_incidence.copy() if copy else self.solar_incidence
+    
+    def get_wind_incidence(self, copy: bool = True) -> np.ndarray:
+        """Return wind incidence data. Set copy=False for read-only operations."""
+        return self.wind_incidence.copy() if copy else self.wind_incidence
+    
+    def get_spot_prices(self, copy: bool = True) -> np.ndarray:
+        """Return spot prices. Set copy=False for read-only operations."""
+        return self.spot_prices.copy() if copy else self.spot_prices
+    
+    def get_demand(self, copy: bool = True) -> np.ndarray:
+        """Return demand data. Set copy=False for read-only operations."""
+        return self.demand.copy() if copy else self.demand
     
     def get_cost_table(self) -> pd.DataFrame:
         """Return a copy of cost table."""

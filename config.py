@@ -27,9 +27,9 @@ class RunModeConfig:
     MODE: str = "quick"  # Options: "quick" (1 hour), "overnight" (8 hours), "custom"
     
     # Quick mode settings (~1 hour)
-    QUICK_POP_SIZE: int = 10
-    QUICK_N_GENERATIONS: int = 3
-    QUICK_PLATEAU_GENERATIONS: int = 2
+    QUICK_POP_SIZE: int = 25
+    QUICK_N_GENERATIONS: int = 5
+    QUICK_PLATEAU_GENERATIONS: int = 3
     
     # Overnight mode settings (~8 hours)
     OVERNIGHT_POP_SIZE: int = 200
@@ -150,7 +150,8 @@ class StorageConfig:
     STORAGE_DEFINITIONS: Dict[str, Dict] = field(default_factory=lambda: {
         'Lake': {
             'capacity_MWh': 8_870_000,  # Swiss hydro reservoir ~8.87 TWh
-            'max_power_MW': 10_000,
+            'max_power_MW': 2_000,      # Physical limit: 2 GW (regardless of PPU count)
+            'physical_power_cap_MW': 2_000,  # Hard cap on Lake power
             'efficiency_charge': 0.88,  # PHS pump efficiency
             'efficiency_discharge': 0.88,  # Turbine efficiency
             'extracted_by': ['HYD_S'],
@@ -280,43 +281,89 @@ class PPUConfig:
     ])
     
     # Portfolio bounds: (min_units, max_units) for each PPU type
-    # A "unit" represents a standardized capacity block
+    # A "unit" represents 10 MW capacity - gives granularity for ~7 GW average demand
+    # 10 GW = 1,000 units (1,000 × 10 MW = 10,000 MW = 10 GW)
     PORTFOLIO_BOUNDS: Dict[str, Tuple[int, int]] = field(default_factory=lambda: {
         # Incidence PPUs
-        'PV': (0, 500),          # Up to 500 GW
-        'WD_ON': (0, 100),       # Up to 100 GW
-        'WD_OFF': (0, 50),       # Up to 50 GW
-        'HYD_R': (0, 20),        # Limited by geography
-        'BIO_WOOD': (0, 50),     # Limited by biomass availability
+        'PV': (0, 1000),          # Up to 10 GW (1,000 × 10 MW)
+        'WD_ON': (0, 1000),       # Up to 10 GW
+        'WD_OFF': (0, 1000),      # Up to 10 GW
+        'HYD_R': (0, 300),        # Up to 3 GW (300 × 10 MW) - hard cap
+        'BIO_WOOD': (0, 1000),    # Up to 10 GW
         
-        # Flex PPUs
-        'HYD_S': (0, 50),        # Limited by lake capacity
-        'THERM': (0, 100),
-        'H2P_G': (0, 100),
-        'H2P_L': (0, 50),
-        'SOL_SALT': (0, 20),
-        'SOL_STEAM': (0, 20),
-        'BIO_OIL_ICE': (0, 50),
-        'PALM_ICE': (0, 50),
-        'IMP_BIOG': (0, 50),
-        'THERM_CH4': (0, 100),
-        'NH3_P': (0, 50),
+        # Flex PPUs (extraction from storage)
+        'HYD_S': (0, 300),        # Up to 3 GW (300 × 10 MW) - hard cap (Lake will cap at 2 GW)
+        'THERM': (0, 1000),       # Up to 10 GW
+        'H2P_G': (0, 1000),       # Up to 10 GW
+        'H2P_L': (0, 1000),       # Up to 10 GW
+        'SOL_SALT': (0, 1000),    # Up to 10 GW
+        'SOL_STEAM': (0, 1000),   # Up to 10 GW
+        'BIO_OIL_ICE': (0, 1000), # Up to 10 GW
+        'PALM_ICE': (0, 1000),    # Up to 10 GW
+        'IMP_BIOG': (0, 1000),    # Up to 10 GW
+        'THERM_CH4': (0, 1000),   # Up to 10 GW
+        'NH3_P': (0, 1000),       # Up to 10 GW
         
-        # Storage PPUs
-        'PHS': (0, 50),
-        'H2_G': (0, 100),
-        'H2_GL': (0, 50),
-        'H2_L': (0, 50),
-        'SYN_FT': (0, 50),
-        'SYN_METH': (0, 50),
-        'NH3_FULL': (0, 50),
-        'SYN_CRACK': (0, 30),
-        'CH4_BIO': (0, 50),
-        'SOL_SALT_STORE': (0, 20),
+        # Storage PPUs (input to storage)
+        'PHS': (0, 1000),         # Up to 10 GW (Lake will cap at 2 GW)
+        'H2_G': (0, 1000),        # Up to 10 GW
+        'H2_GL': (0, 1000),       # Up to 10 GW
+        'H2_L': (0, 1000),        # Up to 10 GW
+        'SYN_FT': (0, 1000),      # Up to 10 GW
+        'SYN_METH': (0, 1000),    # Up to 10 GW
+        'NH3_FULL': (0, 1000),    # Up to 10 GW
+        'SYN_CRACK': (0, 1000),   # Up to 10 GW
+        'CH4_BIO': (0, 1000),     # Up to 10 GW
+        'SOL_SALT_STORE': (0, 1000),  # Up to 10 GW
     })
     
     # Capacity per unit (MW per portfolio unit)
-    MW_PER_UNIT: float = 1000.0  # 1 GW per unit
+    # Each PPU unit = 10 MW power flow capacity
+    MW_PER_UNIT: float = 10.0  # 10 MW per unit (100 units = 1 GW)
+    
+    # ==========================================================================
+    # PROGRESSIVE COST CAPS
+    # ==========================================================================
+    # After 'soft_cap' units, each additional unit increases cost by 'factor'
+    # Formula: cost_multiplier = 1 + factor * max(0, units - soft_cap)
+    # Example: factor=0.1, soft_cap=100, units=150 → multiplier = 1 + 0.1*50 = 6x
+    #
+    # Set factor=0 to disable progressive cost for a PPU type
+    # Set soft_cap high (>= hard max) to effectively disable
+    
+    PROGRESSIVE_COST_CAPS: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        # Incidence PPUs - soft_cap in units of 10 MW (50 units = 0.5 GW)
+        'PV': {'soft_cap': 50, 'factor': 0.0002},       # After 0.5 GW, +0.02% per 10MW unit
+        'WD_ON': {'soft_cap': 50, 'factor': 0.0003},    # After 0.5 GW, +0.03% per unit
+        'WD_OFF': {'soft_cap': 50, 'factor': 0.0005},   # Offshore is expensive to scale
+        'HYD_R': {'soft_cap': 150, 'factor': 0.001},     # After 1.5 GW, limited river sites
+        'BIO_WOOD': {'soft_cap': 50, 'factor': 0.0005},  # After 0.5 GW, biomass supply limited
+        
+        # Flex PPUs - technology/fuel constraints
+        'HYD_S': {'soft_cap': 150, 'factor': 0.001},     # After 1.5 GW, limited by Lake 2 GW cap
+        'THERM': {'soft_cap': 50, 'factor': 0.0002},     # After 0.5 GW, abundant but emissions concern
+        'H2P_G': {'soft_cap': 50, 'factor': 0.0003},     # After 0.5 GW, H2 infrastructure scaling
+        'H2P_L': {'soft_cap': 50, 'factor': 0.0004},     # After 0.5 GW, liquid H2 more expensive
+        'SOL_SALT': {'soft_cap': 50, 'factor': 0.0005},  # After 0.5 GW, concentrated solar limited
+        'SOL_STEAM': {'soft_cap': 50, 'factor': 0.0005}, # After 0.5 GW
+        'BIO_OIL_ICE': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW
+        'PALM_ICE': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW, import dependency
+        'IMP_BIOG': {'soft_cap': 50, 'factor': 0.0005},  # After 0.5 GW, import capacity
+        'THERM_CH4': {'soft_cap': 50, 'factor': 0.0002}, # After 0.5 GW
+        'NH3_P': {'soft_cap': 50, 'factor': 0.0004},    # After 0.5 GW, ammonia infrastructure
+        
+        # Storage PPUs - material/space constraints
+        'PHS': {'soft_cap': 50, 'factor': 0.001},        # After 0.5 GW, limited by Lake 2 GW cap
+        'H2_G': {'soft_cap': 50, 'factor': 0.0003},     # After 0.5 GW, underground storage
+        'H2_GL': {'soft_cap': 50, 'factor': 0.0004},     # After 0.5 GW
+        'H2_L': {'soft_cap': 50, 'factor': 0.0005},      # After 0.5 GW, cryogenic expensive
+        'SYN_FT': {'soft_cap': 50, 'factor': 0.0004},    # After 0.5 GW
+        'SYN_METH': {'soft_cap': 50, 'factor': 0.0004},  # After 0.5 GW
+        'NH3_FULL': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW
+        'SYN_CRACK': {'soft_cap': 50, 'factor': 0.0005}, # After 0.5 GW
+        'CH4_BIO': {'soft_cap': 50, 'factor': 0.0003},  # After 0.5 GW
+        'SOL_SALT_STORE': {'soft_cap': 50, 'factor': 0.0005}, # After 0.5 GW
+    })
 
 
 # =============================================================================
@@ -340,6 +387,16 @@ class FitnessConfig:
     
     # Weight between mean cost and CVaR
     CVAR_WEIGHT: float = 0.3  # 30% weight on tail risk
+    
+    # Cumulative energy balance check
+    # If True, verify that total renewable production >= total demand
+    # (accounting for storage round-trip losses)
+    # WARNING: This is computationally expensive! Disable for faster optimization.
+    CHECK_CUMULATIVE_BALANCE: bool = False  # Disabled by default for performance
+    
+    # Round-trip storage efficiency for cumulative balance check
+    # Production must exceed demand / this value to account for losses
+    STORAGE_ROUND_TRIP_EFFICIENCY: float = 0.75
 
 
 # =============================================================================
