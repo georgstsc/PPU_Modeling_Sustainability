@@ -390,8 +390,8 @@ def evaluate_individual(
             verbose=False,
         )
         
-        # Compute cost
-        cost = compute_scenario_cost(results, ppu_dict, config)
+        # Compute cost (DETAILED: uses actual per-PPU production and costs)
+        cost = compute_scenario_cost(results, ppu_dict, config, ppu_definitions)
         # NOTE: **results must come FIRST so that our computed 'cost' overrides
         # the raw 'net_spot_cost_chf' from dispatch_engine
         scenario_results.append({**results, 'net_spot_cost_chf': cost})

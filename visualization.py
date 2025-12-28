@@ -1206,6 +1206,103 @@ def plot_energy_flow(
     return fig
 
 
+def plot_full_year_production_by_ppu(
+    full_year_results,
+    title: str = "Production by PPU Origin - Full Year",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (16, 10),
+) -> plt.Figure:
+    """
+    Plot stacked production decomposed by every individual PPU origin.
+    
+    Args:
+        full_year_results: FullYearResults object
+        title: Plot title
+        save_path: Optional path to save figure
+        figsize: Figure size
+        
+    Returns:
+        matplotlib Figure
+    """
+    r = full_year_results
+    n_hours = len(r.demand)
+    n_days = n_hours // 24
+    
+    # Get all unique PPU names that actually produced something
+    active_ppus = {}
+    for ppu_name, prod in r.ppu_production.items():
+        if isinstance(prod, (int, float, np.number)):
+            prod_hourly = np.full(n_hours, prod / n_hours)
+        else:
+            prod_hourly = prod
+            
+        if np.sum(prod_hourly) > 1e-3: # Filter out near-zero producers
+            active_ppus[ppu_name] = prod_hourly
+
+    if not active_ppus:
+        print("⚠️ No active PPUs found for decomposition plot.")
+        return plt.figure()
+
+    # Define a custom sorting order for aesthetic stacking
+    # Incidence at bottom, then flex/storage extraction
+    def get_sort_key(name):
+        name_up = name.upper()
+        if 'HYD_R' in name_up or 'RIVER' in name_up: return 0
+        if 'PV' in name_up or 'SOLAR' in name_up and 'SALT' not in name_up: return 1
+        if 'WD' in name_up or 'WIND' in name_up: return 2
+        if 'HYD_S' in name_up or 'LAKE' in name_up: return 3
+        if 'SOL_SALT' in name_up or 'SOL_STEAM' in name_up: return 4
+        if 'BIO' in name_up or 'PALM' in name_up: return 5
+        if 'H2' in name_up or 'NH3' in name_up or 'CH4' in name_up: return 6
+        return 10 # Everything else
+
+    sorted_names = sorted(active_ppus.keys(), key=get_sort_key)
+    
+    # Generate distinct colors for many PPUs
+    cmap = plt.cm.get_cmap('tab20', len(sorted_names))
+    ppu_colors = {name: cmap(i) for i, name in enumerate(sorted_names)}
+    
+    # Calculate daily averages for each PPU
+    daily_prod = {}
+    for name in sorted_names:
+        prod = active_ppus[name]
+        daily_prod[name] = np.array([np.mean(prod[i*24:(i+1)*24]) for i in range(n_days)]) / 1000.0 # to GW
+        
+    fig, ax = plt.subplots(figsize=figsize, facecolor=COLORS['light'])
+    days = np.arange(n_days)
+    bottom = np.zeros(n_days)
+    
+    # Stack plot
+    for name in sorted_names:
+        ax.fill_between(days, bottom, bottom + daily_prod[name],
+                       alpha=0.8, color=ppu_colors[name], label=name)
+        bottom += daily_prod[name]
+        
+    # Demand line
+    daily_demand = np.array([np.mean(r.demand[i*24:(i+1)*24]) for i in range(n_days)]) / 1000.0
+    ax.plot(days, daily_demand, color='black', linewidth=2, linestyle='--', 
+            label='Demand', zorder=10)
+            
+    ax.set_xlabel('Day of Year', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Average Power (GW)', fontsize=11, fontweight='bold')
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    
+    # Handle legend (might be large)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), 
+              ncol=min(len(sorted_names), 5), fontsize=9)
+    
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, n_days)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=COLORS['light'])
+        print(f"Saved: {save_path}")
+        
+    return fig
+
+
 def plot_full_year_production_by_source(
     full_year_results,
     title: str = "Production by Source - Full Year",
@@ -1227,20 +1324,25 @@ def plot_full_year_production_by_source(
     r = full_year_results
     
     # Group PPU production by type
+    # More specific matching to avoid 'SOL_SALT' (dispatchable) appearing as direct 'Solar'
     categories = {
-        'Solar': ['PV', 'SOL'],
-        'Wind': ['WD', 'WIND'],
-        'Hydro': ['HYD', 'PHS'],
-        'Hydrogen': ['H2'],
-        'Biomass': ['BIO', 'PALM'],
-        'Other': [],  # Catch-all
+        'Solar (Direct)': ['PV'],
+        'Wind': ['WD_ON', 'WD_OFF', 'WIND'],
+        'Hydro (River)': ['HYD_R'],
+        'Hydro (Lake)': ['HYD_S', 'Lake'],
+        'Solar (Storage)': ['SOL_SALT', 'SOL_STEAM', 'Solar salt'],
+        'Synthetic Fuels': ['H2', 'THERM', 'NH3', 'CH4', 'Fuel Tank', 'Ammonia'],
+        'Biomass': ['BIO', 'PALM', 'Biooil', 'Palm oil', 'Biogas'],
+        'Other': [],
     }
     
     category_colors = {
-        'Solar': COLORS['solar'],
+        'Solar (Direct)': COLORS['solar'],
         'Wind': COLORS['wind'],
-        'Hydro': COLORS['hydro'],
-        'Hydrogen': COLORS['h2'],
+        'Hydro (River)': COLORS['hydro'],
+        'Hydro (Lake)': '#0055A4', # Deeper blue
+        'Solar (Storage)': '#FFD700', # Gold
+        'Synthetic Fuels': COLORS['h2'],
         'Biomass': COLORS['bio'],
         'Other': COLORS['secondary'],
     }
@@ -1249,15 +1351,29 @@ def plot_full_year_production_by_source(
     n_hours = len(r.demand)
     category_production = {cat: np.zeros(n_hours) for cat in categories}
     
+    # Order for stacking (bottom to top)
+    stack_order = [
+        'Hydro (River)', 'Solar (Direct)', 'Wind', 
+        'Hydro (Lake)', 'Solar (Storage)', 
+        'Biomass', 'Synthetic Fuels', 'Other'
+    ]
+    
     for ppu_name, prod in r.ppu_production.items():
+        # Check if prod is an array or scalar
+        if isinstance(prod, (int, float, np.number)):
+            prod_hourly = np.full(n_hours, prod / n_hours)
+        else:
+            prod_hourly = prod
+            
         assigned = False
-        for cat, keywords in categories.items():
+        for cat in stack_order:
+            keywords = categories[cat]
             if any(kw in ppu_name.upper() for kw in keywords):
-                category_production[cat] += prod
+                category_production[cat] += prod_hourly
                 assigned = True
                 break
         if not assigned:
-            category_production['Other'] += prod
+            category_production['Other'] += prod_hourly
     
     # Daily average for visualization
     n_days = n_hours // 24
@@ -1269,8 +1385,8 @@ def plot_full_year_production_by_source(
     days = np.arange(n_days)
     bottom = np.zeros(n_days)
     
-    # Stack plot
-    for cat in ['Solar', 'Wind', 'Hydro', 'Hydrogen', 'Biomass', 'Other']:
+    # Stack plot in the defined order
+    for cat in stack_order:
         if np.sum(daily_prod[cat]) > 0:
             ax.fill_between(days, bottom, bottom + daily_prod[cat],
                            alpha=0.7, color=category_colors[cat], label=cat)
@@ -1295,6 +1411,8 @@ def plot_full_year_production_by_source(
         print(f"Saved: {save_path}")
     
     return fig
+
+
 
 
 # =============================================================================
@@ -3008,6 +3126,351 @@ def plot_portfolio_cost_breakdown(
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=COLORS['light'])
         print(f"Saved portfolio cost breakdown plot: {save_path}")
+    
+    return fig
+
+
+def plot_energy_balance_distribution(
+    demand: np.ndarray,
+    production: np.ndarray,
+    renewable_production: Optional[np.ndarray] = None,
+    spot_bought: Optional[np.ndarray] = None,
+    spot_sold: Optional[np.ndarray] = None,
+    include_spot_in_balance: bool = False,  # Default to False to see portfolio balance
+    title: str = "Energy Balance Distribution - Portfolio Performance",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (20, 16),
+) -> plt.Figure:
+    """
+    Visualize the distribution of energy surplus and deficit over time.
+    
+    Shows:
+    1. Time series of net balance (production - demand)
+    2. Distribution histogram of surplus vs deficit hours
+    3. When renewable (incidence) energy alone satisfies demand
+    4. Monthly breakdown of surplus/deficit
+    5. Daily pattern analysis
+    
+    Args:
+        demand: Hourly demand array (MW or MWh)
+        production: Hourly production array (MW or MWh)
+        renewable_production: Optional hourly renewable production array (MW or MWh)
+        spot_bought: Optional hourly spot market purchases (MW or MWh)
+        spot_sold: Optional hourly spot market sales (MW or MWh)
+        include_spot_in_balance: If True, includes spot market in the balance (usually results in 0 balance)
+        title: Plot title
+        save_path: Optional path to save figure
+        figsize: Figure size
+        
+    Returns:
+        matplotlib Figure object
+    """
+    # ... (keep validation logic) ...
+    
+    # Calculate net balance (positive = surplus, negative = deficit)
+    total_supply = production.copy()
+    if spot_bought is not None and len(spot_bought) == len(production):
+        total_supply = total_supply + spot_bought
+    if spot_sold is not None and len(spot_sold) == len(production):
+        total_supply = total_supply - spot_sold
+
+    if include_spot_in_balance:
+        # Calculate total supply (production + spot purchases - spot sales)
+        # This gives the actual energy available to meet demand (usually matches demand)
+        net_balance = total_supply - demand
+    else:
+        # Calculate portfolio balance (production - demand)
+        # This shows the actual performance of the portfolio before spot market
+        net_balance = production - demand
+    
+    n_hours = len(net_balance)
+    hours = np.arange(n_hours)
+    
+    # Debug: Check if production and demand are identical (would show 100% balanced)
+    if not include_spot_in_balance and np.allclose(production, demand, rtol=1e-5):
+        print(f"⚠️ WARNING: production and demand are nearly identical!")
+        print(f"   Production range: [{np.min(production):.2f}, {np.max(production):.2f}]")
+        print(f"   Demand range: [{np.min(demand):.2f}, {np.max(demand):.2f}]")
+        if spot_bought is not None:
+            print(f"   Spot bought: {np.sum(spot_bought):.2f} MWh total")
+        if spot_sold is not None:
+            print(f"   Spot sold: {np.sum(spot_sold):.2f} MWh total")
+        print(f"   Using total_supply (production + spot_bought - spot_sold) for balance calculation")
+    
+    # Classify each hour (use a small tolerance for "balanced")
+    tolerance = 1e-3  # 1 kW tolerance
+    surplus_mask = net_balance > tolerance
+    deficit_mask = net_balance < -tolerance
+    balanced_mask = np.abs(net_balance) <= tolerance
+    
+    surplus_hours = np.sum(surplus_mask)
+    deficit_hours = np.sum(deficit_mask)
+    balanced_hours = np.sum(balanced_mask)
+    
+    # Debug output (only if suspicious)
+    if balanced_hours > n_hours * 0.9:  # More than 90% balanced is suspicious
+        print(f"⚠️ WARNING: {100*balanced_hours/n_hours:.1f}% of hours are 'balanced' - this may indicate a data issue")
+        print(f"   DEBUG: n_hours={n_hours}, surplus={surplus_hours}, deficit={deficit_hours}, balanced={balanced_hours}")
+        print(f"   DEBUG: Production stats: min={np.min(production):.2f}, max={np.max(production):.2f}, mean={np.mean(production):.2f}")
+        print(f"   DEBUG: Total supply stats: min={np.min(total_supply):.2f}, max={np.max(total_supply):.2f}, mean={np.mean(total_supply):.2f}")
+        print(f"   DEBUG: Demand stats: min={np.min(demand):.2f}, max={np.max(demand):.2f}, mean={np.mean(demand):.2f}")
+        print(f"   DEBUG: Net balance stats: min={np.min(net_balance):.2f}, max={np.max(net_balance):.2f}, mean={np.mean(net_balance):.2f}")
+        if spot_bought is not None:
+            print(f"   DEBUG: Spot bought total: {np.sum(spot_bought):.2f} MWh")
+        if spot_sold is not None:
+            print(f"   DEBUG: Spot sold total: {np.sum(spot_sold):.2f} MWh")
+    
+    # Calculate renewable-only balance if provided
+    renewable_sufficient = None
+    renewable_sufficient_hours = 0
+    renewable_balance = None
+    if renewable_production is not None and len(renewable_production) == n_hours:
+        renewable_balance = renewable_production - demand
+        renewable_sufficient = renewable_balance >= 0  # Renewable alone satisfies demand
+        renewable_sufficient_hours = np.sum(renewable_sufficient)
+    
+    # Create figure - adjust grid for renewable visualization
+    fig = plt.figure(figsize=figsize, facecolor=COLORS['light'])
+    if renewable_production is not None:
+        # 4 rows: time series, histogram, renewable analysis, monthly/daily
+        gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.25, height_ratios=[1.2, 1, 1, 1])
+    else:
+        # Original 3 rows
+        gs = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.25, height_ratios=[1.2, 1, 1])
+    
+    # ===== SUBPLOT 1: Time Series of Net Balance =====
+    ax1 = fig.add_subplot(gs[0, :])
+    
+    # Create color array for fill (use total_supply for display)
+    surplus_fill = np.where(net_balance > 0, net_balance, 0)
+    deficit_fill = np.where(net_balance < 0, net_balance, 0)
+    
+    # Convert to days for x-axis
+    days = hours / 24
+    
+    ax1.fill_between(days, 0, surplus_fill / 1000, color=COLORS['success'], alpha=0.6, label='Surplus')
+    ax1.fill_between(days, 0, deficit_fill / 1000, color=COLORS['danger'], alpha=0.6, label='Deficit')
+    ax1.axhline(y=0, color='black', linewidth=1, linestyle='-')
+    
+    ax1.set_xlabel('Day of Year', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Net Balance (GW)', fontsize=11, fontweight='bold')
+    ax1.set_title('Energy Balance Over Time (Production - Demand)', fontsize=12, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, n_hours / 24)
+    
+    # Add month markers
+    if n_hours >= 8760:
+        month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        for i, (start, name) in enumerate(zip(month_starts, month_names)):
+            ax1.axvline(x=start, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
+            ax1.text(start + 15, ax1.get_ylim()[1] * 0.95, name, fontsize=8, ha='center', alpha=0.7)
+    
+    # ===== SUBPLOT 2: Distribution Histogram =====
+    ax2 = fig.add_subplot(gs[1, 0])
+    
+    # Create histogram
+    bins = 100
+    surplus_data = net_balance[surplus_mask] / 1000  # Convert to GW
+    deficit_data = net_balance[deficit_mask] / 1000
+    
+    if len(surplus_data) > 0:
+        ax2.hist(surplus_data, bins=bins//2, color=COLORS['success'], alpha=0.7, 
+                 label=f'Surplus hours ({surplus_hours:,})', edgecolor='white')
+    if len(deficit_data) > 0:
+        ax2.hist(deficit_data, bins=bins//2, color=COLORS['danger'], alpha=0.7,
+                 label=f'Deficit hours ({deficit_hours:,})', edgecolor='white')
+    
+    ax2.axvline(x=0, color='black', linewidth=2, linestyle='-')
+    ax2.set_xlabel('Net Balance (GW)', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('Number of Hours', fontsize=11, fontweight='bold')
+    ax2.set_title('Distribution of Energy Balance', fontsize=11, fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    
+    # ===== SUBPLOT 3: Pie Chart of Hours Classification =====
+    row_idx = 1
+    ax3 = fig.add_subplot(gs[row_idx, 1])
+    
+    sizes = [surplus_hours, deficit_hours, balanced_hours]
+    labels = [f'Surplus\n{surplus_hours:,}h ({100*surplus_hours/n_hours:.1f}%)',
+              f'Deficit\n{deficit_hours:,}h ({100*deficit_hours/n_hours:.1f}%)',
+              f'Balanced\n{balanced_hours:,}h ({100*balanced_hours/n_hours:.1f}%)']
+    colors_pie = [COLORS['success'], COLORS['danger'], COLORS['warning']]
+    explode = (0.02, 0.02, 0.02)
+    
+    # Filter out zero values
+    non_zero = [(s, l, c, e) for s, l, c, e in zip(sizes, labels, colors_pie, explode) if s > 0]
+    if non_zero:
+        sizes, labels, colors_pie, explode = zip(*non_zero)
+        ax3.pie(sizes, labels=labels, colors=colors_pie, explode=explode,
+                autopct='', shadow=True, startangle=90)
+    ax3.set_title('Time Classification', fontsize=11, fontweight='bold')
+    
+    # ===== SUBPLOT 3B: Renewable Energy Sufficiency =====
+    if renewable_production is not None and renewable_balance is not None:
+        row_idx = 2
+        ax3b = fig.add_subplot(gs[row_idx, :])
+        
+        # Convert to days for x-axis
+        days = hours / 24
+        
+        # Create color array: green when renewable sufficient, red when not
+        renewable_sufficient_fill = np.where(renewable_sufficient, renewable_balance / 1000, 0)
+        renewable_insufficient_fill = np.where(~renewable_sufficient, renewable_balance / 1000, 0)
+        
+        ax3b.fill_between(days, 0, renewable_sufficient_fill, color=COLORS['success'], 
+                          alpha=0.6, label=f'Renewable Sufficient ({renewable_sufficient_hours:,}h)')
+        ax3b.fill_between(days, 0, renewable_insufficient_fill, color=COLORS['danger'], 
+                          alpha=0.6, label=f'Renewable Insufficient ({n_hours - renewable_sufficient_hours:,}h)')
+        ax3b.axhline(y=0, color='black', linewidth=1, linestyle='-')
+        
+        # Add percentage line
+        pct_sufficient = 100 * renewable_sufficient_hours / n_hours
+        ax3b.axhline(y=0, color='black', linewidth=1, linestyle='-')
+        ax3b.text(0.99, 0.95, f'{pct_sufficient:.1f}% of hours\nrenewable-sufficient', 
+                 transform=ax3b.transAxes, fontsize=11, fontweight='bold',
+                 verticalalignment='top', horizontalalignment='right',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor=COLORS['dark']))
+        
+        ax3b.set_xlabel('Day of Year', fontsize=11, fontweight='bold')
+        ax3b.set_ylabel('Renewable Balance (GW)', fontsize=11, fontweight='bold')
+        ax3b.set_title('When Renewable (Incidence) Energy Alone Satisfies Demand', 
+                      fontsize=12, fontweight='bold')
+        ax3b.legend(loc='upper right', fontsize=10)
+        ax3b.grid(True, alpha=0.3)
+        ax3b.set_xlim(0, n_hours / 24)
+        
+        # Add month markers
+        if n_hours >= 8760:
+            month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            for i, (start, name) in enumerate(zip(month_starts, month_names)):
+                ax3b.axvline(x=start, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
+                if i % 2 == 0:  # Show every other month to avoid crowding
+                    ax3b.text(start + 15, ax3b.get_ylim()[1] * 0.95, name, 
+                             fontsize=8, ha='center', alpha=0.7)
+    
+    # ===== SUBPLOT 4: Monthly Breakdown =====
+    row_idx = 3 if renewable_production is not None else 2
+    ax4 = fig.add_subplot(gs[row_idx, 0])
+    
+    # Calculate monthly statistics
+    if n_hours >= 8760:
+        month_hours = [744, 672, 744, 720, 744, 720, 744, 744, 720, 744, 720, 744]
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        
+        monthly_surplus = []
+        monthly_deficit = []
+        monthly_net = []
+        
+        start_idx = 0
+        for hours_in_month in month_hours:
+            end_idx = start_idx + hours_in_month
+            if end_idx > n_hours:
+                end_idx = n_hours
+            
+            month_balance = net_balance[start_idx:end_idx]
+            monthly_surplus.append(np.sum(month_balance[month_balance > 0]) / 1e6)  # TWh
+            monthly_deficit.append(np.sum(month_balance[month_balance < 0]) / 1e6)  # TWh
+            monthly_net.append(np.sum(month_balance) / 1e6)  # TWh
+            
+            start_idx = end_idx
+        
+        x = np.arange(len(month_names))
+        width = 0.35
+        
+        bars1 = ax4.bar(x - width/2, monthly_surplus, width, label='Surplus', 
+                        color=COLORS['success'], alpha=0.8)
+        bars2 = ax4.bar(x + width/2, monthly_deficit, width, label='Deficit', 
+                        color=COLORS['danger'], alpha=0.8)
+        
+        ax4.axhline(y=0, color='black', linewidth=1)
+        ax4.set_xlabel('Month', fontsize=11, fontweight='bold')
+        ax4.set_ylabel('Energy (TWh)', fontsize=11, fontweight='bold')
+        ax4.set_title('Monthly Energy Surplus/Deficit', fontsize=11, fontweight='bold')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(month_names)
+        ax4.legend(loc='upper right', fontsize=9)
+        ax4.grid(True, alpha=0.3, axis='y')
+    else:
+        ax4.text(0.5, 0.5, 'Requires full year data\n(8760+ hours)', 
+                 ha='center', va='center', fontsize=12, transform=ax4.transAxes)
+        ax4.set_title('Monthly Breakdown (N/A)', fontsize=11, fontweight='bold')
+    
+    # ===== SUBPLOT 5: Daily Pattern (Hour of Day) =====
+    row_idx = 3 if renewable_production is not None else 2
+    ax5 = fig.add_subplot(gs[row_idx, 1])
+    
+    # Reshape to days x hours if possible
+    n_full_days = n_hours // 24
+    if n_full_days > 0:
+        daily_balance = net_balance[:n_full_days * 24].reshape(n_full_days, 24)
+        
+        # Average balance per hour of day
+        hourly_avg = np.mean(daily_balance, axis=0) / 1000  # GW
+        hourly_std = np.std(daily_balance, axis=0) / 1000
+        
+        hours_of_day = np.arange(24)
+        
+        colors_hourly = [COLORS['success'] if v > 0 else COLORS['danger'] for v in hourly_avg]
+        ax5.bar(hours_of_day, hourly_avg, color=colors_hourly, alpha=0.8, edgecolor='white')
+        ax5.errorbar(hours_of_day, hourly_avg, yerr=hourly_std, fmt='none', 
+                     color='gray', alpha=0.5, capsize=2)
+        
+        ax5.axhline(y=0, color='black', linewidth=1)
+        ax5.set_xlabel('Hour of Day', fontsize=11, fontweight='bold')
+        ax5.set_ylabel('Avg Net Balance (GW)', fontsize=11, fontweight='bold')
+        ax5.set_title('Daily Pattern: Average Balance by Hour', fontsize=11, fontweight='bold')
+        ax5.set_xticks(hours_of_day[::2])
+        ax5.grid(True, alpha=0.3, axis='y')
+    else:
+        ax5.text(0.5, 0.5, 'Requires at least 24 hours', 
+                 ha='center', va='center', fontsize=12, transform=ax5.transAxes)
+    
+    # Add summary statistics text
+    total_surplus_twh = np.sum(net_balance[surplus_mask]) / 1e6
+    total_deficit_twh = np.sum(net_balance[deficit_mask]) / 1e6
+    net_balance_twh = total_surplus_twh + total_deficit_twh
+    
+    summary_text = f"""
+    ENERGY BALANCE SUMMARY
+    {'─'*40}
+    Total Hours:     {n_hours:,} ({n_hours/24:.0f} days)
+    Surplus Hours:   {surplus_hours:,} ({100*surplus_hours/n_hours:.1f}%)
+    Deficit Hours:   {deficit_hours:,} ({100*deficit_hours/n_hours:.1f}%)
+    """
+    
+    if renewable_production is not None:
+        summary_text += f"""
+    Renewable Sufficient: {renewable_sufficient_hours:,}h ({100*renewable_sufficient_hours/n_hours:.1f}%)
+    """
+    
+    summary_text += f"""
+    Total Surplus:   {total_surplus_twh:+.2f} TWh
+    Total Deficit:   {total_deficit_twh:+.2f} TWh
+    Net Balance:     {net_balance_twh:+.2f} TWh
+    
+    Max Surplus:     {np.max(net_balance)/1000:+.2f} GW
+    Max Deficit:     {np.min(net_balance)/1000:+.2f} GW
+    """
+    
+    fig.text(0.98, 0.02, summary_text, fontsize=9, fontfamily='monospace',
+             verticalalignment='bottom', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor=COLORS['dark']))
+    
+    # Overall title
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0.08, 1, 0.98])
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=COLORS['light'])
+        print(f"Saved energy balance distribution plot: {save_path}")
     
     return fig
 

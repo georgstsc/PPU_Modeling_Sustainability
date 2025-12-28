@@ -767,8 +767,19 @@ def create_ppu_dictionary(
         for i in range(count):
             ppu_id += 1
             
-            # Cost escalation: 10% increase per existing unit
-            escalation_factor = 1.0 + 0.10 * i
+            # Cost escalation using config's PROGRESSIVE_COST_CAPS
+            # Only apply escalation after soft_cap units
+            if ppu_name in config.ppu.PROGRESSIVE_COST_CAPS:
+                cap_info = config.ppu.PROGRESSIVE_COST_CAPS[ppu_name]
+                soft_cap = cap_info.get('soft_cap', 9999)
+                factor = cap_info.get('factor', 0.0)
+                # Escalation only starts after soft_cap
+                units_over_cap = max(0, i - soft_cap)
+                escalation_factor = 1.0 + factor * units_over_cap
+            else:
+                # No escalation for PPUs not in the config
+                escalation_factor = 1.0
+            
             cost_per_mwh = ppu_def.cost_per_mwh * escalation_factor
             
             rows.append({

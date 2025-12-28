@@ -41,8 +41,17 @@ class PrecomputedRenewables:
     # Wind: location indices and efficiencies
     wind_location_indices: np.ndarray  # Array of location indices (0-based)
     wind_efficiencies: np.ndarray      # Chain efficiencies for each wind unit
-    wind_num_turbines: int             # Turbines per unit
+    wind_num_turbines: float           # Turbines per unit
     
+    # River: PPU indices and monthly production
+    river_indices: List[int] = field(default_factory=list)
+    ror_production_monthly: np.ndarray = field(default_factory=lambda: np.zeros(12)) # MWh per month
+    
+    # Solar Thermal: PPU indices
+    sol_store_indices: List[int] = field(default_factory=list)
+    
+    mw_per_unit: float = 10.0
+
     # Wind power curve parameters
     cut_in_speed: float = 3.0
     rated_speed: float = 12.0
@@ -53,6 +62,7 @@ class PrecomputedRenewables:
 def precompute_renewable_indices(
     ppu_dictionary: pd.DataFrame,
     config: Config = DEFAULT_CONFIG,
+    ror_production: Optional[np.ndarray] = None
 ) -> PrecomputedRenewables:
     """
     Pre-compute location indices and parameters for fast renewable calculation.
@@ -62,6 +72,7 @@ def precompute_renewable_indices(
     Args:
         ppu_dictionary: PPU dictionary with location assignments
         config: Configuration
+        ror_production: Optional monthly river hydro production array
         
     Returns:
         PrecomputedRenewables object for fast vectorized calculations
@@ -76,11 +87,29 @@ def precompute_renewable_indices(
     wind_locations = []
     wind_effs = []
     
-    for _, row in ppu_dictionary.iterrows():
+    # Extract river units
+    river_indices = []
+    
+    # Extract solar thermal store units
+    sol_store_indices = []
+    
+    for i, row in ppu_dictionary.iterrows():
+        ppu_name = row['PPU_Name']
         components = row['Components']
         location_rank = row.get('Location_Rank', np.nan)
         efficiency = row.get('Chain_Efficiency', 0.8)
         
+        # River hydro (incidence)
+        if 'River' in components or ppu_name == 'HYD_R':
+            river_indices.append(i)
+            continue
+            
+        # Solar thermal store (incidence -> storage)
+        if 'Solar concentrator' in str(components) or 'SOL_SALT_STORE' in ppu_name:
+            # We treat these as location-specific if location_rank exists, otherwise index 0
+            sol_store_indices.append(i)
+            # Don't continue, might need location logic below if we want to rank them
+            
         if pd.isna(location_rank):
             continue
             
@@ -99,10 +128,14 @@ def precompute_renewable_indices(
     return PrecomputedRenewables(
         pv_location_indices=np.array(pv_locations, dtype=np.int32),
         pv_efficiencies=np.array(pv_effs, dtype=np.float64),
-        pv_area_m2=mw_per_unit * 1000,  # m² per MW
+        pv_area_m2=mw_per_unit * 5000,  # 5000 m² per MW (approx 200W/m²)
         wind_location_indices=np.array(wind_locations, dtype=np.int32),
         wind_efficiencies=np.array(wind_effs, dtype=np.float64),
-        wind_num_turbines=int(mw_per_unit / 3),
+        wind_num_turbines=mw_per_unit / 3.0,  # 3 MW turbines
+        river_indices=river_indices,
+        ror_production_monthly=ror_production if ror_production is not None else np.zeros(12),
+        sol_store_indices=sol_store_indices,
+        mw_per_unit=mw_per_unit
     )
 
 
@@ -163,7 +196,7 @@ def calculate_renewable_production_fast(
     precomputed: PrecomputedRenewables,
     solar_data: np.ndarray,
     wind_data: np.ndarray,
-) -> float:
+) -> Tuple[float, Dict[str, float]]:
     """
     Fast vectorized renewable production calculation.
     
@@ -171,15 +204,20 @@ def calculate_renewable_production_fast(
     Handles NaN values in input data by treating them as zero.
     
     Args:
-        t: Timestep index
+        t: Timestep index (absolute hour of year)
         precomputed: PrecomputedRenewables object
         solar_data: Solar irradiance array (n_hours, n_locations)
         wind_data: Wind speed array (n_hours, n_locations)
         
     Returns:
-        Total renewable production in MW
+        Tuple of (Total renewable production in MW, breakdown dict)
     """
     total_mw = 0.0
+    breakdown = {}
+    
+    # Calculate month index (0-11) for monthly profiles
+    # Assuming hourly data starting Jan 1st
+    month_idx = min(11, t // (24 * 30)) # Approximation for profiles
     
     # Solar PV production
     if len(precomputed.pv_location_indices) > 0 and t < len(solar_data):
@@ -195,11 +233,46 @@ def calculate_renewable_production_fast(
         # Replace NaN with 0 (no production)
         irradiance_values = np.nan_to_num(irradiance_values, nan=0.0)
         
-        total_mw += _calculate_solar_power_vectorized(
+        pv_mw = _calculate_solar_power_vectorized(
             irradiance_values,
             precomputed.pv_efficiencies,
             precomputed.pv_area_m2,
         )
+        total_mw += pv_mw
+        breakdown['PV'] = pv_mw
+    
+    # River Hydro production (HYD_R) - Incidence based
+    if len(precomputed.river_indices) > 0:
+        # Use monthly ror_production scaled by unit count
+        # ror_production_monthly is total MWh for the month for the WHOLE country
+        # We assume HYD_R units represent a share of this
+        n_units = len(precomputed.river_indices)
+        # Placeholder: assume each unit contributes its share of the monthly production
+        # Total annual HYD_R is ~17 TWh. 1 unit = 10 MW.
+        # Monthly production / (days * 24) = average MW for the month
+        monthly_mwh = precomputed.ror_production_monthly[month_idx]
+        hourly_mw_total = monthly_mwh / (30 * 24) # Approx average MW
+        
+        # Scale by number of units (assuming units are standardized)
+        river_mw = hourly_mw_total * (n_units / 100.0) # Scaling factor depends on data normalization
+        total_mw += river_mw
+        breakdown['HYD_R'] = river_mw
+    
+    # Solar Thermal Storage Input (SOL_SALT_STORE)
+    if len(precomputed.sol_store_indices) > 0 and t < len(solar_data):
+        # Similar to PV but goes to storage (not grid)
+        # However, for simplicity in the stacked plot, we treat it as incidence production
+        # that will immediately be 'consumed' by storage charging in the dispatch loop.
+        n_units = len(precomputed.sol_store_indices)
+        
+        # Use first solar location as proxy if no ranking
+        irrad = solar_data[t, 0] if solar_data.ndim > 1 else solar_data[t]
+        irrad = np.nan_to_num(irrad, nan=0.0)
+        
+        # Solar thermal efficiency ~40% (concentrator + receiver)
+        sol_thermal_mw = irrad * (precomputed.pv_area_m2 * 2) * 0.40 * n_units / 1000.0
+        total_mw += sol_thermal_mw
+        breakdown['SOL_SALT_STORE'] = sol_thermal_mw
     
     # Wind production
     if len(precomputed.wind_location_indices) > 0 and t < len(wind_data):
@@ -215,13 +288,15 @@ def calculate_renewable_production_fast(
         # Replace NaN with 0 (no production)
         wind_speeds = np.nan_to_num(wind_speeds, nan=0.0)
         
-        total_mw += _calculate_wind_power_vectorized(
+        wind_mw = _calculate_wind_power_vectorized(
             wind_speeds,
             precomputed.wind_efficiencies,
             precomputed.wind_num_turbines,
         )
-    
-    return total_mw
+        total_mw += wind_mw
+        breakdown['WD_ON'] = wind_mw
+        
+    return total_mw, breakdown
 
 
 # =============================================================================
@@ -452,36 +527,25 @@ def wind_power_mw(
 # DISPATCHABLE GENERATOR SUPPORT
 # =============================================================================
 
-# PPUs that are dispatchable generators (can produce power on demand)
+# PPUs that are standalone dispatchable generators (fuel-based, no dedicated storage)
 DISPATCHABLE_GENERATORS = {
-    'THERM': {'capacity_factor': 0.95, 'cost_per_mwh': 80},
-    'THERM_CH4': {'capacity_factor': 0.95, 'cost_per_mwh': 70},
-    'H2P_G': {'capacity_factor': 0.90, 'cost_per_mwh': 100},
-    'H2P_L': {'capacity_factor': 0.90, 'cost_per_mwh': 100},
-    'BIO_WOOD': {'capacity_factor': 0.85, 'cost_per_mwh': 90},
-    'BIO_OIL_ICE': {'capacity_factor': 0.90, 'cost_per_mwh': 85},
-    'PALM_ICE': {'capacity_factor': 0.90, 'cost_per_mwh': 80},
-    'IMP_BIOG': {'capacity_factor': 0.95, 'cost_per_mwh': 75},
-    'NH3_P': {'capacity_factor': 0.90, 'cost_per_mwh': 95},
-    'SOL_SALT': {'capacity_factor': 0.70, 'cost_per_mwh': 60},  # Solar thermal
-    'SOL_STEAM': {'capacity_factor': 0.70, 'cost_per_mwh': 65},
-    'HYD_R': {'capacity_factor': 0.50, 'cost_per_mwh': 20},  # Run-of-river
-    'HYD_S': {'capacity_factor': 0.40, 'cost_per_mwh': 25},  # Storage hydro
+    'THERM_M': {'capacity_factor': 0.95, 'cost_per_mwh': 85}, # Biomass thermal
 }
 
 # Storage discharge costs (opportunity cost - value of stored energy)
 # Higher cost = more reluctant to discharge (save for peak demand)
+# This cost should include the OPEX of the extraction PPU (e.g. SOL_SALT)
 STORAGE_DISCHARGE_COSTS = {
-    'Lake': 150,          # Hydro is precious - save for peaks!
-    'Solar salt': 40,     # Easy to recharge from solar
-    'Biogas': 50,         # Medium value
-    'H2 UG 200bar': 80,   # H2 is valuable
-    'CH4 200bar': 70,     # Methane storage
-    'Liquid H2': 90,      # Liquid H2 expensive to produce
-    'Fuel Tank': 60,      # Synthetic fuel
-    'Ammonia': 85,        # Ammonia valuable
-    'Biooil': 55,         # Bio-oil
-    'Palm oil': 55,       # Palm oil
+    'Lake': 150,          # HYD_S extraction
+    'Solar salt': 40,     # SOL_SALT / SOL_STEAM extraction
+    'Biogas': 50,         # IMP_BIOG extraction
+    'H2 UG 200bar': 80,   # H2P_G extraction
+    'CH4 200bar': 70,     # THERM_CH4 extraction
+    'Liquid H2': 90,      # H2P_L extraction
+    'Fuel Tank': 60,      # THERM extraction
+    'Ammonia': 85,        # NH3_P extraction
+    'Biooil': 55,         # BIO_OIL_ICE extraction
+    'Palm oil': 55,       # PALM_ICE extraction
 }
 
 
@@ -813,12 +877,22 @@ def run_dispatch_simulation(
     deficit_series = np.zeros(n_timesteps)
     surplus_series = np.zeros(n_timesteps)
     
+    # Track hourly production per PPU
+    # Initialize with arrays of zeros
+    ppu_production_hourly = {name: np.zeros(n_timesteps) for name in portfolio_counts.keys() if portfolio_counts[name] > 0}
+    
     # Track storage SoC over time
     storage_soc_series = {name: np.zeros(n_timesteps) for name in storages.keys()}
     
     # Precompute renewable indices ONCE (big speedup!)
     if precomputed_renewables is None:
-        precomputed_renewables = precompute_renewable_indices(ppu_dictionary, config)
+        # Load ror_production from config if available (via data loader)
+        # For evaluation, we assume data is already cached
+        from data_loader import load_all_data
+        cached_data = load_all_data(config)
+        precomputed_renewables = precompute_renewable_indices(
+            ppu_dictionary, config, ror_production=cached_data.ror_production
+        )
     
     # Calculate total dispatchable capacity
     total_dispatchable_mw = sum(d.available_power() for d in dispatchers.values())
@@ -833,10 +907,15 @@ def run_dispatch_simulation(
         spot_price = spot_data[t] if t < len(spot_data) else 50.0  # Default price
         
         # ===== STEP 1: Calculate renewable production =====
-        renewable_mw = calculate_renewable_production_fast(
+        renewable_mw, renewable_breakdown = calculate_renewable_production_fast(
             t, precomputed_renewables, solar_data, wind_data
         )
         renewable_production_series[i] = renewable_mw
+        
+        # Track renewable production hourly
+        for name, prod in renewable_breakdown.items():
+            if name in ppu_production_hourly:
+                ppu_production_hourly[name][i] = prod
         
         # Calculate initial balance
         balance_mw = renewable_mw - demand_mw  # Positive = surplus, Negative = deficit
@@ -900,14 +979,26 @@ def run_dispatch_simulation(
                     available = dispatcher.available_power() * timestep_h
                     dispatch = min(available, remaining_deficit_mwh)
                     dispatcher.energy_produced_mwh += dispatch
-                    dispatchable_mw += dispatch / timestep_h
+                    dispatch_mw = dispatch / timestep_h
+                    dispatchable_mw += dispatch_mw
                     remaining_deficit_mwh -= dispatch
+                    
+                    # Track hourly
+                    if dispatcher.ppu_name in ppu_production_hourly:
+                        ppu_production_hourly[dispatcher.ppu_name][i] += dispatch_mw
                     
                 elif option['type'] == 'storage':
                     storage = option['object']
                     discharged = storage.discharge(remaining_deficit_mwh)
                     remaining_deficit_mwh -= discharged
-                    storage_discharged_mw += discharged / timestep_h
+                    dis_mw = discharged / timestep_h
+                    storage_discharged_mw += dis_mw
+                    
+                    # Track hourly (Storage as a source)
+                    storage_ppu_name = option['name']
+                    if storage_ppu_name not in ppu_production_hourly:
+                        ppu_production_hourly[storage_ppu_name] = np.zeros(n_timesteps)
+                    ppu_production_hourly[storage_ppu_name][i] += dis_mw
             
             # Track any remaining deficit
             if remaining_deficit_mwh > 0:
@@ -990,7 +1081,7 @@ def run_dispatch_simulation(
         'deficit': deficit_series,
         'surplus': surplus_series,
         'storage_soc': storage_soc_series,
-        'ppu_production': dispatchable_summary,
+        'ppu_production': ppu_production_hourly,
         # Summary stats
         'total_renewable_mwh': total_renewable_mwh,
         'total_dispatchable_mwh': total_dispatchable_mwh,
@@ -1014,41 +1105,69 @@ def compute_scenario_cost(
     results: Dict[str, Any],
     ppu_dictionary: pd.DataFrame,
     config: Config = DEFAULT_CONFIG,
+    ppu_definitions: Optional[Dict] = None,
 ) -> float:
     """
-    Compute total cost for a scenario.
+    Compute total cost for a scenario using DETAILED per-PPU tracking.
     
     Includes:
     - Net spot market cost (buy - sell)
-    - PPU operational costs
+    - PPU operational costs (based on actual production per PPU)
+    
+    This uses the same cost calculation logic as portfolio_metrics.py
+    for consistency across the entire pipeline.
     
     Args:
-        results: Results from dispatch simulation
-        ppu_dictionary: PPU dictionary
+        results: Results from dispatch simulation (must include 'ppu_production')
+        ppu_dictionary: PPU dictionary DataFrame
         config: Configuration
+        ppu_definitions: Optional dict of PPUDefinition objects for accurate costs
         
     Returns:
         Total cost in CHF
     """
+    # Conversion factor: cost_per_mwh in PPUDefinition is CHF/kWh, need CHF/MWh
+    CHF_KWH_TO_CHF_MWH = 1000.0
+    
     # Spot market cost
-    spot_cost = results['net_spot_cost_chf']
+    spot_cost = results.get('net_spot_cost_chf', 0.0)
     
-    # PPU operational costs (simplified: based on production)
-    # In a full implementation, this would track actual production per PPU
+    # PPU operational costs - DETAILED calculation using actual production per PPU
     ppu_cost = 0.0
+    ppu_production = results.get('ppu_production', {})
     
-    # Estimate based on deficit that was served from storage
-    # Assume average cost across all flex PPUs
-    if 'total_deficit_mwh' in results:
-        avg_flex_cost = 50.0  # CHF/MWh placeholder
-        if not ppu_dictionary.empty:
-            flex_ppus = ppu_dictionary[ppu_dictionary['PPU_Extract'] == 'Flex']
-            if not flex_ppus.empty and 'Cost_CHF_per_MWh' in flex_ppus.columns:
-                avg_flex_cost = flex_ppus['Cost_CHF_per_MWh'].mean()
+    if ppu_production:
+        for ppu_name, production_array in ppu_production.items():
+            if not isinstance(production_array, np.ndarray):
+                continue
+            
+            # Total production for this PPU (MWh)
+            total_production_mwh = np.sum(production_array)
+            
+            if total_production_mwh <= 0:
+                continue
+            
+            # Get cost per MWh for this PPU
+            cost_per_mwh = 50.0  # Default fallback (CHF/MWh)
+            
+            # Try to get accurate cost from ppu_definitions first
+            if ppu_definitions is not None:
+                ppu_def = ppu_definitions.get(ppu_name)
+                if ppu_def is not None:
+                    if hasattr(ppu_def, 'cost_per_mwh'):
+                        # cost_per_mwh is actually in CHF/kWh, convert to CHF/MWh
+                        cost_per_mwh = ppu_def.cost_per_mwh * CHF_KWH_TO_CHF_MWH
+                    elif isinstance(ppu_def, dict) and 'cost_per_mwh' in ppu_def:
+                        cost_per_mwh = ppu_def['cost_per_mwh'] * CHF_KWH_TO_CHF_MWH
+            
+            # Fallback: try to get from ppu_dictionary DataFrame
+            if cost_per_mwh == 50.0 and not ppu_dictionary.empty:
+                ppu_rows = ppu_dictionary[ppu_dictionary['PPU_Name'] == ppu_name]
+                if not ppu_rows.empty and 'Cost_CHF_per_MWh' in ppu_rows.columns:
+                    cost_per_mwh = ppu_rows['Cost_CHF_per_MWh'].values[0]
         
-        # Deficit served by storage has a cost
-        storage_served = results['total_deficit_mwh'] - results['total_spot_buy_mwh']
-        ppu_cost = storage_served * avg_flex_cost
+            # Add production cost
+            ppu_cost += total_production_mwh * cost_per_mwh
     
     return spot_cost + ppu_cost
 
