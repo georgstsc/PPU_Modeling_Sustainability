@@ -716,6 +716,39 @@ where:
 - **Capacity Limits:** Maximum storage capacity constraints (scaled by input PPU count, except Lake)
 - **Scaling:** Storage capacity and power scale linearly with number of PPU units
 
+### 9.6 Aviation Fuel Requirement (Biooil Constraint)
+
+Aviation remains a material residual demand that is not straightforwardly substitutable by direct electricity use. Based on Züttel et al., an aviation-fuel requirement of approximately **23 TWh/year** is specified as a hard constraint.
+
+**Mathematical Formulation:**
+\[
+\text{Aviation Fuel Demand} = 23 \text{ TWh/year} = \frac{23 \times 10^6 \text{ MWh}}{8760 \text{ h}} \approx 2625.57 \text{ MWh/hour}
+\]
+
+**Implementation:**
+1. **Hourly Discharge:** Every hour, 2625.57 MWh of biooil must be discharged from storage for aviation
+2. **Storage Type:** Biooil storage (discharge efficiency = 1.0 for fuel delivery, not electricity conversion)
+3. **Supply Sources:** Biooil can be:
+   - Imported at market price (67 CHF/MWh)
+   - Produced domestically via pyrolysis pathways (BIO_OIL_FROM_WOOD, BIO_OIL_FROM_PALM)
+
+**Capacity Constraint:**
+\[
+N_{\text{BIO\_OIL\_ICE}} \times P_{\text{unit}} \geq \frac{23 \times 10^6}{8760} \approx 2625.57 \text{ MW}
+\]
+
+With $P_{\text{unit}} = 10$ MW per PPU unit:
+\[
+N_{\text{BIO\_OIL\_ICE}} \geq \lceil 2625.57 / 10 \rceil = 263 \text{ units}
+\]
+
+**Validation:**
+- Post-simulation validation checks that every hour met the discharge requirement
+- Portfolios failing this constraint are rejected as infeasible
+- Aviation fuel import costs are tracked separately and included in total system cost
+
+**Note:** This discharge is **independent of electricity generation**. The biooil goes directly to aviation as fuel, not through BIO_OIL_ICE for power generation. The constraint ensures sufficient storage throughput capacity exists.
+
 ---
 
 ## 10. Summary of Key Equations
@@ -776,7 +809,12 @@ P_m^{\text{charge}} = N_m^{\text{input}} \times P_{\text{unit}}, \quad P_m^{\tex
 \sigma_{\text{week},w} = \sqrt{\frac{1}{n_w-1} \sum_{t \in w} (C_t - \bar{C}_w)^2}, \quad \sigma_{\text{annual}} = \frac{1}{W} \sum_{w=1}^{W} \sigma_{\text{week},w}
 \]
 
-### 10.11 Economic Return
+### 10.11 Aviation Fuel Constraint
+\[
+\forall t: \text{Biooil\_Discharge}(t) \geq 2625.57 \text{ MWh}, \quad N_{\text{BIO\_OIL\_ICE}} \geq 263
+\]
+
+### 10.12 Economic Return
 \[
 R_w = \frac{\text{Revenue}_{\text{spot}} - \text{Cost}_{\text{production}}}{\text{Revenue}_{\text{spot}}} \times 100\%, \quad R_{\text{annual}} = \frac{1}{W} \sum_{w=1}^{W} R_w
 \]

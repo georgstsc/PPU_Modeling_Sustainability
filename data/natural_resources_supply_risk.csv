@@ -1,0 +1,31 @@
+Resource,Category,PPUs_Dependent,Components_Using,Criticality,Primary_Producers,Production_Dataset,Source_URL
+Iron/Steel,Base Metal,"HYD_R,HYD_S,PV,WD_ON,WD_OFF,SOL_SALT,SOL_STEAM,SOL_SALT_STORE,THERM,THERM_M,THERM_CH4,H2_G,H2P_G,H2P_L,NH3_FULL,NH3_P,SYN_METH,SYN_FT,SYN_CRACK,BIO_OIL_ICE,PALM_ICE,BIO_WOOD,IMP_BIOG,CH4_BIO,PHS","Turbines,structures,storage tanks,pipelines,all infrastructure",Low,"China,India,Japan,USA,Russia",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Copper,Base Metal,"HYD_R,HYD_S,PV,WD_ON,WD_OFF,SOL_SALT,SOL_STEAM,THERM,THERM_M,THERM_CH4,H2P_G,H2P_L,BIO_OIL_ICE,PALM_ICE,BIO_WOOD,PHS","Windings,cables,transformers,grid connections,inverters",Medium,"Chile,Peru,China,DRC,USA",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Aluminium,Base Metal,"HYD_R,HYD_S,PV,WD_ON,WD_OFF,SOL_SALT,SOL_STEAM,SOL_SALT_STORE","Grid connections,PV frames,inverters,structures",Low,"China,India,Russia,Canada,UAE",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Silicon,Semiconductor,"PV,WD_ON,WD_OFF","PV cells,power electronics,semiconductors",Medium,"China,Russia,Norway,Brazil,USA",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Silver,Precious Metal,PV,"PV cell contacts,conductive paste",Medium,"Mexico,China,Peru,Chile,Poland",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Lithium,Battery Critical,"PV,WD_ON,WD_OFF",Li-ion battery systems,High,"Australia,Chile,China,Argentina,Brazil",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Cobalt,Battery Critical,"PV,WD_ON,WD_OFF,SYN_FT,SYN_CRACK","Li-ion batteries,FT catalysts,hydroprocessing catalysts",Very High,"DRC,Russia,Australia,Philippines,Cuba",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Nickel,Battery/Catalyst,"PV,WD_ON,WD_OFF,THERM,THERM_CH4,H2P_G,H2P_L,NH3_P,SYN_METH,SYN_FT,SYN_CRACK","Li-ion batteries,superalloys,catalysts",High,"Indonesia,Philippines,Russia,New Caledonia,Australia",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Manganese,Battery Critical,"PV,WD_ON,WD_OFF",Li-ion battery cathodes,Medium,"South Africa,Gabon,Australia,China,Ghana",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Graphite,Battery Critical,"PV,WD_ON,WD_OFF",Li-ion battery anodes,High,"China,Mozambique,Madagascar,Brazil,Russia",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Rare Earth Elements (Nd/Dy),Critical Mineral,"WD_ON,WD_OFF",Permanent magnets (PMSG wind turbines),Very High,"China,USA,Myanmar,Australia,Thailand",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Platinum Group Metals (Pt/Ir),Critical Mineral,"H2_G,BIO_OIL_ICE,PALM_ICE","PEM electrolyser catalysts,ICE aftertreatment",Very High,"South Africa,Russia,Zimbabwe,Canada,USA",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Iridium,Critical Mineral,H2_G,PEM electrolyser anode catalyst,Extreme,"South Africa,Zimbabwe (PGM byproduct)",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Sodium Nitrate,Chemical,"SOL_SALT,SOL_SALT_STORE",Molten salt TES (60% of solar salt),Medium,"Chile,synthetic production globally",USGS MCS,https://docs.nrel.gov/docs/fy15osti/64429.pdf
+Potassium Nitrate,Chemical,"SOL_SALT,SOL_SALT_STORE",Molten salt TES (40% of solar salt),Medium,"Chile,Israel,synthetic production",USGS MCS,https://docs.nrel.gov/docs/fy15osti/64429.pdf
+Natural Gas,Fossil Fuel,THERM,"CCGT fuel,pipeline transport",High (geopolitical),"USA,Russia,Iran,Qatar,China",EI Statistical Review,https://www.energyinst.org/statistical-review
+Methane,Energy Carrier,THERM_CH4,Methane thermal plant fuel,High (geopolitical),"USA,Russia,Iran,Qatar,Canada",EI Statistical Review,https://www.energyinst.org/statistical-review
+Hydrogen,Energy Carrier,"H2P_G,H2P_L",H2-to-power fuel,Low (produced domestically),Produced from electrolysis or reforming,IEA Electrolysers,https://www.iea.org/energy-system/low-emission-fuels/electrolysers
+Ammonia,Chemical Intermediate,"NH3_P",Ammonia cracking feedstock,Medium,"China,Russia,India,USA,Saudi Arabia",FAOSTAT / EI,https://data.un.org/Data.aspx?d=FAO
+Biomass/Wood,Biofuel,"BIO_WOOD,THERM_M",Solid biomass fuel,Low (domestic),"USA,Brazil,EU,China,India",FAOSTAT,https://data.un.org/Data.aspx?d=FAO
+Bio-oil,Biofuel,BIO_OIL_ICE,Liquid biofuel for ICE,Medium,Processed from biomass,FAOSTAT,https://data.un.org/Data.aspx?d=FAO
+Palm Oil,Biofuel,PALM_ICE,Palm oil ICE fuel,Medium (land use),"Indonesia,Malaysia,Thailand,Colombia,Nigeria",FAOSTAT,https://data.un.org/Data.aspx?d=FAO&f=itemCode%3A254
+Biogas,Biofuel,"IMP_BIOG,CH4_BIO",Biogas fuel/feedstock,Low (domestic),Produced from organic waste,FAOSTAT / EI,https://www.energyinst.org/statistical-review
+Glass/Silica,Industrial,"PV,SOL_STEAM,SOL_SALT_STORE","PV modules,mirrors,solar collectors",Low,Widely available globally,USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Titanium,Specialty Metal,H2_G,PEM electrolyser bipolar plates,Medium,"China,Japan,Russia,Kazakhstan,USA",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Chromium,Alloy Metal,"THERM,THERM_CH4,H2P_G,H2P_L",Superalloy component,Medium,"South Africa,Kazakhstan,India,Turkey,Finland",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Molybdenum,Catalyst/Alloy,"SYN_FT,SYN_CRACK",Hydroprocessing catalysts,Medium,"China,Chile,USA,Peru,Mexico",USGS MCS,https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+Water,Utility,"H2_G,SOL_SALT,SOL_STEAM","Electrolysis input,steam cycle working fluid",Low (location dependent),Local supply,N/A,N/A
+Electricity,Energy Input,"H2_G,NH3_FULL,SYN_METH,PHS","Electrolysis,synthesis,storage charging",Low (grid dependent),Local grid,N/A,N/A
+

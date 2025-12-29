@@ -34,7 +34,7 @@ from data_loader import load_all_data, CachedData
 from ppu_framework import load_all_ppu_data, Portfolio
 from portfolio_metrics import calculate_portfolio_metrics_3d, PortfolioMetrics3D
 from risk_calculator import RiskCalculator
-from pareto_frontier import extract_pareto_frontier_from_df
+from pareto_frontier import extract_pareto_frontier_from_df, extract_pareto_frontier_3d_from_df
 
 
 # =============================================================================
@@ -212,13 +212,108 @@ class MultiObjectiveGA:
             # Evaluation failed (e.g., dispatch error)
             return None
     
+    def generate_initial_population(
+        self,
+        pop_size: int = 30,
+        seed: int = 42,
+        verbose: bool = True
+    ) -> List[Tuple[Dict[str, int], PortfolioMetrics3D]]:
+        """
+        Generate and evaluate a diverse initial population.
+        
+        This population can be shared across multiple objective runs to ensure
+        all optimizers start from the same search space.
+        
+        Args:
+            pop_size: Population size
+            seed: Random seed for reproducibility
+            verbose: Print progress
+            
+        Returns:
+            List of (portfolio_counts, metrics) tuples
+        """
+        rng = np.random.default_rng(seed)
+        ppu_order = list(self.config.ppu.PORTFOLIO_BOUNDS.keys())
+        
+        # Identify PPU categories for smart initialization
+        incidence_ppus = set(self.config.ppu.INCIDENCE_PPUS)
+        
+        population = []
+        
+        # --- TYPE 1: Simple portfolios (dominated by 1-2 cheap incidence PPUs) ---
+        n_simple = max(1, pop_size // 4)  # 25%
+        cheap_incidence = ['PV', 'WD_ON', 'WD_OFF', 'HYD_R']
+        
+        for i in range(n_simple):
+            counts = {ppu: 0 for ppu in ppu_order}
+            n_ppus = rng.integers(1, 3)
+            selected_ppus = rng.choice(cheap_incidence, size=min(n_ppus, len(cheap_incidence)), replace=False)
+            
+            for ppu_name in selected_ppus:
+                if ppu_name in ppu_order:
+                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                    counts[ppu_name] = int(rng.integers(max_val // 2, max_val + 1))
+            
+            for ppu_name in ['HYD_S', 'PHS']:
+                if ppu_name in ppu_order:
+                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                    counts[ppu_name] = int(rng.integers(0, max(1, max_val // 4)))
+            
+            population.append(counts)
+        
+        # --- TYPE 2: Moderate complexity portfolios (3-5 PPU types) ---
+        n_moderate = max(1, pop_size // 4)  # 25%
+        
+        for i in range(n_moderate):
+            counts = {ppu: 0 for ppu in ppu_order}
+            n_ppus = rng.integers(3, 6)
+            selected_ppus = rng.choice(list(incidence_ppus), size=min(n_ppus, len(incidence_ppus)), replace=False)
+            
+            for ppu_name in selected_ppus:
+                if ppu_name in ppu_order:
+                    min_val, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                    counts[ppu_name] = int(rng.integers(min_val, max_val + 1))
+            
+            storage_support = ['HYD_S', 'PHS', 'H2P_G']
+            for ppu_name in storage_support:
+                if ppu_name in ppu_order and rng.random() < 0.5:
+                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                    counts[ppu_name] = int(rng.integers(0, max(1, max_val // 3)))
+            
+            population.append(counts)
+        
+        # --- TYPE 3: Full random portfolios ---
+        n_random = pop_size - len(population)
+        
+        for _ in range(n_random):
+            counts = {}
+            for ppu_name in ppu_order:
+                min_val, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                counts[ppu_name] = int(rng.integers(min_val, max_val + 1))
+            population.append(counts)
+        
+        # Evaluate all portfolios
+        evaluated = []
+        if verbose:
+            print("Generating shared initial population...")
+        for counts in tqdm(population, desc="Evaluating initial population", disable=not verbose):
+            metrics = self.evaluate_portfolio_with_metrics(counts)
+            if metrics is not None:
+                evaluated.append((counts.copy(), metrics))
+        
+        if verbose:
+            print(f"Valid portfolios in initial population: {len(evaluated)}/{len(population)}")
+        
+        return evaluated
+
     def run_single_objective_ga(
         self,
         objective: ObjectiveConfig,
         n_generations: int = 20,
         pop_size: int = 30,
         seed: int = 42,
-        verbose: bool = True
+        verbose: bool = True,
+        initial_population: Optional[List[Tuple[Dict[str, int], PortfolioMetrics3D]]] = None
     ) -> List[Tuple[Dict[str, int], PortfolioMetrics3D]]:
         """
         Run GA with a specific objective function.
@@ -229,8 +324,10 @@ class MultiObjectiveGA:
             objective: Objective configuration
             n_generations: Number of generations
             pop_size: Population size
-            seed: Random seed
+            seed: Random seed for evolution (selection, mutation)
             verbose: Print progress
+            initial_population: Optional pre-evaluated population to start from.
+                               If provided, skips initial population generation.
             
         Returns:
             List of (portfolio_counts, metrics) tuples for all evaluated portfolios
@@ -244,83 +341,82 @@ class MultiObjectiveGA:
         rng = np.random.default_rng(seed)
         ppu_order = list(self.config.ppu.PORTFOLIO_BOUNDS.keys())
         
-        # Identify PPU categories for smart initialization
-        incidence_ppus = set(self.config.ppu.INCIDENCE_PPUS)  # PV, Wind, Hydro, etc.
-        flex_ppus = set(self.config.ppu.FLEX_PPUS)  # Dispatchable
-        storage_ppus = set(self.config.ppu.STORAGE_PPUS) if hasattr(self.config.ppu, 'STORAGE_PPUS') else set()
-        
         evaluated_portfolios = []
         
-        # Initialize population with DIVERSE portfolio types
-        # This is critical for finding good solutions across all objectives
-        population = []
-        
-        # --- TYPE 1: Simple portfolios (dominated by 1-2 cheap incidence PPUs) ---
-        # These tend to have low RoT, low volatility, AND good returns
-        n_simple = max(1, pop_size // 4)  # 25% of population
-        cheap_incidence = ['PV', 'WD_ON', 'WD_OFF', 'HYD_R']  # Typically cheapest PPUs
-        
-        for i in range(n_simple):
-            counts = {ppu: 0 for ppu in ppu_order}
-            # Pick 1-2 cheap PPUs and max them out
-            n_ppus = rng.integers(1, 3)  # 1 or 2 PPUs
-            selected_ppus = rng.choice(cheap_incidence, size=min(n_ppus, len(cheap_incidence)), replace=False)
+        # Use provided initial population or generate new one
+        if initial_population is not None:
+            # Use shared initial population - this ensures all objectives
+            # start from the same search space
+            pop_with_metrics = [(counts.copy(), metrics) for counts, metrics in initial_population]
+            evaluated_portfolios.extend([(counts.copy(), metrics) for counts, metrics in initial_population])
             
-            for ppu_name in selected_ppus:
-                if ppu_name in ppu_order:
-                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
-                    # Use high counts to meet sovereignty
-                    counts[ppu_name] = int(rng.integers(max_val // 2, max_val + 1))
+            if verbose:
+                print(f"Using shared initial population ({len(pop_with_metrics)} portfolios)")
+        else:
+            # Generate new population (legacy behavior)
+            incidence_ppus = set(self.config.ppu.INCIDENCE_PPUS)
             
-            # Add minimal storage support if needed
-            for ppu_name in ['HYD_S', 'PHS']:
-                if ppu_name in ppu_order:
-                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
-                    counts[ppu_name] = int(rng.integers(0, max(1, max_val // 4)))
+            population = []
             
-            population.append(counts)
-        
-        # --- TYPE 2: Moderate complexity portfolios (3-5 PPU types) ---
-        n_moderate = max(1, pop_size // 4)  # 25% of population
-        
-        for i in range(n_moderate):
-            counts = {ppu: 0 for ppu in ppu_order}
-            # Select 3-5 PPU types
-            n_ppus = rng.integers(3, 6)
-            selected_ppus = rng.choice(list(incidence_ppus), size=min(n_ppus, len(incidence_ppus)), replace=False)
+            # --- TYPE 1: Simple portfolios ---
+            n_simple = max(1, pop_size // 4)
+            cheap_incidence = ['PV', 'WD_ON', 'WD_OFF', 'HYD_R']
             
-            for ppu_name in selected_ppus:
-                if ppu_name in ppu_order:
+            for i in range(n_simple):
+                counts = {ppu: 0 for ppu in ppu_order}
+                n_ppus = rng.integers(1, 3)
+                selected_ppus = rng.choice(cheap_incidence, size=min(n_ppus, len(cheap_incidence)), replace=False)
+                
+                for ppu_name in selected_ppus:
+                    if ppu_name in ppu_order:
+                        _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                        counts[ppu_name] = int(rng.integers(max_val // 2, max_val + 1))
+                
+                for ppu_name in ['HYD_S', 'PHS']:
+                    if ppu_name in ppu_order:
+                        _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                        counts[ppu_name] = int(rng.integers(0, max(1, max_val // 4)))
+                
+                population.append(counts)
+            
+            # --- TYPE 2: Moderate complexity portfolios ---
+            n_moderate = max(1, pop_size // 4)
+            
+            for i in range(n_moderate):
+                counts = {ppu: 0 for ppu in ppu_order}
+                n_ppus = rng.integers(3, 6)
+                selected_ppus = rng.choice(list(incidence_ppus), size=min(n_ppus, len(incidence_ppus)), replace=False)
+                
+                for ppu_name in selected_ppus:
+                    if ppu_name in ppu_order:
+                        min_val, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                        counts[ppu_name] = int(rng.integers(min_val, max_val + 1))
+                
+                storage_support = ['HYD_S', 'PHS', 'H2P_G']
+                for ppu_name in storage_support:
+                    if ppu_name in ppu_order and rng.random() < 0.5:
+                        _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
+                        counts[ppu_name] = int(rng.integers(0, max(1, max_val // 3)))
+                
+                population.append(counts)
+            
+            # --- TYPE 3: Full random portfolios ---
+            n_random = pop_size - len(population)
+            
+            for _ in range(n_random):
+                counts = {}
+                for ppu_name in ppu_order:
                     min_val, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
                     counts[ppu_name] = int(rng.integers(min_val, max_val + 1))
+                population.append(counts)
             
-            # Add some storage support
-            storage_support = ['HYD_S', 'PHS', 'H2P_G']
-            for ppu_name in storage_support:
-                if ppu_name in ppu_order and rng.random() < 0.5:
-                    _, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
-                    counts[ppu_name] = int(rng.integers(0, max(1, max_val // 3)))
-            
-            population.append(counts)
-        
-        # --- TYPE 3: Full random portfolios (original approach) ---
-        # For diversity and exploration
-        n_random = pop_size - len(population)
-        
-        for _ in range(n_random):
-            counts = {}
-            for ppu_name in ppu_order:
-                min_val, max_val = self.config.ppu.PORTFOLIO_BOUNDS[ppu_name]
-                counts[ppu_name] = int(rng.integers(min_val, max_val + 1))
-            population.append(counts)
-        
-        # Evaluate initial population
-        pop_with_metrics = []
-        for counts in tqdm(population, desc="Initial population", disable=not verbose):
-            metrics = self.evaluate_portfolio_with_metrics(counts)
-            if metrics is not None:
-                pop_with_metrics.append((counts, metrics))
-                evaluated_portfolios.append((counts.copy(), metrics))
+            # Evaluate initial population
+            pop_with_metrics = []
+            for counts in tqdm(population, desc="Initial population", disable=not verbose):
+                metrics = self.evaluate_portfolio_with_metrics(counts)
+                if metrics is not None:
+                    pop_with_metrics.append((counts, metrics))
+                    evaluated_portfolios.append((counts.copy(), metrics))
         
         # Evolution loop
         for gen in range(n_generations):
@@ -406,7 +502,9 @@ class MultiObjectiveGA:
         n_generations: int = 15,
         pop_size: int = 25,
         seeds: Optional[List[int]] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        share_initial_population: bool = True,
+        initial_portfolios: Optional[List['Portfolio']] = None
     ) -> pd.DataFrame:
         """
         Explore portfolio space with multiple objectives.
@@ -415,8 +513,14 @@ class MultiObjectiveGA:
             objectives: List of objective configurations (default: all predefined)
             n_generations: Generations per objective
             pop_size: Population size
-            seeds: Seeds for each objective run
+            seeds: Seeds for each objective run (used for evolution, not initialization)
             verbose: Print progress
+            share_initial_population: If True, all objectives start from the same
+                                     initial population. This ensures consistent 
+                                     comparison across objectives.
+            initial_portfolios: Optional list of Portfolio objects to seed the
+                               initial population. If provided, these are evaluated
+                               and added to the initial population.
             
         Returns:
             DataFrame with all evaluated portfolios and their metrics
@@ -436,9 +540,49 @@ class MultiObjectiveGA:
             print(f"Objectives: {len(objectives)}")
             print(f"Generations per objective: {n_generations}")
             print(f"Population size: {pop_size}")
+            print(f"Shared initial population: {share_initial_population}")
+            if initial_portfolios:
+                print(f"Seed portfolios provided: {len(initial_portfolios)}")
             print()
         
         all_evaluated = []
+        
+        # Generate shared initial population if requested
+        shared_population = None
+        if share_initial_population:
+            # Start with seed portfolios if provided
+            if initial_portfolios:
+                if verbose:
+                    print(f"Evaluating {len(initial_portfolios)} seed portfolios...")
+                seed_evaluated = []
+                for portfolio in tqdm(initial_portfolios, desc="Evaluating seeds", disable=not verbose):
+                    metrics = self.evaluate_portfolio_with_metrics(portfolio.ppu_counts)
+                    if metrics is not None:
+                        seed_evaluated.append((portfolio.ppu_counts.copy(), metrics))
+                
+                if verbose:
+                    print(f"Valid seed portfolios: {len(seed_evaluated)}/{len(initial_portfolios)}")
+                
+                # Generate additional portfolios to reach pop_size
+                additional_needed = max(0, pop_size - len(seed_evaluated))
+                if additional_needed > 0 and verbose:
+                    print(f"Generating {additional_needed} additional portfolios...")
+                
+                additional = self.generate_initial_population(
+                    pop_size=additional_needed,
+                    seed=42,
+                    verbose=verbose
+                ) if additional_needed > 0 else []
+                
+                shared_population = seed_evaluated + additional
+            else:
+                shared_population = self.generate_initial_population(
+                    pop_size=pop_size,
+                    seed=42,  # Fixed seed for reproducibility
+                    verbose=verbose
+                )
+            if verbose:
+                print()
         
         for obj_idx, objective in enumerate(objectives):
             seed = seeds[obj_idx] if obj_idx < len(seeds) else 42 + obj_idx
@@ -448,7 +592,8 @@ class MultiObjectiveGA:
                 n_generations=n_generations,
                 pop_size=pop_size,
                 seed=seed,
-                verbose=verbose
+                verbose=verbose,
+                initial_population=shared_population
             )
             
             all_evaluated.extend(evaluated)
@@ -507,10 +652,14 @@ def explore_and_find_frontier(
     n_generations: int = 15,
     pop_size: int = 25,
     output_path: str = "data/result_plots/multi_objective_results.csv",
-    verbose: bool = True
+    verbose: bool = True,
+    use_existing_as_seeds: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Complete workflow: explore with multiple objectives and find Pareto frontier.
+    
+    If use_existing_as_seeds=True and output_path exists, loads existing results
+    and uses them as seeds for continued exploration.
     
     Args:
         config: Configuration
@@ -519,18 +668,90 @@ def explore_and_find_frontier(
         pop_size: Population size
         output_path: Output CSV path
         verbose: Print progress
+        use_existing_as_seeds: If True and output_path exists, use existing
+                              portfolios as seeds for continuation
         
     Returns:
         Tuple of (all_results_df, pareto_frontier_df)
     """
+    import os
+    
+    # Check if we should continue from existing results
+    seed_portfolios = None
+    existing_df = None
+    
+    if use_existing_as_seeds and os.path.exists(output_path):
+        if verbose:
+            print("="*60)
+            print("CONTINUING FROM EXISTING RESULTS")
+            print("="*60)
+            print(f"Loading existing results from: {output_path}")
+        
+        existing_df = pd.read_csv(output_path)
+        
+        if verbose:
+            print(f"Found {len(existing_df)} existing portfolios")
+        
+        # Select seed portfolios: frontier + top performers
+        # 1. 2D Frontier portfolios
+        existing_frontier = extract_pareto_frontier_from_df(
+            existing_df, x_col='x_RoT', y_col='y_volatility',
+            minimize_x=True, minimize_y=True
+        )
+        
+        # 2. Top portfolios by return
+        top_return = existing_df.nlargest(5, 'z_return')
+        
+        # 3. Top portfolios by low RoT
+        top_rot = existing_df.nsmallest(5, 'x_RoT')
+        
+        # 4. Top portfolios by low volatility
+        top_vol = existing_df.nsmallest(5, 'y_volatility')
+        
+        # Combine and deduplicate
+        seed_df = pd.concat([existing_frontier, top_return, top_rot, top_vol]).drop_duplicates(subset=['portfolio_dict'])
+        
+        # Limit to reasonable number
+        n_seeds = min(20, len(seed_df), pop_size)
+        seed_df = seed_df.head(n_seeds)
+        
+        # Convert to Portfolio objects
+        seed_portfolios = []
+        for _, row in seed_df.iterrows():
+            pf_str = row['portfolio_dict']
+            if isinstance(pf_str, str):
+                pf_dict = json.loads(pf_str)
+            else:
+                pf_dict = pf_str
+            seed_portfolios.append(Portfolio(pf_dict))
+        
+        if verbose:
+            print(f"Selected {len(seed_portfolios)} seed portfolios:")
+            print(f"  - {len(existing_frontier)} from 2D frontier")
+            print(f"  - Top 5 by return, RoT, and volatility")
+            print()
+    
     # Run multi-objective exploration
     explorer = MultiObjectiveGA(config)
-    all_df = explorer.explore_multi_objective(
+    new_df = explorer.explore_multi_objective(
         objectives=objectives,
         n_generations=n_generations,
         pop_size=pop_size,
-        verbose=verbose
+        verbose=verbose,
+        initial_portfolios=seed_portfolios  # Use seeds if available
     )
+    
+    # Combine with existing if we had seeds
+    if existing_df is not None:
+        all_df = pd.concat([existing_df, new_df], ignore_index=True)
+        # Remove duplicates
+        all_df = all_df.drop_duplicates(subset=['portfolio_dict'], keep='last')
+        if verbose:
+            print(f"Combined results: {len(all_df)} unique portfolios")
+            print(f"  - Existing: {len(existing_df)}")
+            print(f"  - New: {len(new_df)}")
+    else:
+        all_df = new_df
     
     # Save all results
     all_df.to_csv(output_path, index=False)
@@ -562,6 +783,187 @@ def explore_and_find_frontier(
         print(f"  Volatility: [{pareto_df['y_volatility'].min():.2f}, {pareto_df['y_volatility'].max():.2f}]")
     
     return all_df, pareto_df
+
+
+def continue_exploration_3d_frontier(
+    config: Config = DEFAULT_CONFIG,
+    existing_results_path: str = "data/result_plots/multi_objective_results.csv",
+    objectives: Optional[List[ObjectiveConfig]] = None,
+    n_generations: int = 10,
+    pop_size: int = 20,
+    n_seed_portfolios: int = 20,
+    output_path: str = "data/result_plots/multi_objective_results_3d.csv",
+    verbose: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Continue exploration from existing results and compute 3D Pareto frontier.
+    
+    Uses the best portfolios from existing results as seeds for further exploration.
+    Then computes the 3D Pareto frontier (RoT, Volatility, Return).
+    
+    Args:
+        config: Configuration
+        existing_results_path: Path to existing results CSV
+        objectives: Objective configurations (default: all predefined)
+        n_generations: Generations per objective
+        pop_size: Population size
+        n_seed_portfolios: Number of top portfolios to seed from existing results
+        output_path: Output CSV path
+        verbose: Print progress
+        
+    Returns:
+        Tuple of (all_results_df, pareto_frontier_3d_df)
+    """
+    import os
+    
+    if verbose:
+        print("="*80)
+        print("3D PARETO FRONTIER EXPLORATION (Continuation)")
+        print("="*80)
+        print()
+    
+    # Load existing results
+    if not os.path.exists(existing_results_path):
+        raise FileNotFoundError(
+            f"ERROR: Existing results not found: {existing_results_path}\n"
+            f"Please run the initial multi-objective exploration first."
+        )
+    
+    existing_df = pd.read_csv(existing_results_path)
+    if verbose:
+        print(f"Loaded {len(existing_df)} existing portfolios from: {existing_results_path}")
+    
+    # Select seed portfolios from existing results
+    # Strategy: use frontier + top portfolios by various criteria
+    seed_portfolios = []
+    
+    # 1. Existing 2D frontier portfolios (minimize RoT, minimize Volatility)
+    existing_frontier = extract_pareto_frontier_from_df(
+        existing_df, x_col='x_RoT', y_col='y_volatility',
+        minimize_x=True, minimize_y=True
+    )
+    frontier_dicts = existing_frontier['portfolio_dict'].tolist()
+    for pf_str in frontier_dicts:
+        if isinstance(pf_str, str):
+            pf_dict = json.loads(pf_str)
+        else:
+            pf_dict = pf_str
+        seed_portfolios.append(Portfolio(pf_dict))
+    
+    if verbose:
+        print(f"  - {len(frontier_dicts)} frontier portfolios")
+    
+    # 2. Top portfolios by return (highest return)
+    top_return = existing_df.nlargest(5, 'z_return')['portfolio_dict'].tolist()
+    for pf_str in top_return:
+        if isinstance(pf_str, str):
+            pf_dict = json.loads(pf_str)
+        else:
+            pf_dict = pf_str
+        if pf_dict not in [p.ppu_counts for p in seed_portfolios]:
+            seed_portfolios.append(Portfolio(pf_dict))
+    
+    if verbose:
+        print(f"  - Added top 5 by return")
+    
+    # 3. Top portfolios by low RoT
+    top_rot = existing_df.nsmallest(5, 'x_RoT')['portfolio_dict'].tolist()
+    for pf_str in top_rot:
+        if isinstance(pf_str, str):
+            pf_dict = json.loads(pf_str)
+        else:
+            pf_dict = pf_str
+        if pf_dict not in [p.ppu_counts for p in seed_portfolios]:
+            seed_portfolios.append(Portfolio(pf_dict))
+    
+    if verbose:
+        print(f"  - Added top 5 by low RoT")
+    
+    # 4. Top portfolios by low volatility
+    top_vol = existing_df.nsmallest(5, 'y_volatility')['portfolio_dict'].tolist()
+    for pf_str in top_vol:
+        if isinstance(pf_str, str):
+            pf_dict = json.loads(pf_str)
+        else:
+            pf_dict = pf_str
+        if pf_dict not in [p.ppu_counts for p in seed_portfolios]:
+            seed_portfolios.append(Portfolio(pf_dict))
+    
+    if verbose:
+        print(f"  - Added top 5 by low volatility")
+        print(f"  Total seed portfolios: {len(seed_portfolios)}")
+        print()
+    
+    # Limit to n_seed_portfolios
+    if len(seed_portfolios) > n_seed_portfolios:
+        seed_portfolios = seed_portfolios[:n_seed_portfolios]
+        if verbose:
+            print(f"  Limited to {n_seed_portfolios} seed portfolios")
+    
+    # Run multi-objective exploration with seeds
+    if verbose:
+        print()
+        print("Running continued exploration...")
+        print("="*60)
+    
+    explorer = MultiObjectiveGA(config)
+    
+    # Override initial population generation to use seeds
+    new_df = explorer.explore_multi_objective(
+        objectives=objectives,
+        n_generations=n_generations,
+        pop_size=pop_size,
+        verbose=verbose,
+        initial_portfolios=seed_portfolios  # Pass seeds
+    )
+    
+    # Combine existing and new results
+    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    
+    # Remove duplicates by portfolio_dict
+    combined_df = combined_df.drop_duplicates(subset=['portfolio_dict'], keep='last')
+    
+    if verbose:
+        print()
+        print(f"Combined results: {len(combined_df)} unique portfolios")
+        print(f"  - Existing: {len(existing_df)}")
+        print(f"  - New: {len(new_df)}")
+    
+    # Save combined results
+    combined_df.to_csv(output_path, index=False)
+    if verbose:
+        print(f"\nAll results saved to: {output_path}")
+    
+    # Find 3D Pareto frontier
+    # Minimize RoT, Minimize Volatility, MAXIMIZE Return
+    pareto_3d_df = extract_pareto_frontier_3d_from_df(
+        combined_df,
+        x_col='x_RoT',
+        y_col='y_volatility',
+        z_col='z_return',
+        minimize_x=True,
+        minimize_y=True,
+        minimize_z=False  # MAXIMIZE return
+    )
+    
+    # Save 3D frontier
+    frontier_path = output_path.replace('.csv', '_frontier_3d.csv')
+    pareto_3d_df.to_csv(frontier_path, index=False)
+    
+    if verbose:
+        print()
+        print("="*60)
+        print("3D PARETO FRONTIER")
+        print("="*60)
+        print(f"3D Frontier portfolios: {len(pareto_3d_df)} out of {len(combined_df)}")
+        print(f"Frontier saved to: {frontier_path}")
+        print()
+        print("3D Frontier ranges:")
+        print(f"  RoT: [{pareto_3d_df['x_RoT'].min():.4f}, {pareto_3d_df['x_RoT'].max():.4f}]")
+        print(f"  Volatility: [{pareto_3d_df['y_volatility'].min():.2f}, {pareto_3d_df['y_volatility'].max():.2f}]")
+        print(f"  Return: [{pareto_3d_df['z_return'].min():.2f}%, {pareto_3d_df['z_return'].max():.2f}%]")
+    
+    return combined_df, pareto_3d_df
 
 
 if __name__ == "__main__":

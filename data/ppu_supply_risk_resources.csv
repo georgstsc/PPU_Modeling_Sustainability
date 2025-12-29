@@ -1,0 +1,43 @@
+PPU,Component,Primary_Resources_Manufacturing,Primary_Resources_Operation,Technology_Source,Production_Dataset_Source,Source_URL
+HYD_R,Hydro turbine-generator,"Iron/steel (iron ore), copper (windings), alloying metals",None (driven by water),IEA Clean Energy Transitions,USGS MCS (Fe/Cu/alloys),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+HYD_R,Grid connection (cables/transformers/switchgear),"Copper, aluminium, electrical steel/silicon steel",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+HYD_S,Hydro turbine-generator,"Iron/steel, copper, alloying metals",None,IEA Clean Energy Transitions,USGS MCS (Fe/Cu/alloys),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+HYD_S,Grid connection,"Copper, aluminium, steels",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+PV,PV module (c-Si typical),"Silicon, silver, aluminium, copper, glass/silica, polymers",None,NREL PV Materials,USGS MCS (Si/Ag/Al/Cu),https://docs.nrel.gov/docs/fy22osti/80440.pdf
+PV,Inverter / power electronics,"Copper, aluminium, silicon (semiconductors), steels",None,IEA Grids/Electrification,USGS MCS (Cu/Al/Si/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+PV,Li-ion battery system,"Lithium, nickel, cobalt, manganese, graphite, aluminium, copper",None,IEA Battery Minerals,USGS MCS (Li/Ni/Co/Mn/graphite),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+PV,Grid connection,"Copper, aluminium, steels",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+WD_ON,Wind turbine (generator + structure),"Steels/iron, copper, composites (glass fibre/carbon fibre), rare earths (Nd/Dy) if PMSG",None,NREL Wind Materials + IEA REEs,USGS MCS (Fe/Cu/REEs),https://docs.nrel.gov/docs/fy23osti/81483.pdf
+WD_ON,Inverter / power electronics,"Copper, aluminium, silicon (semiconductors), steels",None,IEA Grids/Electrification,USGS MCS (Cu/Al/Si/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+WD_ON,Li-ion battery system,"Lithium, nickel, cobalt, manganese, graphite, aluminium, copper",None,IEA Battery Minerals,USGS MCS (Li/Ni/Co/Mn/graphite),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+WD_ON,Grid connection,"Copper, aluminium, steels",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+WD_OFF,Wind turbine (generator + structure),"Steels/iron (more than onshore), copper, composites, rare earths (Nd/Dy) if PMSG",None,NREL Wind Materials + IEA REEs,USGS MCS (Fe/Cu/REEs),https://docs.nrel.gov/docs/fy23osti/81483.pdf
+WD_OFF,Subsea export cable / grid connection,"Copper or aluminium conductors, steel armouring, polymers",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+WD_OFF,Li-ion battery system,"Lithium, nickel, cobalt, manganese, graphite, aluminium, copper",None,IEA Battery Minerals,USGS MCS (Li/Ni/Co/Mn/graphite),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_SALT,Molten-salt TES medium,"Sodium nitrate (60%), potassium nitrate (40%)",None (storage medium),NREL Molten-Salt CSP,USGS MCS (sodium/potash/nitrates),https://docs.nrel.gov/docs/fy15osti/64429.pdf
+SOL_SALT,Steam-cycle power block (steam turbine/generator),"Steels/iron, copper",Water/steam (working fluid),IEA Electricity Minerals,USGS MCS (Fe/Cu),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_SALT,Grid connection,"Copper, aluminium, steels",None,IEA Grids,USGS MCS (Cu/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_STEAM,Solar field (mirrors/structure),"Glass/silica, aluminium, steels",None,IEA Electricity Materials,USGS MCS (Si/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_STEAM,Steam-cycle power block,"Steels/iron, copper",Water/steam,IEA Electricity Minerals,USGS MCS (Fe/Cu),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_SALT_STORE,Solar thermal collector,"Glass/silica, aluminium, steels, selective coatings",None,IEA Electricity Materials,USGS MCS (Si/Al/Fe),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+SOL_SALT_STORE,Molten-salt storage tank,"Steels/alloys, insulation materials",Molten salt (NaNO3/KNO3),NREL Molten-Salt CSP,USGS MCS (Fe/alloys),https://docs.nrel.gov/docs/fy15osti/64429.pdf
+THERM,Combined-cycle gas turbine (CCGT),"Nickel-based superalloys (Ni/Co/Cr), steels, copper",Natural gas (methane),DMS Gas Turbine Materials,EI Statistical Review (gas),https://www.energyinst.org/statistical-review
+THERM,Fuel transport/storage (pipeline/LNG),"Steels, alloy steels, polymers/coatings",Natural gas throughput,EI Energy System,EI Statistical Review,https://www.energyinst.org/statistical-review
+THERM_M,Biomass thermal plant,"Steels/iron, copper, refractory materials",Biomass fuel,IEA Electricity Minerals,FAOSTAT (biomass) + USGS MCS,https://data.un.org/Data.aspx?d=FAO
+THERM_CH4,Methane thermal plant,"Nickel-based superalloys, steels, copper",Methane fuel,DMS Gas Turbine Materials,EI Statistical Review (methane),https://www.energyinst.org/statistical-review
+H2_G,Electrolyser system (PEM),"Platinum-group metals (Ir/Pt), steels, titanium",Water + electricity,IRENA Green H2 Cost,USGS MCS (PGMs/Ir/Pt),https://www.irena.org/-/media/Files/IRENA/Agency/Publication/2020/Dec/IRENA_Green_hydrogen_cost_2020.pdf
+H2_G,H2 compression + storage,"Steels/alloys, composite materials",Hydrogen (stored),IEA Electrolysers,USGS MCS (Fe/alloys),https://www.iea.org/energy-system/low-emission-fuels/electrolysers
+H2P_G,H2-to-power CCGT,"Nickel-base superalloys, steels, copper",Hydrogen fuel,DMS Gas Turbine Materials,EI + USGS (turbine alloys),https://d-m-s.dk/wp-content/uploads/2024/08/17-VM-2008-K.-V.-Dahl-Materialer-til-Gasturbiner.pdf
+H2P_L,H2-to-power CCGT (liquid H2),"Nickel-base superalloys, steels, copper, cryogenic materials",Liquid hydrogen fuel,DMS Gas Turbine Materials,EI + USGS (turbine alloys),https://d-m-s.dk/wp-content/uploads/2024/08/17-VM-2008-K.-V.-Dahl-Materialer-til-Gasturbiner.pdf
+NH3_FULL,Ammonia synthesis (Haber-Bosch),"Steels/alloys, iron-based catalysts",Hydrogen + nitrogen + electricity,IEA Critical Minerals,EI (gas for H2) + USGS (catalysts),https://www.iea.org/reports/the-role-of-critical-minerals-in-clean-energy-transitions
+NH3_P,Ammonia cracking (to H2),"Steels/alloys, nickel-based catalysts",Ammonia feedstock,IEA Critical Minerals,FAOSTAT / EI / USGS,https://www.iea.org/reports/the-role-of-critical-minerals-in-clean-energy-transitions
+SYN_METH,Methanation (Sabatier) + DAC,"Steels, nickel catalysts, DAC sorbents/chemicals",CO2 (from air) + H2 + electricity,IEA Critical Minerals,USGS MCS (Ni/metals),https://www.iea.org/reports/the-role-of-critical-minerals-in-clean-energy-transitions
+SYN_FT,Fischer-Tropsch synthesis,"Steels/alloys, cobalt or iron catalysts",H2 + carbon feed (CO/CO2) + energy,IEA Critical Minerals,USGS MCS (Co/Fe/Ni/Mo),https://www.iea.org/reports/the-role-of-critical-minerals-in-clean-energy-transitions
+SYN_CRACK,Hydrocracking / refining,"Steels/alloys, Ni/Co/Mo hydroprocessing catalysts",H2 + carbon feed + energy,IEA Critical Minerals,USGS MCS (Ni/Co/Mo),https://www.iea.org/reports/the-role-of-critical-minerals-in-clean-energy-transitions
+BIO_OIL_ICE,ICE generator (bio-oil),"Steels, copper, PGMs (aftertreatment catalysts)",Bio-oil fuel,PGMs in Catalysts Review,FAOSTAT (biomass) + EI,https://www.sciencedirect.com/science/article/pii/S2405844024013148
+PALM_ICE,ICE generator (palm oil),"Steels, copper, PGMs (aftertreatment catalysts)",Palm oil fuel,PGMs in Catalysts Review,FAOSTAT (palm oil),https://data.un.org/Data.aspx?d=FAO&f=itemCode%3A254
+BIO_WOOD,Biomass gasification plant,"Steels/iron, refractory materials, copper",Wood/biomass fuel,IEA Biomass,FAOSTAT (forestry),https://data.un.org/Data.aspx?d=FAO
+IMP_BIOG,Biogas upgrading + ICE/turbine,"Steels, copper, membrane/adsorbent materials",Biogas (imported),IEA Biogas,FAOSTAT + EI,https://www.energyinst.org/statistical-review
+CH4_BIO,Biogas-to-methane upgrading,"Steels/alloys, membrane or PSA materials",Biogas feedstock,IEA Critical Minerals,FAOSTAT (biomass),https://data.un.org/Data.aspx?d=FAO
+PHS,Pump-turbine + motor-generator,"Steels/iron, copper, electrical steels",Electricity (charging),IEA Electricity Minerals,USGS MCS (Fe/Cu),https://pubs.usgs.gov/periodicals/mcs2025/mcs2025.pdf
+

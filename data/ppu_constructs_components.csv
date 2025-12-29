@@ -10,12 +10,10 @@ H2P_L,"['Liquid storage', 'Hydrogen Transport', 'Combined cycle power plant', 'G
 SOL_SALT,"['Solar concentrator salt', 'Steam generator', 'Combined cycle power plant', 'Grid']",Production,Flex
 SOL_STEAM,"['Solar concentrator steam', 'Combined cycle power plant', 'Grid']",Production,Flex
 BIO_OIL_ICE,"['Biooil', 'Refining', 'Fuel Tank', 'ICE', 'Grid']",Production,Flex
-PALM_ICE,"['Palm oil', 'Pyrolysis', 'Biooil', 'Cracking', 'Refining', 'ICE']",Production,Flex
+PALM_ICE,"['Palm oil', 'Cracking', 'Biooil', 'Refining', 'ICE', 'Grid']",Production,Flex
 BIO_WOOD,"['Wood', 'Pyrolysis', 'Biooil', 'Steam reforming', 'Combined cycle power plant', 'Grid']",Production,Flex
 IMP_BIOG,"['Biogas (50% CH4)', 'Pipeline', 'Biogas purification', 'Combined cycle power plant', 'Grid']",Production,Flex
 NH3_P,"['Ammonia cracking', 'H2 Storage UG 200bar', 'Hydrogen Transport', 'Combined cycle power plant', 'Grid']",Production,Flex
-THERM_G,"['Biogas', 'Combined cycle power plant', 'Grid']",Production,Flex
-THERM_M,"['Biomass', 'Combined cycle power plant', 'Grid']",Production,Flex
 THERM_CH4,"['CH4 storage 200bar', 'Methane compression', 'Methane transport', 'Combined cycle power plant', 'Grid']",Production,Flex
 H2_G,"['Electrolyzer', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage,Store
 H2_GL,"['Electrolyzer', 'Liquifaction', 'Ship transport', 'Liquid storage', 'Liquid to gas', 'Compressor 30-200bar', 'H2 Storage UG 200bar']",Storage,Store
@@ -27,6 +25,3 @@ SYN_CRACK,"['Electrolyzer', 'Palm oil', 'H2, CO2 compression', 'Cracking', 'Refi
 CH4_BIO,"['Electrolyzer', 'Biogas purification', 'Sabatier reaction', 'Methane compression', 'Biogas (50% CH4)']",Storage,Store
 PHS,"['Hydro pump', 'Lake']",Storage,Store
 SOL_SALT_STORE,['Solar concentrator salt'],Storage,Store
-BIO_OIL_FROM_WOOD,"['Wood', 'Pyrolysis', 'Biooil']",Storage,Store
-BIO_OIL_FROM_PALM,"['Palm oil', 'Pyrolysis', 'Biooil']",Storage,Store
-PALM_STORE_IMPORT,"['Palm oil', 'Fuel Transport']",Storage,Store

@@ -245,16 +245,18 @@ def calculate_renewable_production_fast(
     if len(precomputed.river_indices) > 0:
         # Use monthly ror_production scaled by unit count
         # ror_production_monthly is total MWh for the month for the WHOLE country
-        # We assume HYD_R units represent a share of this
+        # Swiss total run-of-river capacity: ~3.4 GW = 340 units (at 10 MW/unit)
+        # Reference: Swiss hydro stats show ~17 TWh/year from run-of-river
         n_units = len(precomputed.river_indices)
-        # Placeholder: assume each unit contributes its share of the monthly production
-        # Total annual HYD_R is ~17 TWh. 1 unit = 10 MW.
+        
         # Monthly production / (days * 24) = average MW for the month
         monthly_mwh = precomputed.ror_production_monthly[month_idx]
-        hourly_mw_total = monthly_mwh / (30 * 24) # Approx average MW
+        hourly_mw_total = monthly_mwh / (30 * 24)  # Average MW for Swiss total
         
-        # Scale by number of units (assuming units are standardized)
-        river_mw = hourly_mw_total * (n_units / 100.0) # Scaling factor depends on data normalization
+        # Scale by fraction of Swiss total capacity (340 units = ~3.4 GW total)
+        # Each unit represents 10 MW of the total Swiss run-of-river capacity
+        SWISS_TOTAL_HYD_R_UNITS = 340.0  # ~3.4 GW national capacity
+        river_mw = hourly_mw_total * (n_units / SWISS_TOTAL_HYD_R_UNITS)
         total_mw += river_mw
         breakdown['HYD_R'] = river_mw
     
@@ -528,8 +530,13 @@ def wind_power_mw(
 # =============================================================================
 
 # PPUs that are standalone dispatchable generators (fuel-based, no dedicated storage)
+# These can dispatch without drawing from storage - they use direct fuel input
 DISPATCHABLE_GENERATORS = {
-    'THERM_M': {'capacity_factor': 0.95, 'cost_per_mwh': 85}, # Biomass thermal
+    'THERM_M': {'capacity_factor': 0.95, 'cost_per_mwh': 85},   # Methane thermal (direct import)
+    'THERM_G': {'capacity_factor': 0.95, 'cost_per_mwh': 23},   # Gas thermal (direct import)
+    # BIO_WOOD: Wood → Pyrolysis → Biooil → Steam reforming → CCPP → Grid
+    # This is a flexible generator that uses biomass as direct input (not storage-backed)
+    'BIO_WOOD': {'capacity_factor': 0.70, 'cost_per_mwh': 215}, # Wood biomass (215 CHF/MWh from PPU costs)
 }
 
 # Storage discharge costs (opportunity cost - value of stored energy)
@@ -546,6 +553,21 @@ STORAGE_DISCHARGE_COSTS = {
     'Ammonia': 85,        # NH3_P extraction
     'Biooil': 55,         # BIO_OIL_ICE extraction
     'Palm oil': 55,       # PALM_ICE extraction
+}
+
+# Mapping from storage name to the PPU(s) that extract from it
+# Used to attribute storage discharge production to the correct PPU for RoT calculation
+STORAGE_TO_EXTRACTING_PPU = {
+    'Lake': 'HYD_S',
+    'Solar salt': 'SOL_SALT',  # Could also be SOL_STEAM, using primary
+    'Biogas': 'IMP_BIOG',
+    'H2 UG 200bar': 'H2P_G',
+    'CH4 200bar': 'THERM_CH4',
+    'Liquid H2': 'H2P_L',
+    'Fuel Tank': 'THERM',
+    'Ammonia': 'NH3_P',
+    'Biooil': 'BIO_OIL_ICE',
+    'Palm oil': 'PALM_ICE',
 }
 
 
@@ -877,6 +899,25 @@ def run_dispatch_simulation(
     deficit_series = np.zeros(n_timesteps)
     surplus_series = np.zeros(n_timesteps)
     
+    # =========================================================================
+    # AVIATION FUEL TRACKING
+    # =========================================================================
+    # Mandatory biooil discharge for aviation: 23 TWh/year = ~2625.57 MWh/hour
+    aviation_fuel_required_mwh = config.energy_system.AVIATION_FUEL_HOURLY_MWH * timestep_h
+    aviation_fuel_consumed_series = np.zeros(n_timesteps)  # Track actual consumption
+    aviation_fuel_shortfall_series = np.zeros(n_timesteps)  # Track any shortfall
+    aviation_fuel_import_cost_series = np.zeros(n_timesteps)  # Track import costs
+    
+    # Biooil import price from storage definition
+    biooil_import_price = config.storage.STORAGE_DEFINITIONS.get(
+        'Biooil', {}
+    ).get('import_price_chf_per_mwh', 67.0)
+    
+    # Track total aviation fuel metrics
+    total_aviation_fuel_consumed_mwh = 0.0
+    total_aviation_fuel_shortfall_mwh = 0.0
+    total_aviation_fuel_import_cost_chf = 0.0
+    
     # Track hourly production per PPU
     # Initialize with arrays of zeros
     ppu_production_hourly = {name: np.zeros(n_timesteps) for name in portfolio_counts.keys() if portfolio_counts[name] > 0}
@@ -994,11 +1035,13 @@ def run_dispatch_simulation(
                     dis_mw = discharged / timestep_h
                     storage_discharged_mw += dis_mw
                     
-                    # Track hourly (Storage as a source)
-                    storage_ppu_name = option['name']
-                    if storage_ppu_name not in ppu_production_hourly:
-                        ppu_production_hourly[storage_ppu_name] = np.zeros(n_timesteps)
-                    ppu_production_hourly[storage_ppu_name][i] += dis_mw
+                    # Track hourly under the EXTRACTING PPU name (not storage name)
+                    # This ensures RoT calculation uses correct PPU production volumes
+                    storage_name = option['name']
+                    extracting_ppu = STORAGE_TO_EXTRACTING_PPU.get(storage_name, storage_name)
+                    if extracting_ppu not in ppu_production_hourly:
+                        ppu_production_hourly[extracting_ppu] = np.zeros(n_timesteps)
+                    ppu_production_hourly[extracting_ppu][i] += dis_mw
             
             # Track any remaining deficit
             if remaining_deficit_mwh > 0:
@@ -1051,6 +1094,41 @@ def run_dispatch_simulation(
         # Track storage SoC
         for name, storage in state.storages.items():
             storage_soc_series[name][i] = storage.soc
+        
+        # =====================================================================
+        # MANDATORY AVIATION FUEL DISCHARGE
+        # =====================================================================
+        # Biooil must be discharged every hour for aviation (independent of grid)
+        # This is a HARD constraint - if not met, portfolio is infeasible
+        
+        if 'Biooil' in state.storages:
+            biooil_storage = state.storages['Biooil']
+            
+            # Try to discharge required amount for aviation
+            # Note: This discharge is INDEPENDENT of electricity generation
+            # The biooil goes directly to aviation, not to BIO_OIL_ICE for power
+            
+            available_biooil_mwh = biooil_storage.current_mwh
+            actual_discharge_mwh = min(aviation_fuel_required_mwh, available_biooil_mwh)
+            
+            # Withdraw from storage (no efficiency loss - raw fuel to planes)
+            biooil_storage.current_mwh -= actual_discharge_mwh
+            
+            # Track consumption
+            aviation_fuel_consumed_series[i] = actual_discharge_mwh
+            total_aviation_fuel_consumed_mwh += actual_discharge_mwh
+            
+            # Check for shortfall
+            shortfall = aviation_fuel_required_mwh - actual_discharge_mwh
+            if shortfall > 0:
+                aviation_fuel_shortfall_series[i] = shortfall
+                total_aviation_fuel_shortfall_mwh += shortfall
+            
+            # Calculate import cost for consumed biooil
+            # (Biooil must be purchased/imported to refill storage)
+            import_cost = actual_discharge_mwh * biooil_import_price
+            aviation_fuel_import_cost_series[i] = import_cost
+            total_aviation_fuel_import_cost_chf += import_cost
     
     # Compile dispatchable production summary
     dispatchable_summary = {
@@ -1086,6 +1164,18 @@ def run_dispatch_simulation(
         'total_renewable_mwh': total_renewable_mwh,
         'total_dispatchable_mwh': total_dispatchable_mwh,
         'dispatchable_capacity_mw': total_dispatchable_mw,
+        # =====================================================================
+        # AVIATION FUEL RESULTS
+        # =====================================================================
+        'aviation_fuel_consumed_mwh': total_aviation_fuel_consumed_mwh,
+        'aviation_fuel_shortfall_mwh': total_aviation_fuel_shortfall_mwh,
+        'aviation_fuel_import_cost_chf': total_aviation_fuel_import_cost_chf,
+        'aviation_fuel_consumed_series': aviation_fuel_consumed_series,
+        'aviation_fuel_shortfall_series': aviation_fuel_shortfall_series,
+        'aviation_fuel_import_cost_series': aviation_fuel_import_cost_series,
+        'aviation_fuel_required_hourly_mwh': aviation_fuel_required_mwh,
+        # Validation: True if all hourly requirements were met
+        'aviation_fuel_constraint_met': total_aviation_fuel_shortfall_mwh < 1e-6,
     }
     
     if verbose:
@@ -1113,6 +1203,7 @@ def compute_scenario_cost(
     Includes:
     - Net spot market cost (buy - sell)
     - PPU operational costs (based on actual production per PPU)
+    - Aviation fuel import costs (biooil for aviation)
     
     This uses the same cost calculation logic as portfolio_metrics.py
     for consistency across the entire pipeline.
@@ -1131,6 +1222,9 @@ def compute_scenario_cost(
     
     # Spot market cost
     spot_cost = results.get('net_spot_cost_chf', 0.0)
+    
+    # Aviation fuel import cost (biooil purchased for aviation)
+    aviation_fuel_cost = results.get('aviation_fuel_import_cost_chf', 0.0)
     
     # PPU operational costs - DETAILED calculation using actual production per PPU
     ppu_cost = 0.0
@@ -1169,7 +1263,7 @@ def compute_scenario_cost(
             # Add production cost
             ppu_cost += total_production_mwh * cost_per_mwh
     
-    return spot_cost + ppu_cost
+    return spot_cost + ppu_cost + aviation_fuel_cost
 
 
 def compute_portfolio_metrics(

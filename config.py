@@ -71,6 +71,28 @@ class EnergySystemConfig:
     # Current annual demand (~55 TWh for reference)
     CURRENT_ANNUAL_DEMAND_TWH: float = 55.0
 
+    # ==========================================================================
+    # AVIATION FUEL REQUIREMENT
+    # ==========================================================================
+    # Aviation requires 23 TWh/year of biooil fuel (CO2-neutral synthetic fuel)
+    # This is a HARD constraint: biooil must be discharged every hour
+    # Reference: Züttel et al. (2024) - Swiss energy transition pathway
+    
+    AVIATION_FUEL_DEMAND_TWH_YEAR: float = 23.0
+    
+    # Hourly biooil discharge requirement (MWh/hour)
+    # 23 TWh/year = 23,000,000 MWh/year ÷ 8760 hours ≈ 2625.57 MWh/hour
+    @property
+    def AVIATION_FUEL_HOURLY_MWH(self) -> float:
+        return self.AVIATION_FUEL_DEMAND_TWH_YEAR * 1e6 / 8760
+    
+    # Minimum BIO_OIL_ICE units needed to meet hourly discharge
+    # Each unit = 10 MW, hourly discharge = 2625.57 MWh = 2625.57 MW for 1 hour
+    # Need ~263 units minimum
+    @property
+    def MIN_BIO_OIL_ICE_UNITS(self) -> int:
+        return int(np.ceil(self.AVIATION_FUEL_HOURLY_MWH / 10.0))
+
 
 # =============================================================================
 # GENETIC ALGORITHM PARAMETERS
@@ -248,7 +270,7 @@ class PPUConfig:
         'WD_ON',    # Wind onshore
         'WD_OFF',   # Wind offshore
         'HYD_R',    # Run-of-river hydro
-        'BIO_WOOD', # Biomass (wood)
+        # Note: BIO_WOOD moved to DISPATCHABLE_GENERATORS (direct biomass input, not incidence-based)
     ])
     
     # Flexible/dispatchable PPUs (depend on storage)

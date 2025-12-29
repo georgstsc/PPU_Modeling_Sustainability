@@ -170,8 +170,9 @@ def calculate_chain_cost(
     
     Accounts for:
     - Direct component costs
-    - Auxiliary energy requirements (w)
     - Cumulative efficiency losses
+    
+    Note: Auxiliary energy requirements (w) are ignored as negligible.
     
     Args:
         components: List of component names
@@ -197,11 +198,8 @@ def calculate_chain_cost(
         component_efficiencies.append(comp_data['efficiency'])
         cumulative_efficiency *= comp_data['efficiency']
         
-        # Auxiliary energy cost (scaled by position in chain)
-        w = comp_data['w']
-        if w > 0 and cumulative_efficiency > 0:
-            aux_cost = w / cumulative_efficiency
-            total_cost += aux_cost
+        # Auxiliary energy cost is ignored (negligible)
+        # Previously: aux_cost = w / cumulative_efficiency
     
     return PPUCostData(
         efficiency=cumulative_efficiency,
@@ -421,6 +419,42 @@ def check_energy_sovereignty(
     is_sovereign = annual_production >= target
     
     return is_sovereign, annual_production, target
+
+
+def check_aviation_fuel_capacity(
+    portfolio: Portfolio,
+    config: Config = DEFAULT_CONFIG,
+) -> Tuple[bool, int, int, float]:
+    """
+    Check if portfolio has sufficient BIO_OIL_ICE capacity for aviation fuel.
+    
+    Aviation fuel requirement: 23 TWh/year = ~2625.57 MWh/hour
+    Each BIO_OIL_ICE unit provides 10 MW = 10 MWh/hour
+    Minimum units needed: ceil(2625.57 / 10) = 263 units
+    
+    Note: This is a capacity check only. Actual biooil storage replenishment
+    (via domestic production or imports) must be sufficient to meet hourly demand.
+    
+    Args:
+        portfolio: Portfolio to check
+        config: Configuration
+        
+    Returns:
+        Tuple of (has_capacity, current_units, required_units, hourly_capacity_mwh)
+    """
+    bio_oil_ice_count = portfolio.ppu_counts.get('BIO_OIL_ICE', 0)
+    required_hourly_mwh = config.energy_system.AVIATION_FUEL_HOURLY_MWH
+    
+    # Each unit = 10 MW = 10 MWh/hour discharge capacity
+    mw_per_unit = config.ppu.MW_PER_UNIT
+    hourly_capacity_mwh = bio_oil_ice_count * mw_per_unit
+    
+    # Calculate minimum required units
+    min_required_units = int(np.ceil(required_hourly_mwh / mw_per_unit))
+    
+    has_capacity = bio_oil_ice_count >= min_required_units
+    
+    return has_capacity, bio_oil_ice_count, min_required_units, hourly_capacity_mwh
 
 
 # =============================================================================

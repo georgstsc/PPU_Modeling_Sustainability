@@ -830,6 +830,16 @@ class FullYearResults:
     peak_deficit_mw: float = 0.0
     hours_in_deficit: int = 0
     
+    # =========================================================================
+    # AVIATION FUEL METRICS (23 TWh/year biooil requirement)
+    # =========================================================================
+    aviation_fuel_consumed_mwh: float = 0.0
+    aviation_fuel_shortfall_mwh: float = 0.0
+    aviation_fuel_import_cost_chf: float = 0.0
+    aviation_fuel_constraint_met: bool = False
+    aviation_fuel_consumed_series: np.ndarray = field(default_factory=lambda: np.array([]))
+    aviation_fuel_shortfall_series: np.ndarray = field(default_factory=lambda: np.array([]))
+    
     # Monthly breakdowns
     monthly_production: Optional[np.ndarray] = None
     monthly_demand: Optional[np.ndarray] = None
@@ -919,6 +929,13 @@ def evaluate_portfolio_full_year(
         dispatchable_production=results.get('dispatchable_production', np.zeros(n_hours)),
         ppu_production=results.get('ppu_production', {}),
         storage_soc=results.get('storage_soc', {}),
+        # Aviation fuel metrics
+        aviation_fuel_consumed_mwh=results.get('aviation_fuel_consumed_mwh', 0.0),
+        aviation_fuel_shortfall_mwh=results.get('aviation_fuel_shortfall_mwh', 0.0),
+        aviation_fuel_import_cost_chf=results.get('aviation_fuel_import_cost_chf', 0.0),
+        aviation_fuel_constraint_met=results.get('aviation_fuel_constraint_met', False),
+        aviation_fuel_consumed_series=results.get('aviation_fuel_consumed_series', np.zeros(n_hours)),
+        aviation_fuel_shortfall_series=results.get('aviation_fuel_shortfall_series', np.zeros(n_hours)),
     )
     
     # Compute aggregate metrics
@@ -971,6 +988,19 @@ def evaluate_portfolio_full_year(
         print(f"Deficit Analysis:")
         print(f"  Hours in deficit: {full_year.hours_in_deficit} ({full_year.hours_in_deficit/n_hours*100:.1f}%)")
         print(f"  Peak deficit: {full_year.peak_deficit_mw:,.0f} MW")
+        print()
+        print(f"Aviation Fuel (Biooil):")
+        required_twh = config.energy_system.AVIATION_FUEL_DEMAND_TWH_YEAR
+        consumed_twh = full_year.aviation_fuel_consumed_mwh / 1e6
+        shortfall_twh = full_year.aviation_fuel_shortfall_mwh / 1e6
+        print(f"  Required: {required_twh:,.1f} TWh/year")
+        print(f"  Consumed: {consumed_twh:,.2f} TWh ({consumed_twh/required_twh*100:.1f}%)")
+        print(f"  Shortfall: {shortfall_twh:,.2f} TWh")
+        print(f"  Import Cost: {full_year.aviation_fuel_import_cost_chf/1e6:,.1f} M CHF")
+        print(f"  Constraint Met: {'✅ YES' if full_year.aviation_fuel_constraint_met else '❌ NO'}")
+        if not full_year.aviation_fuel_constraint_met:
+            hours_short = np.sum(full_year.aviation_fuel_shortfall_series > 0)
+            print(f"  ⚠️  {hours_short} hours with biooil shortfall")
     
     return full_year
 

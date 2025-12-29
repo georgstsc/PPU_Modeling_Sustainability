@@ -88,6 +88,119 @@ def find_pareto_frontier_2d(
     return is_pareto
 
 
+def find_pareto_frontier_3d(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    z_values: np.ndarray,
+    minimize_x: bool = True,
+    minimize_y: bool = True,
+    minimize_z: bool = False  # Typically maximize return
+) -> np.ndarray:
+    """
+    Find Pareto-optimal points in 3D space.
+    
+    A point is Pareto-optimal if no other point dominates it in all three dimensions.
+    
+    Dominance: Point j dominates point i if j is better or equal in all dimensions,
+    and strictly better in at least one.
+    
+    Args:
+        x_values: Array of x-axis values (e.g., RoT)
+        y_values: Array of y-axis values (e.g., Volatility)
+        z_values: Array of z-axis values (e.g., Return)
+        minimize_x: Whether to minimize x (True) or maximize x (False)
+        minimize_y: Whether to minimize y (True) or maximize y (False)
+        minimize_z: Whether to minimize z (True) or maximize z (False)
+        
+    Returns:
+        Boolean array indicating which points are on the Pareto frontier
+    """
+    n_points = len(x_values)
+    is_pareto = np.ones(n_points, dtype=bool)
+    
+    # Convert to "lower is better" for all dimensions
+    x_adj = x_values if minimize_x else -x_values
+    y_adj = y_values if minimize_y else -y_values
+    z_adj = z_values if minimize_z else -z_values
+    
+    for i in range(n_points):
+        if not is_pareto[i]:
+            continue
+        
+        for j in range(n_points):
+            if i == j or not is_pareto[j]:
+                continue
+            
+            # Check if point j dominates point i
+            # j dominates i if: j <= i in all dimensions AND j < i in at least one
+            j_leq_i_x = x_adj[j] <= x_adj[i]
+            j_leq_i_y = y_adj[j] <= y_adj[i]
+            j_leq_i_z = z_adj[j] <= z_adj[i]
+            
+            j_lt_i_x = x_adj[j] < x_adj[i]
+            j_lt_i_y = y_adj[j] < y_adj[i]
+            j_lt_i_z = z_adj[j] < z_adj[i]
+            
+            # j dominates i if j is <= in all AND < in at least one
+            if j_leq_i_x and j_leq_i_y and j_leq_i_z:
+                if j_lt_i_x or j_lt_i_y or j_lt_i_z:
+                    is_pareto[i] = False
+                    break
+    
+    return is_pareto
+
+
+def extract_pareto_frontier_3d_from_df(
+    df: pd.DataFrame,
+    x_col: str = 'x_RoT',
+    y_col: str = 'y_volatility',
+    z_col: str = 'z_return',
+    minimize_x: bool = True,
+    minimize_y: bool = True,
+    minimize_z: bool = False  # Maximize return
+) -> pd.DataFrame:
+    """
+    Extract 3D Pareto-optimal portfolios from a results DataFrame.
+    
+    Args:
+        df: DataFrame with portfolio metrics
+        x_col: Column name for x-axis (default: 'x_RoT')
+        y_col: Column name for y-axis (default: 'y_volatility')
+        z_col: Column name for z-axis (default: 'z_return')
+        minimize_x: Whether to minimize x (True) or maximize x (False)
+        minimize_y: Whether to minimize y (True) or maximize y (False)
+        minimize_z: Whether to minimize z (True) or maximize z (False)
+        
+    Returns:
+        DataFrame containing only 3D Pareto-optimal portfolios
+    """
+    # Extract values
+    x_values = df[x_col].values
+    y_values = df[y_col].values
+    z_values = df[z_col].values
+    
+    # Remove any NaN or inf values
+    valid_mask = (np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(z_values))
+    df_valid = df[valid_mask].copy()
+    x_valid = x_values[valid_mask]
+    y_valid = y_values[valid_mask]
+    z_valid = z_values[valid_mask]
+    
+    # Find 3D Pareto-optimal points
+    is_pareto = find_pareto_frontier_3d(
+        x_valid, y_valid, z_valid,
+        minimize_x=minimize_x, minimize_y=minimize_y, minimize_z=minimize_z
+    )
+    
+    # Extract Pareto-optimal portfolios
+    pareto_df = df_valid[is_pareto].copy()
+    
+    # Sort by x_col for easier visualization
+    pareto_df = pareto_df.sort_values(x_col)
+    
+    return pareto_df
+
+
 def extract_pareto_frontier_from_df(
     df: pd.DataFrame,
     x_col: str = 'x_RoT',
