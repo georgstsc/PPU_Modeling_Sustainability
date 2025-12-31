@@ -181,6 +181,7 @@ class StorageConfig:
         },
         'Fuel Tank': {
             'capacity_MWh': 20_000_000,
+            'max_capacity_cap_MWh': 25_000_000,  # 25 TWh max
             'max_power_MW': 50_000,
             'efficiency_charge': 0.70,
             'efficiency_discharge': 0.50,
@@ -189,6 +190,7 @@ class StorageConfig:
         },
         'H2 UG 200bar': {
             'capacity_MWh': 700_000,
+            'max_capacity_cap_MWh': 50_000_000,  # 50 TWh max
             'max_power_MW': 5_000,
             'efficiency_charge': 0.60,
             'efficiency_discharge': 0.50,
@@ -197,6 +199,7 @@ class StorageConfig:
         },
         'Liquid H2': {
             'capacity_MWh': 100_000,
+            'max_capacity_cap_MWh': 50_000_000,  # 50 TWh max
             'max_power_MW': 2_000,
             'efficiency_charge': 0.70,
             'efficiency_discharge': 0.50,
@@ -231,6 +234,7 @@ class StorageConfig:
         },
         'Biogas': {
             'capacity_MWh': 200_000,
+            'max_capacity_cap_MWh': 25_000_000,  # 25 TWh max
             'max_power_MW': 2_000,
             'efficiency_charge': 0.98,
             'efficiency_discharge': 0.50,
@@ -239,6 +243,7 @@ class StorageConfig:
         },
         'CH4 200bar': {
             'capacity_MWh': 700_000,
+            'max_capacity_cap_MWh': 50_000_000,  # 50 TWh max
             'max_power_MW': 5_000,
             'efficiency_charge': 0.78,
             'efficiency_discharge': 0.50,
@@ -247,6 +252,7 @@ class StorageConfig:
         },
         'Ammonia': {
             'capacity_MWh': 300_000,
+            'max_capacity_cap_MWh': 50_000_000,  # 50 TWh max
             'max_power_MW': 3_000,
             'efficiency_charge': 0.78,
             'efficiency_discharge': 0.375,  # 0.75 * 0.50

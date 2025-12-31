@@ -31,17 +31,24 @@ from config import Config, DEFAULT_CONFIG
 
 @dataclass
 class PrecomputedRenewables:
-    """Pre-computed indices for fast renewable production calculation."""
+    """Pre-computed parameters for fast renewable production calculation.
     
-    # Solar PV: location indices and efficiencies
-    pv_location_indices: np.ndarray  # Array of location indices (0-based)
-    pv_efficiencies: np.ndarray      # Chain efficiencies for each PV unit
-    pv_area_m2: float                # Area per unit
+    DISTRIBUTED DEPLOYMENT MODEL:
+    - Solar: Each PPU adds 1000 m² to EVERY location (distributed rooftop solar)
+    - Wind: Each PPU adds 1 turbine to EVERY location (distributed wind farms)
+    - Production is summed across ALL locations
+    """
     
-    # Wind: location indices and efficiencies
-    wind_location_indices: np.ndarray  # Array of location indices (0-based)
-    wind_efficiencies: np.ndarray      # Chain efficiencies for each wind unit
-    wind_num_turbines: float           # Turbines per unit
+    # Solar PV: count and efficiency (distributed across all locations)
+    pv_count: int = 0                # Number of PV PPU units
+    pv_efficiency: float = 0.84      # Average chain efficiency
+    pv_area_per_location_m2: float = 1000.0  # 1000 m² per PPU per location
+    
+    # Wind: count and efficiency (distributed across all locations)  
+    wind_onshore_count: int = 0      # Number of WD_ON PPU units
+    wind_offshore_count: int = 0     # Number of WD_OFF PPU units
+    wind_efficiency: float = 0.84    # Average chain efficiency
+    turbines_per_location: int = 1   # 1 turbine per PPU per location
     
     # River: PPU indices and monthly production
     river_indices: List[int] = field(default_factory=list)
@@ -65,27 +72,32 @@ def precompute_renewable_indices(
     ror_production: Optional[np.ndarray] = None
 ) -> PrecomputedRenewables:
     """
-    Pre-compute location indices and parameters for fast renewable calculation.
+    Pre-compute parameters for DISTRIBUTED renewable calculation.
+    
+    DISTRIBUTED DEPLOYMENT MODEL:
+    - Solar: Each PPU adds 1000 m² to EVERY location (distributed rooftop solar)
+    - Wind: Each PPU adds 1 turbine to EVERY location (distributed wind farms)
+    - Production is summed across ALL locations at each timestep
     
     This should be called ONCE before the simulation loop, not every timestep.
     
     Args:
-        ppu_dictionary: PPU dictionary with location assignments
+        ppu_dictionary: PPU dictionary with PPU counts
         config: Configuration
         ror_production: Optional monthly river hydro production array
         
     Returns:
-        PrecomputedRenewables object for fast vectorized calculations
+        PrecomputedRenewables object for fast distributed calculations
     """
     mw_per_unit = config.ppu.MW_PER_UNIT
     
-    # Extract solar PV units
-    pv_locations = []
-    pv_effs = []
+    # Count PPU units by type
+    pv_count = 0
+    pv_efficiency_sum = 0.0
     
-    # Extract wind units  
-    wind_locations = []
-    wind_effs = []
+    wind_onshore_count = 0
+    wind_offshore_count = 0
+    wind_efficiency_sum = 0.0
     
     # Extract river units
     river_indices = []
@@ -96,8 +108,7 @@ def precompute_renewable_indices(
     for i, row in ppu_dictionary.iterrows():
         ppu_name = row['PPU_Name']
         components = row['Components']
-        location_rank = row.get('Location_Rank', np.nan)
-        efficiency = row.get('Chain_Efficiency', 0.8)
+        efficiency = row.get('Chain_Efficiency', 0.84)
         
         # River hydro (incidence)
         if 'River' in components or ppu_name == 'HYD_R':
@@ -106,32 +117,36 @@ def precompute_renewable_indices(
             
         # Solar thermal store (incidence -> storage)
         if 'Solar concentrator' in str(components) or 'SOL_SALT_STORE' in ppu_name:
-            # We treat these as location-specific if location_rank exists, otherwise index 0
             sol_store_indices.append(i)
-            # Don't continue, might need location logic below if we want to rank them
-            
-        if pd.isna(location_rank):
-            continue
-            
-        loc_idx = int(location_rank) - 1  # Convert to 0-based index
         
-        # Solar PV
+        # Solar PV - count units
         if 'PV' in components:
-            pv_locations.append(loc_idx)
-            pv_effs.append(efficiency)
+            pv_count += 1
+            pv_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
         
-        # Wind (onshore or offshore)
-        elif 'Wind (onshore)' in components or 'Wind (offshore)' in components:
-            wind_locations.append(loc_idx)
-            wind_effs.append(efficiency if not pd.isna(efficiency) else 0.85)
+        # Wind onshore
+        elif 'Wind (onshore)' in components:
+            wind_onshore_count += 1
+            wind_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
+            
+        # Wind offshore
+        elif 'Wind (offshore)' in components:
+            wind_offshore_count += 1
+            wind_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
+    
+    # Calculate average efficiencies
+    pv_efficiency = pv_efficiency_sum / pv_count if pv_count > 0 else 0.84
+    total_wind = wind_onshore_count + wind_offshore_count
+    wind_efficiency = wind_efficiency_sum / total_wind if total_wind > 0 else 0.84
     
     return PrecomputedRenewables(
-        pv_location_indices=np.array(pv_locations, dtype=np.int32),
-        pv_efficiencies=np.array(pv_effs, dtype=np.float64),
-        pv_area_m2=mw_per_unit * 5000,  # 5000 m² per MW (approx 200W/m²)
-        wind_location_indices=np.array(wind_locations, dtype=np.int32),
-        wind_efficiencies=np.array(wind_effs, dtype=np.float64),
-        wind_num_turbines=mw_per_unit / 3.0,  # 3 MW turbines
+        pv_count=pv_count,
+        pv_efficiency=pv_efficiency,
+        pv_area_per_location_m2=1000.0,  # 1000 m² per PPU per location
+        wind_onshore_count=wind_onshore_count,
+        wind_offshore_count=wind_offshore_count,
+        wind_efficiency=wind_efficiency,
+        turbines_per_location=1,  # 1 turbine per PPU per location
         river_indices=river_indices,
         ror_production_monthly=ror_production if ror_production is not None else np.zeros(12),
         sol_store_indices=sol_store_indices,
@@ -140,54 +155,96 @@ def precompute_renewable_indices(
 
 
 @njit(cache=True)
-def _calculate_solar_power_vectorized(
-    irradiance_values: np.ndarray,
-    efficiencies: np.ndarray,
-    area_m2: float,
+def _calculate_solar_power_distributed(
+    irradiance_all_locations: np.ndarray,
+    n_ppu: int,
+    area_per_location_m2: float,
+    chain_efficiency: float,
 ) -> float:
-    """Vectorized solar power calculation using numba.
+    """Distributed solar power calculation - sums across ALL locations.
+    
+    DISTRIBUTED MODEL: Each PPU adds area_per_location_m2 to EVERY location.
+    Total area = n_ppu × area_per_location_m2 × n_locations
     
     Args:
-        irradiance_values: Solar irradiance in kWh/m²/hour
-        efficiencies: Chain efficiencies for each unit
-        area_m2: Panel area per unit in m²
+        irradiance_all_locations: Solar irradiance at ALL locations (1D array)
+        n_ppu: Number of PV PPU units
+        area_per_location_m2: Panel area per PPU per location (1000 m²)
+        chain_efficiency: PPU chain efficiency
         
     Returns:
         Total power in MW
     """
+    if n_ppu == 0:
+        return 0.0
+    
     efficiency_pv = 0.20  # 20% PV panel efficiency
     total_power = 0.0
-    for i in range(len(irradiance_values)):
-        # P = irradiance * area * PV_efficiency * chain_efficiency
-        # Units: kWh/m²/h * m² * efficiency = kW
-        # Divide by 1000 to get MW
-        power = irradiance_values[i] * area_m2 * efficiency_pv * efficiencies[i] / 1000.0
+    
+    # Sum production across ALL locations
+    for i in range(len(irradiance_all_locations)):
+        # Total area at this location = n_ppu × area_per_location
+        total_area_at_loc = n_ppu * area_per_location_m2
+        # P = irradiance × area × PV_efficiency × chain_efficiency
+        # Units: kWh/m²/h × m² × efficiency = kW → /1000 = MW
+        power = irradiance_all_locations[i] * total_area_at_loc * efficiency_pv * chain_efficiency / 1000.0
         total_power += power
+    
     return total_power
 
 
 @njit(cache=True)
-def _calculate_wind_power_vectorized(
-    wind_speeds: np.ndarray,
-    efficiencies: np.ndarray,
-    num_turbines: int,
+def _calculate_wind_power_distributed(
+    wind_speeds_all_locations: np.ndarray,
+    n_ppu: int,
+    turbines_per_location: int,
+    chain_efficiency: float,
     rated_power: float = 3.0,
     cut_in: float = 3.0,
     rated_speed: float = 12.0,
     cut_out: float = 25.0,
 ) -> float:
-    """Vectorized wind power calculation using numba."""
+    """Distributed wind power calculation - sums across ALL locations.
+    
+    DISTRIBUTED MODEL: Each PPU adds turbines_per_location to EVERY location.
+    Total turbines = n_ppu × turbines_per_location × n_locations
+    
+    Args:
+        wind_speeds_all_locations: Wind speed at ALL locations (1D array)
+        n_ppu: Number of wind PPU units
+        turbines_per_location: Turbines per PPU per location (1)
+        chain_efficiency: PPU chain efficiency
+        rated_power: Rated power per turbine (MW)
+        cut_in: Cut-in wind speed (m/s)
+        rated_speed: Rated wind speed (m/s)
+        cut_out: Cut-out wind speed (m/s)
+        
+    Returns:
+        Total power in MW
+    """
+    if n_ppu == 0:
+        return 0.0
+    
     total_power = 0.0
-    for i in range(len(wind_speeds)):
-        ws = wind_speeds[i]
+    
+    # Total turbines at each location
+    total_turbines_at_loc = n_ppu * turbines_per_location
+    
+    # Sum production across ALL locations
+    for i in range(len(wind_speeds_all_locations)):
+        ws = wind_speeds_all_locations[i]
+        
+        # Wind power curve
         if ws < cut_in or ws > cut_out:
             power = 0.0
         elif ws >= rated_speed:
-            power = rated_power * num_turbines
+            power = rated_power * total_turbines_at_loc
         else:
             ratio = (ws - cut_in) / (rated_speed - cut_in)
-            power = rated_power * num_turbines * (ratio ** 3)
-        total_power += power * efficiencies[i]
+            power = rated_power * total_turbines_at_loc * (ratio ** 3)
+        
+        total_power += power * chain_efficiency
+    
     return total_power
 
 
@@ -198,14 +255,16 @@ def calculate_renewable_production_fast(
     wind_data: np.ndarray,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Fast vectorized renewable production calculation.
+    Fast DISTRIBUTED renewable production calculation.
     
-    Uses precomputed indices to avoid iterrows() overhead.
-    Handles NaN values in input data by treating them as zero.
+    DISTRIBUTED DEPLOYMENT MODEL:
+    - Solar: Each PPU adds 1000 m² to EVERY location (distributed rooftop solar)
+    - Wind: Each PPU adds 1 turbine to EVERY location (distributed wind farms)
+    - Production is summed across ALL locations at each timestep
     
     Args:
         t: Timestep index (absolute hour of year)
-        precomputed: PrecomputedRenewables object
+        precomputed: PrecomputedRenewables object with PPU counts
         solar_data: Solar irradiance array (n_hours, n_locations)
         wind_data: Wind speed array (n_hours, n_locations)
         
@@ -216,87 +275,98 @@ def calculate_renewable_production_fast(
     breakdown = {}
     
     # Calculate month index (0-11) for monthly profiles
-    # Assuming hourly data starting Jan 1st
-    month_idx = min(11, t // (24 * 30)) # Approximation for profiles
+    month_idx = min(11, t // (24 * 30))
     
-    # Solar PV production
-    if len(precomputed.pv_location_indices) > 0 and t < len(solar_data):
-        # Clip indices to valid range
-        max_solar_loc = solar_data.shape[1] - 1 if solar_data.ndim > 1 else 0
-        pv_locs = np.clip(precomputed.pv_location_indices, 0, max_solar_loc)
-        
+    # =================================================================
+    # SOLAR PV - DISTRIBUTED across ALL locations
+    # =================================================================
+    if precomputed.pv_count > 0 and t < len(solar_data):
+        # Get irradiance at ALL locations for this timestep
         if solar_data.ndim > 1:
-            irradiance_values = solar_data[t, pv_locs].astype(np.float64)
+            irradiance_all = solar_data[t, :].astype(np.float64)
         else:
-            irradiance_values = np.full(len(pv_locs), float(solar_data[t]))
+            irradiance_all = np.array([float(solar_data[t])])
         
         # Replace NaN with 0 (no production)
-        irradiance_values = np.nan_to_num(irradiance_values, nan=0.0)
+        irradiance_all = np.nan_to_num(irradiance_all, nan=0.0)
         
-        pv_mw = _calculate_solar_power_vectorized(
-            irradiance_values,
-            precomputed.pv_efficiencies,
-            precomputed.pv_area_m2,
+        pv_mw = _calculate_solar_power_distributed(
+            irradiance_all,
+            precomputed.pv_count,
+            precomputed.pv_area_per_location_m2,  # 1000 m² per PPU per location
+            precomputed.pv_efficiency,
         )
         total_mw += pv_mw
         breakdown['PV'] = pv_mw
     
-    # River Hydro production (HYD_R) - Incidence based
+    # =================================================================
+    # RIVER HYDRO (HYD_R) - Incidence based (unchanged)
+    # =================================================================
     if len(precomputed.river_indices) > 0:
-        # Use monthly ror_production scaled by unit count
-        # ror_production_monthly is total MWh for the month for the WHOLE country
-        # Swiss total run-of-river capacity: ~3.4 GW = 340 units (at 10 MW/unit)
-        # Reference: Swiss hydro stats show ~17 TWh/year from run-of-river
         n_units = len(precomputed.river_indices)
-        
-        # Monthly production / (days * 24) = average MW for the month
         monthly_mwh = precomputed.ror_production_monthly[month_idx]
-        hourly_mw_total = monthly_mwh / (30 * 24)  # Average MW for Swiss total
+        hourly_mw_total = monthly_mwh / (30 * 24)
         
-        # Scale by fraction of Swiss total capacity (340 units = ~3.4 GW total)
-        # Each unit represents 10 MW of the total Swiss run-of-river capacity
-        SWISS_TOTAL_HYD_R_UNITS = 340.0  # ~3.4 GW national capacity
+        SWISS_TOTAL_HYD_R_UNITS = 340.0
         river_mw = hourly_mw_total * (n_units / SWISS_TOTAL_HYD_R_UNITS)
         total_mw += river_mw
         breakdown['HYD_R'] = river_mw
     
-    # Solar Thermal Storage Input (SOL_SALT_STORE)
+    # =================================================================
+    # SOLAR THERMAL STORAGE (SOL_SALT_STORE) - Incidence based
+    # =================================================================
     if len(precomputed.sol_store_indices) > 0 and t < len(solar_data):
-        # Similar to PV but goes to storage (not grid)
-        # However, for simplicity in the stacked plot, we treat it as incidence production
-        # that will immediately be 'consumed' by storage charging in the dispatch loop.
         n_units = len(precomputed.sol_store_indices)
         
-        # Use first solar location as proxy if no ranking
-        irrad = solar_data[t, 0] if solar_data.ndim > 1 else solar_data[t]
+        # Use mean irradiance across all locations for thermal
+        if solar_data.ndim > 1:
+            irrad = np.nanmean(solar_data[t, :])
+        else:
+            irrad = float(solar_data[t])
         irrad = np.nan_to_num(irrad, nan=0.0)
         
-        # Solar thermal efficiency ~40% (concentrator + receiver)
-        sol_thermal_mw = irrad * (precomputed.pv_area_m2 * 2) * 0.40 * n_units / 1000.0
+        # Solar thermal: ~10,000 m² concentrator area per unit, 40% efficiency
+        sol_thermal_mw = irrad * 10000.0 * 0.40 * n_units / 1000.0
         total_mw += sol_thermal_mw
         breakdown['SOL_SALT_STORE'] = sol_thermal_mw
     
-    # Wind production
-    if len(precomputed.wind_location_indices) > 0 and t < len(wind_data):
-        # Clip indices to valid range
-        max_wind_loc = wind_data.shape[1] - 1 if wind_data.ndim > 1 else 0
-        wind_locs = np.clip(precomputed.wind_location_indices, 0, max_wind_loc)
-        
+    # =================================================================
+    # WIND - DISTRIBUTED across ALL locations
+    # =================================================================
+    total_wind_count = precomputed.wind_onshore_count + precomputed.wind_offshore_count
+    if total_wind_count > 0 and t < len(wind_data):
+        # Get wind speed at ALL locations for this timestep
         if wind_data.ndim > 1:
-            wind_speeds = wind_data[t, wind_locs].astype(np.float64)
+            wind_speeds_all = wind_data[t, :].astype(np.float64)
         else:
-            wind_speeds = np.full(len(wind_locs), float(wind_data[t]))
+            wind_speeds_all = np.array([float(wind_data[t])])
         
         # Replace NaN with 0 (no production)
-        wind_speeds = np.nan_to_num(wind_speeds, nan=0.0)
+        wind_speeds_all = np.nan_to_num(wind_speeds_all, nan=0.0)
         
-        wind_mw = _calculate_wind_power_vectorized(
-            wind_speeds,
-            precomputed.wind_efficiencies,
-            precomputed.wind_num_turbines,
+        # Onshore wind (3 MW turbines)
+        if precomputed.wind_onshore_count > 0:
+            wind_on_mw = _calculate_wind_power_distributed(
+                wind_speeds_all,
+                precomputed.wind_onshore_count,
+                precomputed.turbines_per_location,  # 1 turbine per PPU per location
+                precomputed.wind_efficiency,
+                rated_power=3.0,  # 3 MW onshore turbines
+            )
+            total_mw += wind_on_mw
+            breakdown['WD_ON'] = wind_on_mw
+        
+        # Offshore wind (5 MW turbines)
+        if precomputed.wind_offshore_count > 0:
+            wind_off_mw = _calculate_wind_power_distributed(
+                wind_speeds_all,
+                precomputed.wind_offshore_count,
+                precomputed.turbines_per_location,
+                precomputed.wind_efficiency,
+                rated_power=5.0,  # 5 MW offshore turbines
         )
-        total_mw += wind_mw
-        breakdown['WD_ON'] = wind_mw
+            total_mw += wind_off_mw
+            breakdown['WD_OFF'] = wind_off_mw
         
     return total_mw, breakdown
 
@@ -683,6 +753,12 @@ def initialize_storage_state(
             capacity_scale = max(1, input_ppu_count)
         
         capacity = storage_def['capacity_MWh'] * capacity_scale
+        
+        # Apply maximum capacity cap if defined
+        max_cap = storage_def.get('max_capacity_cap_MWh')
+        if max_cap is not None:
+            capacity = min(capacity, max_cap)
+        
         current = capacity * initial_soc
         
         storages[storage_name] = StorageState(
@@ -1054,22 +1130,74 @@ def run_dispatch_simulation(
                 state.total_spot_buy_cost += remaining_deficit_mwh * spot_price
         
         else:
-            # ===== STEP 4: SURPLUS - Charge storage =====
-            remaining_surplus_mwh = balance_mw * timestep_h
-            state.total_surplus_mwh += remaining_surplus_mwh
+            # ===== STEP 4: SURPLUS - Utility-Based Proportional Storage Charging =====
+            # All storages self-regulate around their target SoC (60%)
+            # Distribution is proportional to: charge_willingness × efficiency
             
-            for storage_name in config.dispatch.CHARGE_PRIORITY:
-                if storage_name not in state.storages or remaining_surplus_mwh <= 0:
-                    continue
+            surplus_mwh = balance_mw * timestep_h
+            state.total_surplus_mwh += surplus_mwh
+            
+            # Calculate charge willingness for each storage
+            # disposition_index: -1 (empty, wants charge) to +1 (full, wants discharge)
+            # charge_willingness = how much storage wants to charge (0 to 1)
+            target_soc = config.storage.TARGET_SOC_FRACTION
+            
+            charge_weights = {}
+            total_charge_weight = 0.0
+            
+            for storage_name, storage in state.storages.items():
+                d_stor = calculate_disposition_index(storage.soc, soc_target=target_soc)
+                # Charge willingness: stronger when below target (d_stor < 0)
+                # Also consider available capacity
+                available_capacity = storage.capacity_mwh * (1.0 - storage.soc)
+                if available_capacity > 0 and d_stor < 0.5:  # Only charge if below ~target+deadband
+                    # Weight = willingness × efficiency × available capacity factor
+                    willingness = max(0.0, 0.5 - d_stor)  # 0 to 1
+                    weight = willingness * storage.efficiency_charge
+                    charge_weights[storage_name] = weight
+                    total_charge_weight += weight
+            
+            # Distribute surplus proportionally
+            remaining_surplus_mwh = surplus_mwh
+            
+            if total_charge_weight > 0:
+                for storage_name, weight in charge_weights.items():
+                    if remaining_surplus_mwh <= 0:
+                        break
+                    
                 storage = state.storages[storage_name]
-                charged = storage.charge(remaining_surplus_mwh)
+                    proportion = weight / total_charge_weight
+                    allocated_mwh = surplus_mwh * proportion
+                    
+                    # Ghost PPU mechanism for Biooil and Palm oil
+                    # They sell surplus electricity on spot → import fuel
+                    if storage_name in ('Biooil', 'Palm oil'):
+                        import_price = 67.0 if storage_name == 'Biooil' else 87.0
+                        
+                        # Sell allocated surplus on spot market
+                        spot_revenue = allocated_mwh * spot_price
+                        
+                        # Buy fuel with revenue (convert electricity value to fuel)
+                        fuel_mwh = spot_revenue / import_price
+                        
+                        # Charge storage with imported fuel
+                        actually_charged = storage.charge(fuel_mwh)
+                        
+                        if actually_charged > 0:
+                            # Track spot sale (electricity sold by ghost PPU)
+                            actual_elec_sold = actually_charged * import_price / spot_price if spot_price > 0 else 0
+                            state.total_spot_sell_mwh += actual_elec_sold
+                            state.total_spot_sell_revenue += actual_elec_sold * spot_price
+                            remaining_surplus_mwh -= actual_elec_sold
+                    else:
+                        # Regular storage: charge directly with electricity
+                        charged = storage.charge(allocated_mwh)
                 remaining_surplus_mwh -= charged
                 storage_charged_mw += charged / timestep_h
             
-            # Any remaining surplus could be sold or curtailed
+            # Any remaining surplus is sold on spot market
             if remaining_surplus_mwh > 0:
                 surplus_series[i] = remaining_surplus_mwh / timestep_h
-                # Could sell to spot market (optional)
                 state.spot_sold.append((i, remaining_surplus_mwh / timestep_h))
                 state.total_spot_sell_mwh += remaining_surplus_mwh
                 state.total_spot_sell_revenue += remaining_surplus_mwh * spot_price
@@ -1096,39 +1224,46 @@ def run_dispatch_simulation(
             storage_soc_series[name][i] = storage.soc
         
         # =====================================================================
-        # MANDATORY AVIATION FUEL DISCHARGE
+        # MANDATORY AVIATION FUEL CONSUMPTION
         # =====================================================================
-        # Biooil must be discharged every hour for aviation (independent of grid)
-        # This is a HARD constraint - if not met, portfolio is infeasible
+        # Aviation fuel (23 TWh/year biooil) is a HARD constraint
+        # We ALWAYS meet it by:
+        # 1. First, use biooil from storage (if available)
+        # 2. Then, IMPORT any shortfall at import price (67 CHF/MWh)
+        # This ensures aviation fuel is always consumed - no shortfall.
+        
+        from_storage_mwh = 0.0
+        imported_mwh = 0.0
         
         if 'Biooil' in state.storages:
             biooil_storage = state.storages['Biooil']
             
-            # Try to discharge required amount for aviation
-            # Note: This discharge is INDEPENDENT of electricity generation
-            # The biooil goes directly to aviation, not to BIO_OIL_ICE for power
-            
+            # Try to discharge from storage first
             available_biooil_mwh = biooil_storage.current_mwh
-            actual_discharge_mwh = min(aviation_fuel_required_mwh, available_biooil_mwh)
+            from_storage_mwh = min(aviation_fuel_required_mwh, available_biooil_mwh)
             
             # Withdraw from storage (no efficiency loss - raw fuel to planes)
-            biooil_storage.current_mwh -= actual_discharge_mwh
-            
-            # Track consumption
-            aviation_fuel_consumed_series[i] = actual_discharge_mwh
-            total_aviation_fuel_consumed_mwh += actual_discharge_mwh
-            
-            # Check for shortfall
-            shortfall = aviation_fuel_required_mwh - actual_discharge_mwh
-            if shortfall > 0:
-                aviation_fuel_shortfall_series[i] = shortfall
-                total_aviation_fuel_shortfall_mwh += shortfall
-            
-            # Calculate import cost for consumed biooil
-            # (Biooil must be purchased/imported to refill storage)
-            import_cost = actual_discharge_mwh * biooil_import_price
-            aviation_fuel_import_cost_series[i] = import_cost
-            total_aviation_fuel_import_cost_chf += import_cost
+            biooil_storage.current_mwh -= from_storage_mwh
+        
+        # Import any shortfall (automatic purchase at import price)
+        imported_mwh = aviation_fuel_required_mwh - from_storage_mwh
+        
+        # Total consumed = from storage + imported (always meets requirement)
+        total_consumed_mwh = from_storage_mwh + imported_mwh
+        
+        # Track consumption (always equals required)
+        aviation_fuel_consumed_series[i] = total_consumed_mwh
+        total_aviation_fuel_consumed_mwh += total_consumed_mwh
+        
+        # Shortfall is now only tracked for info (but should always be 0)
+        # We import to cover it, so actual shortfall = 0
+        aviation_fuel_shortfall_series[i] = 0.0  # No shortfall - we import
+        
+        # Calculate import cost for ALL biooil consumed
+        # (Biooil must be purchased/imported regardless of source)
+        import_cost = total_consumed_mwh * biooil_import_price
+        aviation_fuel_import_cost_series[i] = import_cost
+        total_aviation_fuel_import_cost_chf += import_cost
     
     # Compile dispatchable production summary
     dispatchable_summary = {

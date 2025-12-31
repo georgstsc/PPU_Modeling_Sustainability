@@ -472,25 +472,29 @@ def calculate_cumulative_renewable_production(
     precomputed_sums: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Calculate ACTUAL cumulative renewable production using real incidence data.
+    Calculate ACTUAL cumulative renewable production using DISTRIBUTED deployment model.
     
-    OPTIMIZED VERSION: Uses pre-computed location sums to avoid repeated calculations.
+    DISTRIBUTED MODEL:
+    - Solar: Each PPU adds 1000 m² to EVERY location (distributed rooftop solar)
+    - Wind: Each PPU adds 1 turbine to EVERY location (distributed wind farms)
+    - Production summed across ALL locations for full year
     
     Args:
         portfolio: Portfolio with PPU counts
         ppu_definitions: PPU definitions
         solar_data: Solar irradiance array (n_hours, n_locations) [kWh/m²/h]
         wind_data: Wind speed array (n_hours, n_locations) [m/s]
-        solar_ranking: Location indices sorted by quality (best first)
-        wind_ranking: Location indices sorted by quality (best first)
+        solar_ranking: Location indices (not used in distributed model)
+        wind_ranking: Location indices (not used in distributed model)
         config: Configuration
-        precomputed_sums: Optional dict with pre-computed location sums for speed
+        precomputed_sums: Optional dict with pre-computed sums for speed
         
     Returns:
         Tuple of (total_production_mwh, breakdown_by_type)
     """
     mw_per_unit = config.ppu.MW_PER_UNIT
     n_hours = len(solar_data)
+    n_locations = solar_data.shape[1] if solar_data.ndim > 1 else 1
     
     # Production breakdown
     production_by_type = {
@@ -500,67 +504,76 @@ def calculate_cumulative_renewable_production(
         'hydro_ror': 0.0,
     }
     
-    # --- Solar PV (OPTIMIZED: use pre-computed sums or vectorized) ---
+    # =================================================================
+    # SOLAR PV - DISTRIBUTED across ALL locations
+    # Each PPU adds 1000 m² to every location
+    # =================================================================
     pv_count = portfolio.get_count('PV')
     if pv_count > 0:
         pv_def = ppu_definitions.get('PV')
         pv_efficiency = pv_def.efficiency if pv_def else 0.84
-        area_m2 = mw_per_unit * 1000  # m² per unit
+        area_per_location_m2 = 1000.0  # 1000 m² per PPU per location
+        efficiency_pv = 0.20  # 20% panel efficiency
+        
+        # Total area at each location = n_ppu × 1000 m²
+        total_area_per_loc = pv_count * area_per_location_m2
         
         if precomputed_sums and 'solar_location_sums' in precomputed_sums:
-            # Use pre-computed sums (FAST)
+            # Use pre-computed annual sums per location (FAST)
             solar_sums = precomputed_sums['solar_location_sums']
-            n_locs = min(pv_count, len(solar_ranking), len(solar_sums))
-            # Sum the best n_locs locations
-            ranked_sums = solar_sums[solar_ranking[:n_locs]]
-            production_by_type['solar'] = np.sum(ranked_sums) * area_m2 * pv_efficiency / 1000
+            # Sum across ALL locations (distributed model)
+            total_irradiance_kwh_m2 = np.sum(solar_sums)
         else:
-            # Vectorized fallback (still fast)
-            n_locs = min(pv_count, len(solar_ranking), solar_data.shape[1])
-            loc_indices = solar_ranking[:n_locs]
-            # Sum over hours for selected locations, then sum across locations
-            location_sums = np.sum(solar_data[:, loc_indices], axis=0)
-            production_by_type['solar'] = np.sum(location_sums) * area_m2 * pv_efficiency / 1000
+            # Sum all irradiance across all hours and locations
+            total_irradiance_kwh_m2 = np.nansum(solar_data)
+        
+        # Production = total_irradiance × area × PV_eff × chain_eff
+        # Result in MWh (irradiance is kWh/m², area is m², /1000 for MW, × hours implicit)
+        production_by_type['solar'] = (
+            total_irradiance_kwh_m2 * total_area_per_loc * efficiency_pv * pv_efficiency / 1000
+        )
     
-    # --- Wind Onshore (OPTIMIZED) ---
+    # =================================================================
+    # WIND ONSHORE - DISTRIBUTED across ALL locations
+    # Each PPU adds 1 turbine (3 MW) to every location
+    # =================================================================
     wind_on_count = portfolio.get_count('WD_ON')
     if wind_on_count > 0:
         wind_def = ppu_definitions.get('WD_ON')
         wind_efficiency = wind_def.efficiency if wind_def else 0.84
-        num_turbines = int(mw_per_unit / 3)
+        turbines_per_location = 1  # 1 turbine per PPU per location
+        rated_power_mw = 3.0
         
-        if precomputed_sums and 'wind_location_production' in precomputed_sums:
-            # Use pre-computed wind production (FAST)
-            wind_prod = precomputed_sums['wind_location_production']
-            n_locs = min(wind_on_count, len(wind_ranking), len(wind_prod))
-            ranked_prod = wind_prod[wind_ranking[:n_locs]]
-            production_by_type['wind_onshore'] = np.sum(ranked_prod) * wind_efficiency
-        else:
-            # Vectorized: process all locations at once
-            n_locs = min(wind_on_count, len(wind_ranking), wind_data.shape[1])
-            loc_indices = wind_ranking[:n_locs]
-            wind_speeds = wind_data[:, loc_indices]  # (n_hours, n_locs)
-            
-            # Vectorized wind power calculation
-            hourly_power = _wind_power_vectorized(wind_speeds, num_turbines)
-            production_by_type['wind_onshore'] = np.sum(hourly_power) * wind_efficiency
+        # Total turbines at each location = n_ppu × 1
+        total_turbines_per_loc = wind_on_count * turbines_per_location
+        
+        # Calculate wind power at ALL locations for all hours
+        hourly_power = _wind_power_vectorized_distributed(
+            wind_data, total_turbines_per_loc, rated_power_mw
+        )
+        production_by_type['wind_onshore'] = np.sum(hourly_power) * wind_efficiency
     
-    # --- Wind Offshore (OPTIMIZED) ---
+    # =================================================================
+    # WIND OFFSHORE - DISTRIBUTED across ALL locations
+    # Each PPU adds 1 turbine (5 MW) to every location
+    # =================================================================
     wind_off_count = portfolio.get_count('WD_OFF')
     if wind_off_count > 0:
         wind_def = ppu_definitions.get('WD_OFF')
         wind_efficiency = wind_def.efficiency if wind_def else 0.84
-        num_turbines = int(mw_per_unit / 5)  # Larger offshore turbines
+        turbines_per_location = 1
+        rated_power_mw = 5.0  # Larger offshore turbines
         
-        start_idx = wind_on_count
-        n_locs = min(wind_off_count, len(wind_ranking) - start_idx, wind_data.shape[1])
-        if n_locs > 0:
-            loc_indices = wind_ranking[start_idx:start_idx + n_locs]
-            wind_speeds = wind_data[:, loc_indices]
-            hourly_power = _wind_power_vectorized(wind_speeds, num_turbines, rated_power_mw=5.0)
-            production_by_type['wind_offshore'] = np.sum(hourly_power) * wind_efficiency
+        total_turbines_per_loc = wind_off_count * turbines_per_location
+        
+        hourly_power = _wind_power_vectorized_distributed(
+            wind_data, total_turbines_per_loc, rated_power_mw
+        )
+        production_by_type['wind_offshore'] = np.sum(hourly_power) * wind_efficiency
     
-    # --- Hydro Run-of-River (unchanged - already fast) ---
+    # =================================================================
+    # HYDRO RUN-OF-RIVER (unchanged - capacity factor based)
+    # =================================================================
     hyd_r_count = portfolio.get_count('HYD_R')
     if hyd_r_count > 0:
         hyd_def = ppu_definitions.get('HYD_R')
@@ -573,6 +586,46 @@ def calculate_cumulative_renewable_production(
     total_production = sum(production_by_type.values())
     
     return total_production, production_by_type
+
+
+def _wind_power_vectorized_distributed(
+    wind_speeds: np.ndarray,
+    turbines_per_location: int,
+    rated_power_mw: float = 3.0,
+    cut_in: float = 3.0,
+    rated_speed: float = 12.0,
+    cut_out: float = 25.0,
+) -> np.ndarray:
+    """
+    Vectorized wind power for DISTRIBUTED model - sum across ALL locations.
+    
+    Args:
+        wind_speeds: (n_hours, n_locations) or (n_hours,) array
+        turbines_per_location: Total turbines at each location
+        rated_power_mw: Rated power per turbine
+        cut_in, rated_speed, cut_out: Wind turbine parameters
+        
+    Returns:
+        Hourly power production summed across all locations (MW)
+    """
+    ws = np.nan_to_num(wind_speeds, nan=0.0)
+    
+    # Initialize power array
+    power = np.zeros_like(ws)
+    
+    # Cubic region: cut_in <= ws < rated_speed
+    cubic_mask = (ws >= cut_in) & (ws < rated_speed)
+    ratio = np.where(cubic_mask, (ws - cut_in) / (rated_speed - cut_in), 0)
+    power = np.where(cubic_mask, rated_power_mw * turbines_per_location * (ratio ** 3), power)
+    
+    # Rated region: rated_speed <= ws <= cut_out  
+    rated_mask = (ws >= rated_speed) & (ws <= cut_out)
+    power = np.where(rated_mask, rated_power_mw * turbines_per_location, power)
+    
+    # Sum across locations if 2D, otherwise return 1D
+    if power.ndim > 1:
+        return np.sum(power, axis=1)  # Sum across locations for each hour
+    return power
 
 
 def _wind_power_vectorized(
