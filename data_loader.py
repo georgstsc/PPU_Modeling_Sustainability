@@ -36,7 +36,7 @@ class CachedData:
     # Time series data (hourly for 2024)
     solar_incidence: np.ndarray  # Shape: (8760, n_locations)
     wind_incidence: np.ndarray   # Shape: (8760, n_locations)
-    spot_prices: np.ndarray      # Shape: (8760,)
+    spot_prices: np.ndarray      # Shape: (8760,) - in CHF/MWh (converted from EUR)
     demand: np.ndarray           # Shape: (8760,)
     
     # Location rankings (for building in optimal locations)
@@ -46,10 +46,17 @@ class CachedData:
     # Hydro data
     reservoir_levels: np.ndarray  # Monthly reservoir levels
     ror_production: np.ndarray    # Run-of-river monthly production
+    water_inflow_mwh: np.ndarray  # Hourly water inflow to lakes (MWh) - from precipitation
+    
+    # Palm oil and exchange rates (for dynamic pricing)
+    palm_oil_chf_mwh: np.ndarray  # Daily palm oil prices (CHF/MWh) - indexed by day of year
+    usd_chf_daily: np.ndarray     # Daily USD/CHF rates - for palm oil conversion
+    eur_chf_daily: np.ndarray     # Daily EUR/CHF rates - for spot price conversion
     
     # Cost data
     cost_table: pd.DataFrame
     ppu_components: pd.DataFrame
+    ppu_lcoe: pd.DataFrame        # PPU efficiency and LCOE (from ppu_efficiency_lcoe_analysis.csv)
     
     # Metadata
     n_hours: int = 8760
@@ -116,6 +123,28 @@ class CachedData:
     def get_ppu_components(self) -> pd.DataFrame:
         """Return a copy of PPU components."""
         return self.ppu_components.copy()
+    
+    def get_ppu_lcoe(self) -> pd.DataFrame:
+        """Return a copy of PPU LCOE data."""
+        return self.ppu_lcoe.copy()
+    
+    def get_water_inflow(self, copy: bool = True) -> np.ndarray:
+        """Return water inflow to lakes (MWh). Set copy=False for read-only operations."""
+        return self.water_inflow_mwh.copy() if copy else self.water_inflow_mwh
+    
+    def get_palm_oil_price(self, day_of_year: int) -> float:
+        """Return palm oil price (CHF/MWh) for a specific day of year (0-365)."""
+        day_idx = min(day_of_year, len(self.palm_oil_chf_mwh) - 1)
+        return float(self.palm_oil_chf_mwh[day_idx])
+    
+    def get_palm_oil_prices_daily(self, copy: bool = True) -> np.ndarray:
+        """Return daily palm oil prices (CHF/MWh)."""
+        return self.palm_oil_chf_mwh.copy() if copy else self.palm_oil_chf_mwh
+    
+    def get_eur_chf_rate(self, day_of_year: int) -> float:
+        """Return EUR/CHF rate for a specific day of year (0-365)."""
+        day_idx = min(day_of_year, len(self.eur_chf_daily) - 1)
+        return float(self.eur_chf_daily[day_idx])
 
 
 # =============================================================================
@@ -317,15 +346,156 @@ def _load_hydro_data(data_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     return reservoir, ror
 
 
-def _load_cost_data(data_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load cost table and PPU components."""
+def _load_cost_data(data_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load cost table, PPU components, and PPU LCOE."""
     cost_path = data_dir / 'cost_table_tidy.csv'
     cost_df = pd.read_csv(cost_path)
     
     ppu_path = data_dir / 'ppu_constructs_components.csv'
     ppu_df = pd.read_csv(ppu_path)
     
-    return cost_df, ppu_df
+    # Load PPU efficiency and LCOE data (with parallelism)
+    lcoe_path = data_dir / 'ppu_efficiency_lcoe_analysis.csv'
+    if lcoe_path.exists():
+        lcoe_df = pd.read_csv(lcoe_path)
+    else:
+        lcoe_df = pd.DataFrame()
+        warnings.warn("PPU LCOE file not found - using empty DataFrame")
+    
+    return cost_df, ppu_df, lcoe_df
+
+
+def _load_palm_oil_prices(data_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load palm oil prices and convert to CHF/MWh.
+    
+    Source: rea_holdings_share_prices.csv (USD/metric ton)
+    Conversion: USD/metric ton → CHF/MWh
+        - 1 metric ton = 12.22 MWh (at 44 MJ/kg energy density)
+        - USD → CHF via DAT_ASCII_USDCHF_M1_2024.csv
+    
+    Returns:
+        Tuple of (palm_oil_chf_mwh, usd_chf_daily) arrays indexed by day of year
+    """
+    # Load palm oil prices (USD/metric ton)
+    palm_path = data_dir / 'rea_holdings_share_prices.csv'
+    if palm_path.exists():
+        palm_df = pd.read_csv(palm_path)
+        # Clean up the DataFrame - the file has irregular structure
+        # First column should be date, use the second numeric column as price
+        palm_df.columns = ['date', 'open', 'high', 'low', 'close']
+        palm_df = palm_df.iloc[1:]  # Skip header row
+        palm_df['date'] = pd.to_datetime(palm_df['date'], errors='coerce')
+        palm_df['close'] = pd.to_numeric(palm_df['close'], errors='coerce')
+        palm_df = palm_df.dropna(subset=['date', 'close'])
+        palm_df = palm_df.set_index('date').sort_index()
+        
+        # Filter to 2024 and resample to daily (forward fill missing days)
+        palm_2024 = palm_df['2024-01-01':'2024-12-31']['close']
+        palm_daily = palm_2024.resample('D').ffill().bfill()
+    else:
+        # Default: 950 USD/ton average palm oil price
+        palm_daily = pd.Series([950.0] * 366, 
+                               index=pd.date_range('2024-01-01', periods=366, freq='D'))
+        warnings.warn("Palm oil price file not found - using default 950 USD/ton")
+    
+    # Load USD/CHF exchange rates
+    usd_chf_path = data_dir / 'DAT_ASCII_USDCHF_M1_2024.csv'
+    if usd_chf_path.exists():
+        # This is minute data with format: YYYYMMDD HHMMSS;open;high;low;close;volume
+        usd_df = pd.read_csv(usd_chf_path, sep=';', header=None,
+                             names=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+        usd_df['date'] = pd.to_datetime(usd_df['datetime'].str[:8], format='%Y%m%d', errors='coerce')
+        # Aggregate to daily average - the rate is USD per CHF
+        usd_daily = usd_df.groupby('date')['close'].mean()
+        # Convert USD per CHF to CHF per USD (invert)
+        chf_per_usd = 1.0 / usd_daily
+        chf_per_usd = chf_per_usd.resample('D').ffill().bfill()
+    else:
+        # Default: 0.88 CHF per USD
+        chf_per_usd = pd.Series([0.88] * 366,
+                                index=pd.date_range('2024-01-01', periods=366, freq='D'))
+        warnings.warn("USD/CHF rate file not found - using default 0.88 CHF/USD")
+    
+    # Align indices
+    date_range = pd.date_range('2024-01-01', periods=366, freq='D')
+    palm_aligned = palm_daily.reindex(date_range, method='ffill').fillna(950.0)
+    chf_aligned = chf_per_usd.reindex(date_range, method='ffill').fillna(0.88)
+    
+    # Convert USD/metric ton to CHF/MWh
+    # price_chf_mwh = price_usd_ton × chf_per_usd / mwh_per_ton
+    MWH_PER_TON = 12.22  # 44 MJ/kg × 1000 kg/ton ÷ 3600 MJ/MWh
+    palm_chf_mwh = (palm_aligned.values * chf_aligned.values) / MWH_PER_TON
+    
+    return palm_chf_mwh.astype(np.float32), chf_aligned.values.astype(np.float32)
+
+
+def _load_eur_chf_rates(data_dir: Path) -> np.ndarray:
+    """
+    Load EUR/CHF exchange rates for spot price conversion.
+    
+    Source: chf_to_eur_2024.csv (CHF to EUR rate)
+    Need: EUR to CHF rate (inverse)
+    
+    Returns:
+        Array of EUR/CHF rates indexed by day of year (366 days for 2024)
+    """
+    eur_path = data_dir / 'chf_to_eur_2024.csv'
+    if eur_path.exists():
+        eur_df = pd.read_csv(eur_path)
+        eur_df['Date'] = pd.to_datetime(eur_df['Date'], errors='coerce')
+        eur_df = eur_df.dropna(subset=['Date'])
+        eur_df = eur_df.set_index('Date').sort_index()
+        
+        # The file has "CHF to EUR" which means 1 CHF = X EUR
+        # We need EUR to CHF: 1 EUR = 1/X CHF
+        chf_to_eur = eur_df['CHF to EUR']
+        eur_to_chf = 1.0 / chf_to_eur
+        
+        # Resample to daily
+        eur_to_chf = eur_to_chf.resample('D').ffill().bfill()
+    else:
+        # Default: 0.93 EUR to CHF (1 EUR = 0.93 CHF, or 1 CHF = 1.08 EUR)
+        eur_to_chf = pd.Series([0.93] * 366,
+                               index=pd.date_range('2024-01-01', periods=366, freq='D'))
+        warnings.warn("EUR/CHF rate file not found - using default 0.93 CHF/EUR")
+    
+    # Align to full year
+    date_range = pd.date_range('2024-01-01', periods=366, freq='D')
+    eur_aligned = eur_to_chf.reindex(date_range, method='ffill').fillna(0.93)
+    
+    return eur_aligned.values.astype(np.float32)
+
+
+def _load_water_inflow(data_dir: Path, kwh_per_m3: float = 0.9) -> np.ndarray:
+    """
+    Load water inflow to lakes from precipitation data.
+    
+    Source: Swiss_Water_Hourly_2024.csv (Water_Reaching_Lakes_m3 column)
+    Conversion: m³ × 0.9 kWh/m³ = kWh, then /1000 = MWh
+    
+    Based on Swiss hydropower data from hydrodaten.admin.ch:
+    - 36.5 TWh annual production from 40.5 km³ runoff
+    - 36,500 GWh / 40,500 million m³ ≈ 0.90 kWh/m³
+    
+    Returns:
+        Array of hourly water inflow (MWh) - shape (8784,) for 2024
+    """
+    water_path = data_dir / 'Swiss_Water_Hourly_2024.csv'
+    if water_path.exists():
+        water_df = pd.read_csv(water_path)
+        if 'Water_Reaching_Lakes_m3' in water_df.columns:
+            water_m3 = water_df['Water_Reaching_Lakes_m3'].values
+            # Convert m³ to MWh: m³ × kWh/m³ ÷ 1000
+            water_mwh = water_m3 * kwh_per_m3 / 1000.0
+        else:
+            water_mwh = np.zeros(8784)
+            warnings.warn("Water inflow column not found - using zeros")
+    else:
+        water_mwh = np.zeros(8784)
+        warnings.warn("Water inflow file not found - using zeros")
+    
+    return water_mwh.astype(np.float32)
 
 
 # =============================================================================
@@ -359,8 +529,8 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
     wind_incidence, wind_ranking = _load_wind_incidence(data_dir)
     print(f"  - Wind incidence: {wind_incidence.shape}")
     
-    spot_prices = _load_spot_prices(data_dir)
-    print(f"  - Spot prices: {spot_prices.shape}")
+    spot_prices_eur = _load_spot_prices(data_dir)
+    print(f"  - Spot prices (EUR): {spot_prices_eur.shape}")
     
     demand = _load_demand(data_dir)
     print(f"  - Demand: {demand.shape}")
@@ -368,8 +538,28 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
     reservoir, ror = _load_hydro_data(data_dir)
     print(f"  - Hydro data loaded")
     
-    cost_table, ppu_components = _load_cost_data(data_dir)
-    print(f"  - Cost data loaded")
+    cost_table, ppu_components, ppu_lcoe = _load_cost_data(data_dir)
+    print(f"  - Cost data loaded (LCOE: {len(ppu_lcoe)} PPUs)")
+    
+    # Load exchange rates for currency conversion
+    eur_chf_daily = _load_eur_chf_rates(data_dir)
+    print(f"  - EUR/CHF rates: {len(eur_chf_daily)} days")
+    
+    # Load palm oil prices and USD/CHF rates
+    palm_oil_chf_mwh, usd_chf_daily = _load_palm_oil_prices(data_dir)
+    print(f"  - Palm oil prices (CHF/MWh): {len(palm_oil_chf_mwh)} days, avg {palm_oil_chf_mwh.mean():.2f}")
+    
+    # Load water inflow to lakes
+    water_inflow_mwh = _load_water_inflow(data_dir)
+    print(f"  - Water inflow: {len(water_inflow_mwh)} hours, total {water_inflow_mwh.sum()/1e6:.2f} TWh")
+    
+    # Convert spot prices from EUR to CHF (hourly)
+    # Map each hour to its day of year to get the right exchange rate
+    n_hours_spot = len(spot_prices_eur)
+    day_indices = np.arange(n_hours_spot) // 24
+    day_indices = np.clip(day_indices, 0, len(eur_chf_daily) - 1)
+    spot_prices = spot_prices_eur * eur_chf_daily[day_indices]
+    print(f"  - Spot prices converted to CHF: avg {spot_prices.mean():.2f} CHF/MWh")
     
     # Ensure consistent lengths across all time series
     # Use the minimum length (typically demand/spot which is 8784 for leap year 2024)
@@ -388,6 +578,9 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
     
     print(f"  - Aligned all data to {n_hours} timesteps ({n_hours/24:.0f} days)")
     
+    # Align water inflow to same length
+    water_inflow_mwh = water_inflow_mwh[:n_hours]
+    
     # Create cached data object
     _DATA_CACHE = CachedData(
         solar_incidence=solar_incidence,
@@ -398,8 +591,13 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
         wind_ranking=wind_ranking,
         reservoir_levels=reservoir,
         ror_production=ror,
+        water_inflow_mwh=water_inflow_mwh,
+        palm_oil_chf_mwh=palm_oil_chf_mwh,
+        usd_chf_daily=usd_chf_daily,
+        eur_chf_daily=eur_chf_daily,
         cost_table=cost_table,
         ppu_components=ppu_components,
+        ppu_lcoe=ppu_lcoe,
         n_hours=n_hours,
         n_solar_locations=solar_incidence.shape[1] if solar_incidence.ndim > 1 else 1,
         n_wind_locations=wind_incidence.shape[1] if wind_incidence.ndim > 1 else 1,

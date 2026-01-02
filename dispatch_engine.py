@@ -387,7 +387,7 @@ class StorageState:
     efficiency_charge: float
     efficiency_discharge: float
     
-    # Import pricing (for palm oil, biooil)
+    # Import pricing (for palm oil - dynamic from rea_holdings_share_prices.csv)
     import_price_chf_per_mwh: Optional[float] = None
     
     # Legacy compatibility - use discharge power as default
@@ -604,8 +604,9 @@ def wind_power_mw(
 DISPATCHABLE_GENERATORS = {
     'THERM_M': {'capacity_factor': 0.95, 'cost_per_mwh': 85},   # Methane thermal (direct import)
     'THERM_G': {'capacity_factor': 0.95, 'cost_per_mwh': 23},   # Gas thermal (direct import)
-    # BIO_WOOD: Wood → Pyrolysis → Biooil → Steam reforming → CCPP → Grid
+    # BIO_WOOD: Wood → Pyrolysis → Bio-based fuel → Steam reforming → CCPP → Grid
     # This is a flexible generator that uses biomass as direct input (not storage-backed)
+    # Note: Intermediate fuel is produced in-line, not from external storage
     'BIO_WOOD': {'capacity_factor': 0.70, 'cost_per_mwh': 215}, # Wood biomass (215 CHF/MWh from PPU costs)
 }
 
@@ -619,10 +620,10 @@ STORAGE_DISCHARGE_COSTS = {
     'H2 UG 200bar': 80,   # H2P_G extraction
     'CH4 200bar': 70,     # THERM_CH4 extraction
     'Liquid H2': 90,      # H2P_L extraction
-    'Fuel Tank': 60,      # THERM extraction
+    'Fuel Tank': 60,      # THERM extraction (also supplies aviation fuel)
     'Ammonia': 85,        # NH3_P extraction
-    'Biooil': 55,         # BIO_OIL_ICE extraction
-    'Palm oil': 55,       # PALM_ICE extraction
+    'Palm oil': 55,       # PALM_ICE extraction (only imported bio-fuel)
+    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
 }
 
 # Mapping from storage name to the PPU(s) that extract from it
@@ -634,10 +635,10 @@ STORAGE_TO_EXTRACTING_PPU = {
     'H2 UG 200bar': 'H2P_G',
     'CH4 200bar': 'THERM_CH4',
     'Liquid H2': 'H2P_L',
-    'Fuel Tank': 'THERM',
+    'Fuel Tank': 'THERM',  # Also provides aviation fuel
     'Ammonia': 'NH3_P',
-    'Biooil': 'BIO_OIL_ICE',
-    'Palm oil': 'PALM_ICE',
+    'Palm oil': 'PALM_ICE',  # Only imported bio-fuel
+    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
 }
 
 
@@ -978,16 +979,16 @@ def run_dispatch_simulation(
     # =========================================================================
     # AVIATION FUEL TRACKING
     # =========================================================================
-    # Mandatory biooil discharge for aviation: 23 TWh/year = ~2625.57 MWh/hour
+    # Mandatory synthetic fuel from Fuel Tank for aviation: 23 TWh/year = ~2625.57 MWh/hour
+    # NOTE: Changed from Biooil to Fuel Tank - synthetic fuel for aviation
     aviation_fuel_required_mwh = config.energy_system.AVIATION_FUEL_HOURLY_MWH * timestep_h
     aviation_fuel_consumed_series = np.zeros(n_timesteps)  # Track actual consumption
     aviation_fuel_shortfall_series = np.zeros(n_timesteps)  # Track any shortfall
     aviation_fuel_import_cost_series = np.zeros(n_timesteps)  # Track import costs
     
-    # Biooil import price from storage definition
-    biooil_import_price = config.storage.STORAGE_DEFINITIONS.get(
-        'Biooil', {}
-    ).get('import_price_chf_per_mwh', 67.0)
+    # Synthetic fuel cost (from Fuel Tank, produced by SYN_FT/SYN_CRACK)
+    # Use LCOE of SYN_FT as the reference cost for aviation fuel
+    synthetic_fuel_cost_per_mwh = 60.0  # Default, can be loaded from LCOE data
     
     # Track total aviation fuel metrics
     total_aviation_fuel_consumed_mwh = 0.0
@@ -1018,10 +1019,27 @@ def run_dispatch_simulation(
         print(f"Running dispatch simulation for {n_timesteps} timesteps...")
         print(f"  Dispatchable capacity: {total_dispatchable_mw:,.0f} MW")
     
+    # Load water inflow data for Lake (if available)
+    from data_loader import load_all_data
+    cached_data = load_all_data(config)
+    water_inflow_data = cached_data.get_water_inflow(copy=False)  # MWh per hour
+    
     for i, t in enumerate(scenario_indices):
         # Get data for this timestep
         demand_mw = demand_data[t] if t < len(demand_data) else 0.0
         spot_price = spot_data[t] if t < len(spot_data) else 50.0  # Default price
+        
+        # ===== WATER INFLOW TO LAKE =====
+        # Add precipitation-based water inflow to Lake storage
+        # Source: Swiss_Water_Hourly_2024.csv (0.9 kWh/m³ conversion)
+        if 'Lake' in state.storages:
+            lake = state.storages['Lake']
+            water_inflow_mwh = water_inflow_data[t] if t < len(water_inflow_data) else 0.0
+            # Add inflow to Lake (capped at capacity)
+            if water_inflow_mwh > 0:
+                space_available = lake.capacity_mwh - lake.current_mwh
+                actual_inflow = min(water_inflow_mwh, space_available)
+                lake.current_mwh += actual_inflow
         
         # ===== STEP 1: Calculate renewable production =====
         renewable_mw, renewable_breakdown = calculate_renewable_production_fast(
@@ -1169,10 +1187,14 @@ def run_dispatch_simulation(
                     proportion = weight / total_charge_weight
                     allocated_mwh = surplus_mwh * proportion
                     
-                    # Ghost PPU mechanism for Biooil and Palm oil
+                    # Ghost PPU mechanism for Palm oil (only imported bio-fuel)
                     # They sell surplus electricity on spot → import fuel
-                    if storage_name in ('Biooil', 'Palm oil'):
-                        import_price = 67.0 if storage_name == 'Biooil' else 87.0
+                    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
+                    if storage_name == 'Palm oil':
+                        # Palm oil price is DYNAMIC (from rea_holdings_share_prices.csv)
+                        # Get daily price - t is the timestep index, convert to day of year
+                        day_of_year = t // 24  # Convert hour to day
+                        import_price = cached_data.get_palm_oil_price(day_of_year)
                         
                         # Sell allocated surplus on spot market
                         spot_revenue = allocated_mwh * spot_price
@@ -1224,46 +1246,46 @@ def run_dispatch_simulation(
             storage_soc_series[name][i] = storage.soc
         
         # =====================================================================
-        # MANDATORY AVIATION FUEL CONSUMPTION
+        # MANDATORY AVIATION FUEL CONSUMPTION (from Fuel Tank)
         # =====================================================================
-        # Aviation fuel (23 TWh/year biooil) is a HARD constraint
+        # Aviation fuel (23 TWh/year synthetic fuel) is a HARD constraint
+        # Supplied from Fuel Tank (produced by SYN_FT, SYN_CRACK PPUs)
         # We ALWAYS meet it by:
-        # 1. First, use biooil from storage (if available)
-        # 2. Then, IMPORT any shortfall at import price (67 CHF/MWh)
-        # This ensures aviation fuel is always consumed - no shortfall.
+        # 1. First, use synthetic fuel from Fuel Tank (if available)
+        # 2. Then, track shortfall (cannot import synthetic fuel directly)
         
         from_storage_mwh = 0.0
-        imported_mwh = 0.0
+        shortfall_mwh = 0.0
         
-        if 'Biooil' in state.storages:
-            biooil_storage = state.storages['Biooil']
+        if 'Fuel Tank' in state.storages:
+            fuel_tank = state.storages['Fuel Tank']
             
             # Try to discharge from storage first
-            available_biooil_mwh = biooil_storage.current_mwh
-            from_storage_mwh = min(aviation_fuel_required_mwh, available_biooil_mwh)
+            available_fuel_mwh = fuel_tank.current_mwh
+            from_storage_mwh = min(aviation_fuel_required_mwh, available_fuel_mwh)
             
-            # Withdraw from storage (no efficiency loss - raw fuel to planes)
-            biooil_storage.current_mwh -= from_storage_mwh
+            # Withdraw from storage (no efficiency loss - direct fuel to planes)
+            fuel_tank.current_mwh -= from_storage_mwh
         
-        # Import any shortfall (automatic purchase at import price)
-        imported_mwh = aviation_fuel_required_mwh - from_storage_mwh
+        # Track shortfall (synthetic fuel cannot be directly imported)
+        shortfall_mwh = aviation_fuel_required_mwh - from_storage_mwh
         
-        # Total consumed = from storage + imported (always meets requirement)
-        total_consumed_mwh = from_storage_mwh + imported_mwh
+        # Total consumed = what we could get from storage
+        total_consumed_mwh = from_storage_mwh
         
-        # Track consumption (always equals required)
+        # Track consumption
         aviation_fuel_consumed_series[i] = total_consumed_mwh
         total_aviation_fuel_consumed_mwh += total_consumed_mwh
         
-        # Shortfall is now only tracked for info (but should always be 0)
-        # We import to cover it, so actual shortfall = 0
-        aviation_fuel_shortfall_series[i] = 0.0  # No shortfall - we import
+        # Track shortfall (this is a constraint violation if > 0)
+        aviation_fuel_shortfall_series[i] = shortfall_mwh
+        total_aviation_fuel_shortfall_mwh += shortfall_mwh
         
-        # Calculate import cost for ALL biooil consumed
-        # (Biooil must be purchased/imported regardless of source)
-        import_cost = total_consumed_mwh * biooil_import_price
-        aviation_fuel_import_cost_series[i] = import_cost
-        total_aviation_fuel_import_cost_chf += import_cost
+        # Calculate production cost for fuel consumed (based on Fuel Tank LCOE)
+        # Cost is embedded in the synthetic fuel production, not import
+        production_cost = total_consumed_mwh * synthetic_fuel_cost_per_mwh
+        aviation_fuel_import_cost_series[i] = production_cost
+        total_aviation_fuel_import_cost_chf += production_cost
     
     # Compile dispatchable production summary
     dispatchable_summary = {

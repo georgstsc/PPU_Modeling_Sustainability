@@ -157,7 +157,7 @@ def plot_portfolio_composition(
         'Solar': ['PV'],
         'Wind': ['WD_ON', 'WD_OFF'],
         'Hydro': ['HYD_R', 'HYD_S', 'PHS'],
-        'Thermal': ['THERM', 'THERM_CH4', 'BIO_OIL_ICE', 'PALM_ICE'],
+        'Thermal': ['THERM', 'THERM_CH4', 'PALM_ICE'],  # BIO_OIL_ICE removed
         'Hydrogen': ['H2_G', 'H2_GL', 'H2_L', 'H2P_G', 'H2P_L'],
         'Synthesis': ['SYN_FT', 'SYN_METH', 'SYN_CRACK', 'NH3_FULL', 'NH3_P'],
         'Bio': ['BIO_WOOD', 'CH4_BIO', 'IMP_BIOG'],
@@ -997,7 +997,7 @@ def plot_energy_flow(
             'type': 'generator',
         },
         'GENERATOR - Biomass': {
-            'ppus': ['BIO_WOOD', 'BIO_OIL_ICE', 'PALM_ICE', 'IMP_BIOG'],
+            'ppus': ['BIO_WOOD', 'PALM_ICE', 'IMP_BIOG'],  # BIO_OIL_ICE removed
             'color': COLORS['bio'],
             'type': 'generator',
         },
@@ -1332,7 +1332,7 @@ def plot_full_year_production_by_source(
         'Hydro (Lake)': ['HYD_S', 'Lake'],
         'Solar (Storage)': ['SOL_SALT', 'SOL_STEAM', 'Solar salt'],
         'Synthetic Fuels': ['H2', 'THERM', 'NH3', 'CH4', 'Fuel Tank', 'Ammonia'],
-        'Biomass': ['BIO', 'PALM', 'Biooil', 'Palm oil', 'Biogas'],
+        'Biomass': ['BIO', 'PALM', 'Palm oil', 'Biogas'],  # Biooil removed
         'Other': [],
     }
     

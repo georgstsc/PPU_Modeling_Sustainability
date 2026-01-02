@@ -219,6 +219,7 @@ def build_ppu_definitions(
     ppu_constructs_df: pd.DataFrame,
     cost_df: pd.DataFrame,
     storage_definitions: Dict[str, Dict],
+    ppu_lcoe_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, PPUDefinition]:
     """
     Build complete PPU definitions from construct data.
@@ -227,11 +228,23 @@ def build_ppu_definitions(
         ppu_constructs_df: PPU constructs DataFrame
         cost_df: Cost table DataFrame
         storage_definitions: Storage configuration from config
+        ppu_lcoe_df: Optional PPU LCOE DataFrame (from ppu_efficiency_lcoe_analysis.csv)
+                     If provided, uses pre-computed efficiency and LCOE values
+                     which properly handle parallel PPU chains.
         
     Returns:
         Dictionary mapping PPU name to PPUDefinition
     """
     ppu_defs = {}
+    
+    # Build LCOE lookup if available
+    lcoe_lookup = {}
+    if ppu_lcoe_df is not None and not ppu_lcoe_df.empty:
+        for _, row in ppu_lcoe_df.iterrows():
+            lcoe_lookup[row['PPU']] = {
+                'efficiency': float(row['Efficiency']),
+                'lcoe_chf_kwh': float(row['LCOE_CHF_kWh']),  # Already in CHF/kWh
+            }
     
     for _, row in ppu_constructs_df.iterrows():
         ppu_name = row['PPU']
@@ -239,8 +252,16 @@ def build_ppu_definitions(
         category = row.get('Category', 'Production')
         extract_type = row.get('Extract', 'Flex')
         
-        # Calculate costs
-        cost_data = calculate_chain_cost(components, cost_df)
+        # Use LCOE data if available (includes parallelism), else calculate from chain
+        if ppu_name in lcoe_lookup:
+            # Use pre-computed LCOE (handles parallel chains correctly)
+            efficiency = lcoe_lookup[ppu_name]['efficiency']
+            cost_per_mwh = lcoe_lookup[ppu_name]['lcoe_chf_kwh']  # Actually CHF/kWh
+        else:
+            # Fall back to chain calculation
+            cost_data = calculate_chain_cost(components, cost_df)
+            efficiency = cost_data.efficiency
+            cost_per_mwh = cost_data.cost_per_mwh
         
         # Determine storage relationships
         can_extract_from = []
@@ -257,8 +278,8 @@ def build_ppu_definitions(
             category=category,
             extract_type=extract_type,
             components=components,
-            efficiency=cost_data.efficiency,
-            cost_per_mwh=cost_data.cost_per_mwh,
+            efficiency=efficiency,
+            cost_per_mwh=cost_per_mwh,
             can_extract_from=can_extract_from,
             can_input_to=can_input_to,
         )
@@ -363,8 +384,7 @@ def estimate_annual_production(
         'H2P_L': 0.80,
         'SOL_SALT': 0.60,
         'SOL_STEAM': 0.60,
-        'BIO_OIL_ICE': 0.80,
-        'PALM_ICE': 0.80,
+        'PALM_ICE': 0.80,  # Only imported bio-fuel (BIO_OIL_ICE removed)
         'IMP_BIOG': 0.80,
         'THERM_CH4': 0.80,
         'NH3_P': 0.80,
@@ -373,7 +393,7 @@ def estimate_annual_production(
     # Storage PPUs don't produce, they store
     STORAGE_PPUS = {'PHS', 'H2_G', 'H2_GL', 'H2_L', 'SYN_FT', 'SYN_METH', 
                     'NH3_FULL', 'SYN_CRACK', 'CH4_BIO', 'SOL_SALT_STORE',
-                    'BIOOIL_IMPORT', 'PALM_IMPORT'}
+                    'PALM_IMPORT'}  # BIOOIL_IMPORT removed
     
     total_twh = 0.0
     mw_per_unit = config.ppu.MW_PER_UNIT
@@ -426,14 +446,14 @@ def check_aviation_fuel_capacity(
     config: Config = DEFAULT_CONFIG,
 ) -> Tuple[bool, int, int, float]:
     """
-    Check if portfolio has sufficient BIO_OIL_ICE capacity for aviation fuel.
+    Check if portfolio has sufficient THERM + SYN_FT/SYN_CRACK capacity for aviation fuel.
     
-    Aviation fuel requirement: 23 TWh/year = ~2625.57 MWh/hour
-    Each BIO_OIL_ICE unit provides 10 MW = 10 MWh/hour
-    Minimum units needed: ceil(2625.57 / 10) = 263 units
+    Aviation fuel requirement: 23 TWh/year = ~2625.57 MWh/hour from Fuel Tank
+    Aviation fuel is supplied from Fuel Tank (synthetic fuel) via THERM PPU.
+    SYN_FT and SYN_CRACK produce synthetic fuel to fill Fuel Tank.
     
-    Note: This is a capacity check only. Actual biooil storage replenishment
-    (via domestic production or imports) must be sufficient to meet hourly demand.
+    Note: This is a capacity check only. Actual Fuel Tank production
+    (via SYN_FT/SYN_CRACK) must be sufficient to meet hourly demand.
     
     Args:
         portfolio: Portfolio to check
@@ -442,19 +462,30 @@ def check_aviation_fuel_capacity(
     Returns:
         Tuple of (has_capacity, current_units, required_units, hourly_capacity_mwh)
     """
-    bio_oil_ice_count = portfolio.ppu_counts.get('BIO_OIL_ICE', 0)
+    # THERM extracts from Fuel Tank for aviation (and electricity)
+    therm_count = portfolio.ppu_counts.get('THERM', 0)
+    # SYN_FT and SYN_CRACK produce synthetic fuel
+    syn_ft_count = portfolio.ppu_counts.get('SYN_FT', 0)
+    syn_crack_count = portfolio.ppu_counts.get('SYN_CRACK', 0)
+    
     required_hourly_mwh = config.energy_system.AVIATION_FUEL_HOURLY_MWH
     
-    # Each unit = 10 MW = 10 MWh/hour discharge capacity
+    # Each unit = 10 MW = 10 MWh/hour capacity
     mw_per_unit = config.ppu.MW_PER_UNIT
-    hourly_capacity_mwh = bio_oil_ice_count * mw_per_unit
     
-    # Calculate minimum required units
+    # THERM can extract for aviation (but also serves electricity demand)
+    therm_capacity_mwh = therm_count * mw_per_unit
+    
+    # SYN_FT + SYN_CRACK produce fuel for Fuel Tank
+    syn_production_capacity = (syn_ft_count + syn_crack_count) * mw_per_unit
+    
+    # Calculate minimum required units for extraction
     min_required_units = int(np.ceil(required_hourly_mwh / mw_per_unit))
     
-    has_capacity = bio_oil_ice_count >= min_required_units
+    # Check if we have enough extraction capacity (THERM)
+    has_capacity = therm_count >= min_required_units
     
-    return has_capacity, bio_oil_ice_count, min_required_units, hourly_capacity_mwh
+    return has_capacity, therm_count, min_required_units, therm_capacity_mwh
 
 
 # =============================================================================
@@ -955,11 +986,19 @@ def load_all_ppu_data(
     # Load constructs
     constructs_df = load_ppu_constructs(data_dir / config.paths.PPU_CONSTRUCTS)
     
-    # Build definitions
+    # Load LCOE data (includes parallelism) if available
+    lcoe_path = data_dir / 'ppu_efficiency_lcoe_analysis.csv'
+    if lcoe_path.exists():
+        ppu_lcoe_df = pd.read_csv(lcoe_path)
+    else:
+        ppu_lcoe_df = None
+    
+    # Build definitions (using LCOE data if available)
     ppu_definitions = build_ppu_definitions(
         constructs_df, 
         cost_df, 
-        config.storage.STORAGE_DEFINITIONS
+        config.storage.STORAGE_DEFINITIONS,
+        ppu_lcoe_df=ppu_lcoe_df,
     )
     
     return cost_df, constructs_df, ppu_definitions

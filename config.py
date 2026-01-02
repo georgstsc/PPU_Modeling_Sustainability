@@ -86,11 +86,12 @@ class EnergySystemConfig:
     def AVIATION_FUEL_HOURLY_MWH(self) -> float:
         return self.AVIATION_FUEL_DEMAND_TWH_YEAR * 1e6 / 8760
     
-    # Minimum BIO_OIL_ICE units needed to meet hourly discharge
+    # Minimum THERM units needed to extract aviation fuel from Fuel Tank
+    # Aviation fuel comes from Fuel Tank (synthetic fuel) via THERM PPU
     # Each unit = 10 MW, hourly discharge = 2625.57 MWh = 2625.57 MW for 1 hour
-    # Need ~263 units minimum
+    # Need ~263 units minimum (but THERM also serves electricity demand)
     @property
-    def MIN_BIO_OIL_ICE_UNITS(self) -> int:
+    def MIN_THERM_UNITS_FOR_AVIATION(self) -> int:
         return int(np.ceil(self.AVIATION_FUEL_HOURLY_MWH / 10.0))
 
 
@@ -171,13 +172,17 @@ class StorageConfig:
     # These are initial/default values, scaled by portfolio
     STORAGE_DEFINITIONS: Dict[str, Dict] = field(default_factory=lambda: {
         'Lake': {
-            'capacity_MWh': 8_870_000,  # Swiss hydro reservoir ~8.87 TWh
+            'capacity_MWh': 8_870_000,  # Swiss hydro reservoir ~8.87 TWh (max capacity)
             'max_power_MW': 2_000,      # Physical limit: 2 GW (regardless of PPU count)
             'physical_power_cap_MW': 2_000,  # Hard cap on Lake power
             'efficiency_charge': 0.88,  # PHS pump efficiency
             'efficiency_discharge': 0.88,  # Turbine efficiency
             'extracted_by': ['HYD_S'],
             'input_by': ['PHS'],
+            # Water inflow from precipitation (from Swiss_Water_Hourly_2024.csv)
+            # Conversion: 0.9 kWh per m³ (from hydrodaten.admin.ch: 36.5 TWh / 40.5 km³)
+            'water_energy_kwh_per_m3': 0.9,  # kWh per cubic meter
+            'receives_water_inflow': True,   # Receives hourly water inflow
         },
         'Fuel Tank': {
             'capacity_MWh': 20_000_000,
@@ -214,23 +219,19 @@ class StorageConfig:
             'extracted_by': ['SOL_STEAM', 'SOL_SALT'],
             'input_by': ['SOL_SALT_STORE'],
         },
-        'Biooil': {
+        # NOTE: Biooil storage removed - Palm oil is the only imported bio-fuel
+        # Aviation fuel requirement (23 TWh/year) now comes from Fuel Tank (synthetic fuel)
+        'Palm oil': {
             'capacity_MWh': 500_000,
             'max_power_MW': 5_000,
             'efficiency_charge': 1.0,  # Purchase at market price
             'efficiency_discharge': 0.30,  # ICE efficiency
-            'extracted_by': ['BIO_OIL_ICE'],
-            'input_by': ['BIOOIL_IMPORT'],  # Buy at 67 CHF/MWh
-            'import_price_chf_per_mwh': 67.0,
-        },
-        'Palm oil': {
-            'capacity_MWh': 500_000,
-            'max_power_MW': 5_000,
-            'efficiency_charge': 1.0,
-            'efficiency_discharge': 0.30,
             'extracted_by': ['PALM_ICE'],
-            'input_by': ['PALM_IMPORT'],  # Buy at 87 CHF/MWh
-            'import_price_chf_per_mwh': 87.0,
+            'input_by': ['PALM_IMPORT'],
+            # Price is DYNAMIC: loaded from rea_holdings_share_prices.csv (USD/metric ton)
+            # Converted to CHF/MWh using USD/CHF exchange rate and 44 MJ/kg energy density
+            # 1 metric ton = 1000 kg × 44 MJ/kg = 44,000 MJ = 12.22 MWh
+            'energy_density_mwh_per_ton': 12.22,  # 44 MJ/kg average
         },
         'Biogas': {
             'capacity_MWh': 200_000,
@@ -282,16 +283,16 @@ class PPUConfig:
     # Flexible/dispatchable PPUs (depend on storage)
     FLEX_PPUS: List[str] = field(default_factory=lambda: [
         'HYD_S',      # Hydro storage
-        'THERM',      # Thermal (fuel tank)
+        'THERM',      # Thermal (fuel tank) - also supplies aviation fuel
         'H2P_G',      # H2 gas power
         'H2P_L',      # H2 liquid power
         'SOL_SALT',   # Solar salt thermal
         'SOL_STEAM',  # Solar steam
-        'BIO_OIL_ICE', # Biooil ICE
-        'PALM_ICE',   # Palm oil ICE
+        'PALM_ICE',   # Palm oil ICE (only imported bio-fuel)
         'IMP_BIOG',   # Imported biogas
         'THERM_CH4',  # Methane thermal
         'NH3_P',      # Ammonia power
+        # NOTE: BIO_OIL_ICE removed - redundant with PALM_ICE
     ])
     
     # Storage input PPUs
@@ -326,8 +327,7 @@ class PPUConfig:
         'H2P_L': (0, 1000),       # Up to 10 GW
         'SOL_SALT': (0, 1000),    # Up to 10 GW
         'SOL_STEAM': (0, 1000),   # Up to 10 GW
-        'BIO_OIL_ICE': (0, 1000), # Up to 10 GW
-        'PALM_ICE': (0, 1000),    # Up to 10 GW
+        'PALM_ICE': (0, 1000),    # Up to 10 GW (only imported bio-fuel)
         'IMP_BIOG': (0, 1000),    # Up to 10 GW
         'THERM_CH4': (0, 1000),   # Up to 10 GW
         'NH3_P': (0, 1000),       # Up to 10 GW
@@ -374,8 +374,7 @@ class PPUConfig:
         'H2P_L': {'soft_cap': 50, 'factor': 0.0004},     # After 0.5 GW, liquid H2 more expensive
         'SOL_SALT': {'soft_cap': 50, 'factor': 0.0005},  # After 0.5 GW, concentrated solar limited
         'SOL_STEAM': {'soft_cap': 50, 'factor': 0.0005}, # After 0.5 GW
-        'BIO_OIL_ICE': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW
-        'PALM_ICE': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW, import dependency
+        'PALM_ICE': {'soft_cap': 50, 'factor': 0.0004}, # After 0.5 GW, import dependency (only bio-fuel)
         'IMP_BIOG': {'soft_cap': 50, 'factor': 0.0005},  # After 0.5 GW, import capacity
         'THERM_CH4': {'soft_cap': 50, 'factor': 0.0002}, # After 0.5 GW
         'NH3_P': {'soft_cap': 50, 'factor': 0.0004},    # After 0.5 GW, ammonia infrastructure
@@ -443,10 +442,9 @@ class DispatchConfig:
         'H2 UG 200bar', # Lower efficiency but available
         'CH4 200bar',
         'Liquid H2',
-        'Fuel Tank',   # Flexible but lower efficiency
+        'Fuel Tank',   # Flexible but lower efficiency (also supplies aviation fuel)
         'Ammonia',
-        'Biooil',      # Low efficiency but unlimited import
-        'Palm oil',
+        'Palm oil',    # Only imported bio-fuel (Biooil removed)
     ])
     
     # Priority order for storage charging (when supply > demand)
@@ -457,10 +455,9 @@ class DispatchConfig:
         'CH4 200bar',  # Methanation
         'Biogas',
         'Liquid H2',
-        'Fuel Tank',   # FT synthesis
+        'Fuel Tank',   # FT synthesis (also supplies aviation fuel)
         'Ammonia',
-        'Biooil',      # Only when very cheap
-        'Palm oil',
+        'Palm oil',    # Ghost PPU import (only bio-fuel)
     ])
     
     # Spot price thresholds for storage decisions (CHF/MWh)
