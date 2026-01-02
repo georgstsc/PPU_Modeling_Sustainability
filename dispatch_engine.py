@@ -1165,7 +1165,7 @@ def run_dispatch_simulation(
                     if remaining_surplus_mwh <= 0:
                         break
                     
-                storage = state.storages[storage_name]
+                    storage = state.storages[storage_name]
                     proportion = weight / total_charge_weight
                     allocated_mwh = surplus_mwh * proportion
                     
