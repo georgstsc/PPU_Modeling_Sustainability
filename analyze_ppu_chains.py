@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""PPU Chain Analysis: Efficiency and LCOE Calculation."""
+"""
+PPU Chain Analysis: Efficiency and LCOE Calculation.
+
+IMPORTANT CHANGE (v2.0):
+- LCOE is now calculated by DIRECTLY SUMMING the 'cost' column from cost_table_tidy.csv
+- We NO LONGER calculate from CAPEX/OPEX to avoid double-counting efficiency losses
+- Efficiency is ONLY used for calculating chain efficiency (energy output), NOT for cost adjustment
+- The 'cost' column already represents the cost per kWh for each component
+- Progressive cost escalation (soft caps) remains unchanged
+"""
 
 import pandas as pd
 import ast
@@ -14,6 +23,7 @@ for _, row in cost_df.iterrows():
     comp_map[row['item']] = {
         'eff': float(row['efficiency']) if pd.notna(row['efficiency']) else 1.0,
         'w': float(row['w']) if pd.notna(row['w']) else 0.0,
+        'cost': float(row['cost']) if pd.notna(row['cost']) else 0.0,  # Direct cost in CHF/kWh
         'capex': float(row['capex']) if pd.notna(row['capex']) else 0.0,
         'opex': float(row['opex']) if pd.notna(row['opex']) else 0.0,
         'lifetime': float(row['lifetime']) if pd.notna(row['lifetime']) else 20.0,
@@ -45,9 +55,9 @@ def get_comp(name):
     # Special cases for components without cost data (natural resources, basic infrastructure)
     zero_cost_components = ['River', 'Grid']  # These are "free" natural resources or basic infrastructure
     if name in zero_cost_components:
-        return {'eff': 1.0, 'w': 0.0, 'capex': 0.0, 'opex': 0.0, 'lifetime': 50.0, 'pavg': 1.0}
+        return {'eff': 1.0, 'w': 0.0, 'cost': 0.0, 'capex': 0.0, 'opex': 0.0, 'lifetime': 50.0, 'pavg': 1.0}
     print(f"  ⚠️  Component '{name}' not found")
-    return {'eff': 1.0, 'w': 0.0, 'capex': 0.0, 'opex': 0.0, 'lifetime': 20.0, 'pavg': 1.0}
+    return {'eff': 1.0, 'w': 0.0, 'cost': 0.0, 'capex': 0.0, 'opex': 0.0, 'lifetime': 20.0, 'pavg': 1.0}
 
 # Parallel PPU configurations: (branch1, branch2, merge, (weight1, weight2))
 PARALLEL = {
@@ -112,26 +122,50 @@ def parallel_eff(b1, b2, merge, weights):
     
     return eta_m * (w1 * eta1 + w2 * eta2) * (1 - min(w_tot, 0.99))
 
-def annuity(capex, lifetime, r=0.02):
-    """Amortize CAPEX over lifetime."""
-    if lifetime <= 0 or capex <= 0:
-        return 0.0
-    return capex * r * (1+r)**lifetime / ((1+r)**lifetime - 1)
-
-def calc_lcoe(comps, eff):
-    """LCOE for 1 GW plant in CHF/kWh."""
-    annual = 0.0
-    pavg = 1.0
+def calc_lcoe_direct(comps):
+    """
+    Calculate LCOE by directly summing the 'cost' column from cost_table_tidy.csv.
+    
+    This avoids double-counting efficiency losses, as the 'cost' column already
+    represents the cost per kWh for each component. We simply sum them.
+    
+    Efficiency is NOT used to adjust costs here - it's only used separately
+    to calculate the overall chain efficiency for energy output calculations.
+    
+    IMPORTANT: The 'cost' column is assumed to already account for component-level
+    costs. We do NOT divide by efficiency, as that would double-count losses.
+    """
+    total_cost = 0.0
     for c in comps:
         d = get_comp(c)
-        cap = d['capex'] * 1e6  # CHF for 1 GW (capex is CHF/kW × 1e6 kW)
-        opx = d['opex'] * 1e6   # CHF/yr for 1 GW
-        annual += annuity(cap, d['lifetime']) + opx
-        if d['pavg'] < pavg:
-            pavg = d['pavg']
+        comp_cost = d.get('cost', 0.0)
+        if comp_cost == 0.0 and c not in ['River', 'Grid']:
+            print(f"    ⚠️  Warning: Component '{c}' has zero cost")
+        total_cost += comp_cost  # Direct sum of component costs (CHF/kWh)
+    return total_cost
+
+def calc_lcoe_parallel(b1, b2, merge, weights):
+    """
+    Calculate LCOE for parallel chains by weighted sum of branch costs.
     
-    energy_mwh = 1000 * 8760 * pavg * eff  # 1 GW × 8760h × CF × efficiency
-    return (annual / energy_mwh / 1000) if energy_mwh > 0 else 999.0
+    For parallel chains, we weight the costs by the branch weights:
+    - Branch 1 cost × weight1 + Branch 2 cost × weight2 + Merge cost
+    
+    IMPORTANT: Costs are NOT adjusted by efficiency here. The 'cost' column
+    already represents the cost per kWh for each component.
+    """
+    w1, w2 = weights
+    
+    # Branch 1 cost (weighted)
+    branch1_cost = sum(get_comp(c).get('cost', 0.0) for c in b1) * w1
+    
+    # Branch 2 cost (weighted)
+    branch2_cost = sum(get_comp(c).get('cost', 0.0) for c in b2) * w2
+    
+    # Merge path cost (full cost, not weighted)
+    merge_cost = sum(get_comp(c).get('cost', 0.0) for c in merge)
+    
+    return branch1_cost + branch2_cost + merge_cost
 
 # Main analysis
 print("=" * 120)
@@ -149,13 +183,12 @@ for _, row in ppu_df.iterrows():
     if ppu in PARALLEL:
         b1, b2, merge, w = PARALLEL[ppu]
         eff = parallel_eff(b1, b2, merge, w)
-        all_c = b1 + b2 + merge
-        lcoe = calc_lcoe(all_c, eff)
+        lcoe = calc_lcoe_parallel(b1, b2, merge, w)
         typ = 'Parallel'
         subchains = f"B1({w[0]:.0%}): {b1} | B2({w[1]:.0%}): {b2} | Merge: {merge}"
     else:
         eff = chain_eff(comps)
-        lcoe = calc_lcoe(comps, eff)
+        lcoe = calc_lcoe_direct(comps)
         typ = 'Sequential'
         subchains = ' → '.join(comps)
     
@@ -221,8 +254,17 @@ for ppu, (b1, b2, merge, w) in PARALLEL.items():
     print(f"         = {eta_m:.4f} × ({w[0]:.2f}×{eta1:.4f} + {w[1]:.2f}×{eta2:.4f}) × {1-w_tot:.4f}")
     print(f"  ✅ Overall Efficiency: {eta_final:.4f} ({eta_final*100:.2f}%)")
     
-    lcoe = calc_lcoe(all_c, eta_final)
-    print(f"  ✅ LCOE: {lcoe:.4f} CHF/kWh ({lcoe*1000:.2f} CHF/MWh)")
+    # Cost breakdown
+    branch1_cost = sum(get_comp(c)['cost'] for c in b1)
+    branch2_cost = sum(get_comp(c)['cost'] for c in b2)
+    merge_cost = sum(get_comp(c)['cost'] for c in merge)
+    print(f"  Cost breakdown:")
+    print(f"    Branch 1 cost: {branch1_cost:.6f} CHF/kWh × {w[0]:.2f} = {branch1_cost * w[0]:.6f} CHF/kWh")
+    print(f"    Branch 2 cost: {branch2_cost:.6f} CHF/kWh × {w[1]:.2f} = {branch2_cost * w[1]:.6f} CHF/kWh")
+    print(f"    Merge cost: {merge_cost:.6f} CHF/kWh")
+    
+    lcoe = calc_lcoe_parallel(b1, b2, merge, w)
+    print(f"  ✅ LCOE (direct sum): {lcoe:.4f} CHF/kWh ({lcoe*1000:.2f} CHF/MWh)")
 
 # Sequential PPU details
 print("\n" + "=" * 120)
@@ -238,15 +280,18 @@ for r in results:
         
         running_eta = 1.0
         w_tot = 0.0
+        total_cost = 0.0
         for c in comps:
             d = get_comp(c)
             running_eta *= d['eff']
             w_tot += d['w']
-            print(f"  • {c:<35} η={d['eff']:.4f}  w={d['w']:.4f}  → cumulative η={running_eta:.4f}")
+            total_cost += d['cost']
+            print(f"  • {c:<35} η={d['eff']:.4f}  w={d['w']:.4f}  cost={d['cost']:.6f} CHF/kWh  → cumulative η={running_eta:.4f}")
         
         final_eta = running_eta * (1 - min(w_tot, 0.99))
         print(f"  Loss adjustment: (1 - Σw) = (1 - {w_tot:.4f}) = {1-w_tot:.4f}")
         print(f"  ✅ Overall Efficiency: {final_eta:.4f} ({final_eta*100:.2f}%)")
+        print(f"  ✅ Total Cost (direct sum): {total_cost:.6f} CHF/kWh")
         print(f"  ✅ LCOE: {r['LCOE_CHF_kWh']:.4f} CHF/kWh ({r['LCOE_CHF_kWh']*1000:.2f} CHF/MWh)")
 
 # Save to CSV
