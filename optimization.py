@@ -191,10 +191,23 @@ def calculate_progressive_cost_penalty(
             continue
         
         # Get base cost for this PPU (CHF/MWh)
-        base_cost = 50.0  # Default
+        # CRITICAL: No fallback prices allowed - must find actual cost
+        base_cost = None
         if ppu_name in ppu_definitions:
             ppu_def = ppu_definitions[ppu_name]
-            base_cost = getattr(ppu_def, 'cost_per_mwh', 50.0)
+            if hasattr(ppu_def, 'cost_per_mwh'):
+                # cost_per_mwh is in CHF/kWh, convert to CHF/MWh
+                base_cost = ppu_def.cost_per_mwh * 1000.0
+            elif isinstance(ppu_def, dict) and 'cost_per_mwh' in ppu_def:
+                base_cost = ppu_def['cost_per_mwh'] * 1000.0
+        
+        # CRITICAL: Raise error if cost not found - no fallback allowed
+        if base_cost is None:
+            raise ValueError(
+                f"CRITICAL: Cannot find cost_per_mwh for PPU '{ppu_name}' for progressive cost calculation. "
+                f"Cannot use fallback price as it would falsify costs. "
+                f"Please ensure PPU cost is defined in ppu_definitions."
+            )
         
         # Calculate excess units
         excess_units = count - soft_cap

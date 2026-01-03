@@ -203,16 +203,29 @@ def calculate_production_costs(
     CHF_KWH_TO_CHF_MWH = 1000.0
     
     def get_ppu_cost(ppu_name: str) -> float:
-        """Get PPU cost in CHF/MWh (same logic as visualization.py)."""
+        """Get PPU cost in CHF/MWh. CRITICAL: No fallback prices allowed."""
         ppu_def = ppu_definitions.get(ppu_name)
         if ppu_def is None:
-            return 50.0  # Default fallback (already in CHF/MWh)
+            raise ValueError(
+                f"CRITICAL: PPU '{ppu_name}' not found in ppu_definitions. "
+                f"Cannot use fallback price as it would falsify costs. "
+                f"Please ensure all PPUs are properly defined."
+            )
         elif hasattr(ppu_def, 'cost_per_mwh'):
             # Convert from CHF/kWh to CHF/MWh
             return ppu_def.cost_per_mwh * CHF_KWH_TO_CHF_MWH
         elif isinstance(ppu_def, dict):
-            return ppu_def.get('cost_per_mwh', 0.05) * CHF_KWH_TO_CHF_MWH
-        return 50.0
+            if 'cost_per_mwh' not in ppu_def:
+                raise ValueError(
+                    f"CRITICAL: PPU '{ppu_name}' missing 'cost_per_mwh' in definition. "
+                    f"Cannot use fallback price as it would falsify costs."
+                )
+            return ppu_def['cost_per_mwh'] * CHF_KWH_TO_CHF_MWH
+        else:
+            raise ValueError(
+                f"CRITICAL: Cannot extract cost from PPU '{ppu_name}' definition. "
+                f"Cannot use fallback price as it would falsify costs."
+            )
     
     n_hours = len(full_year_results.demand)
     weighted_costs = np.zeros(n_hours)  # Sum of (production * cost)

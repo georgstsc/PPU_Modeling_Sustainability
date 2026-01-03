@@ -275,10 +275,14 @@ def _load_spot_prices(data_dir: Path) -> np.ndarray:
     
     prices = df[price_col].values.astype(np.float32)
     
-    # Handle NaN values
+    # CRITICAL: No fallback prices allowed - raise error on missing data
     if np.isnan(prices).any():
-        warnings.warn(f"Found {np.isnan(prices).sum()} NaN values in spot prices, filling with mean")
-        prices = np.nan_to_num(prices, nan=np.nanmean(prices))
+        nan_count = np.isnan(prices).sum()
+        raise ValueError(
+            f"CRITICAL: Found {nan_count} NaN values in spot prices from {spot_path}. "
+            f"Missing price data cannot be replaced with fallback values. "
+            f"Please fix the data source or handle missing values explicitly."
+        )
     
     return prices
 
@@ -394,10 +398,12 @@ def _load_palm_oil_prices(data_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
         palm_2024 = palm_df['2024-01-01':'2024-12-31']['close']
         palm_daily = palm_2024.resample('D').ffill().bfill()
     else:
-        # Default: 950 USD/ton average palm oil price
-        palm_daily = pd.Series([950.0] * 366, 
-                               index=pd.date_range('2024-01-01', periods=366, freq='D'))
-        warnings.warn("Palm oil price file not found - using default 950 USD/ton")
+        # CRITICAL: No fallback prices allowed
+        raise FileNotFoundError(
+            f"CRITICAL: Palm oil price file not found at {palm_path}. "
+            f"Cannot use fallback prices as they would falsify costs. "
+            f"Please ensure the data file exists and is properly formatted."
+        )
     
     # Load USD/CHF exchange rates
     usd_chf_path = data_dir / 'DAT_ASCII_USDCHF_M1_2024.csv'
@@ -412,15 +418,41 @@ def _load_palm_oil_prices(data_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
         chf_per_usd = 1.0 / usd_daily
         chf_per_usd = chf_per_usd.resample('D').ffill().bfill()
     else:
-        # Default: 0.88 CHF per USD
-        chf_per_usd = pd.Series([0.88] * 366,
-                                index=pd.date_range('2024-01-01', periods=366, freq='D'))
-        warnings.warn("USD/CHF rate file not found - using default 0.88 CHF/USD")
+        # CRITICAL: No fallback exchange rates allowed
+        raise FileNotFoundError(
+            f"CRITICAL: USD/CHF exchange rate file not found at {usd_chf_path}. "
+            f"Cannot use fallback rates as they would falsify costs. "
+            f"Please ensure the data file exists and is properly formatted."
+        )
     
     # Align indices
     date_range = pd.date_range('2024-01-01', periods=366, freq='D')
-    palm_aligned = palm_daily.reindex(date_range, method='ffill').fillna(950.0)
-    chf_aligned = chf_per_usd.reindex(date_range, method='ffill').fillna(0.88)
+    # Forward-fill from previous values, then backfill any remaining gaps (e.g., first day)
+    # This uses actual data from the time series, not arbitrary fallback values
+    palm_aligned = palm_daily.reindex(date_range, method='ffill').bfill()
+    chf_aligned = chf_per_usd.reindex(date_range, method='ffill').bfill()
+    
+    # CRITICAL: Check for missing values after alignment - no fallbacks allowed
+    # After forward-fill and backfill, any remaining NaNs indicate data gaps that cannot be filled
+    if palm_aligned.isna().any():
+        missing_days = palm_aligned.isna().sum()
+        missing_dates = palm_aligned[palm_aligned.isna()].index.strftime('%Y-%m-%d').tolist()
+        raise ValueError(
+            f"CRITICAL: {missing_days} missing palm oil price values after alignment. "
+            f"Cannot use fallback prices as they would falsify costs. "
+            f"Missing dates: {missing_dates[:10]}{'...' if len(missing_dates) > 10 else ''}. "
+            f"Please ensure complete price data coverage for 2024."
+        )
+    
+    if chf_aligned.isna().any():
+        missing_days = chf_aligned.isna().sum()
+        missing_dates = chf_aligned[chf_aligned.isna()].index.strftime('%Y-%m-%d').tolist()
+        raise ValueError(
+            f"CRITICAL: {missing_days} missing USD/CHF exchange rate values after alignment. "
+            f"Cannot use fallback rates as they would falsify costs. "
+            f"Missing dates: {missing_dates[:10]}{'...' if len(missing_dates) > 10 else ''}. "
+            f"Please ensure complete exchange rate data coverage for 2024."
+        )
     
     # Convert USD/metric ton to CHF/MWh
     # price_chf_mwh = price_usd_ton × chf_per_usd / mwh_per_ton
@@ -434,11 +466,14 @@ def _load_eur_chf_rates(data_dir: Path) -> np.ndarray:
     """
     Load EUR/CHF exchange rates for spot price conversion.
     
-    Source: chf_to_eur_2024.csv (CHF to EUR rate)
-    Need: EUR to CHF rate (inverse)
+    Source: chf_to_eur_2024.csv
+    - Column "CHF to EUR" = X means: 1 CHF = X EUR (CHF is stronger when X > 1.0)
+    - We need EUR/CHF: 1 EUR = (1/X) CHF
+    - Historical EUR/CHF in 2024: ~0.93-0.99 (CHF stronger, so EUR/CHF < 1.0)
     
     Returns:
         Array of EUR/CHF rates indexed by day of year (366 days for 2024)
+        Values should be < 1.0 (typically 0.93-0.99) since CHF is stronger than EUR
     """
     eur_path = data_dir / 'chf_to_eur_2024.csv'
     if eur_path.exists():
@@ -448,21 +483,57 @@ def _load_eur_chf_rates(data_dir: Path) -> np.ndarray:
         eur_df = eur_df.set_index('Date').sort_index()
         
         # The file has "CHF to EUR" which means 1 CHF = X EUR
-        # We need EUR to CHF: 1 EUR = 1/X CHF
+        # Since CHF is stronger than EUR, X > 1.0 (typically 1.05-1.08 in 2024)
+        # We need EUR/CHF: 1 EUR = (1/X) CHF
+        # This should give values < 1.0 (typically 0.93-0.99)
         chf_to_eur = eur_df['CHF to EUR']
+        
+        # Verify interpretation: if CHF is stronger, chf_to_eur should be > 1.0
+        if chf_to_eur.mean() < 1.0:
+            raise ValueError(
+                f"CRITICAL: Exchange rate interpretation error. "
+                f"'CHF to EUR' values average {chf_to_eur.mean():.4f} (< 1.0), "
+                f"but CHF should be stronger than EUR. "
+                f"Please verify the data file format and interpretation."
+            )
+        
         eur_to_chf = 1.0 / chf_to_eur
+        
+        # Verify result: EUR/CHF should be < 1.0 if CHF is stronger
+        if eur_to_chf.mean() > 1.0:
+            warnings.warn(
+                f"WARNING: Calculated EUR/CHF = {eur_to_chf.mean():.4f} (> 1.0). "
+                f"Expected < 1.0 since CHF is stronger. "
+                f"Historical range: 0.93-0.99. Please verify conversion logic."
+            )
         
         # Resample to daily
         eur_to_chf = eur_to_chf.resample('D').ffill().bfill()
     else:
-        # Default: 0.93 EUR to CHF (1 EUR = 0.93 CHF, or 1 CHF = 1.08 EUR)
-        eur_to_chf = pd.Series([0.93] * 366,
-                               index=pd.date_range('2024-01-01', periods=366, freq='D'))
-        warnings.warn("EUR/CHF rate file not found - using default 0.93 CHF/EUR")
+        # CRITICAL: No fallback exchange rates allowed
+        raise FileNotFoundError(
+            f"CRITICAL: EUR/CHF exchange rate file not found at {eur_path}. "
+            f"Cannot use fallback rates as they would falsify costs. "
+            f"Please ensure the data file exists and is properly formatted."
+        )
     
     # Align to full year
     date_range = pd.date_range('2024-01-01', periods=366, freq='D')
-    eur_aligned = eur_to_chf.reindex(date_range, method='ffill').fillna(0.93)
+    # Forward-fill from previous values, then backfill any remaining gaps (e.g., first day)
+    # This uses actual data from the time series, not arbitrary fallback values
+    eur_aligned = eur_to_chf.reindex(date_range, method='ffill').bfill()
+    
+    # CRITICAL: Check for missing values after alignment - no fallbacks allowed
+    # After forward-fill and backfill, any remaining NaNs indicate data gaps that cannot be filled
+    if eur_aligned.isna().any():
+        missing_days = eur_aligned.isna().sum()
+        missing_dates = eur_aligned[eur_aligned.isna()].index.strftime('%Y-%m-%d').tolist()
+        raise ValueError(
+            f"CRITICAL: {missing_days} missing EUR/CHF exchange rate values after alignment. "
+            f"Cannot use fallback rates as they would falsify costs. "
+            f"Missing dates: {missing_dates[:10]}{'...' if len(missing_dates) > 10 else ''}. "
+            f"Please ensure complete exchange rate data coverage for 2024."
+        )
     
     return eur_aligned.values.astype(np.float32)
 

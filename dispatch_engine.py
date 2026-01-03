@@ -1027,7 +1027,15 @@ def run_dispatch_simulation(
     for i, t in enumerate(scenario_indices):
         # Get data for this timestep
         demand_mw = demand_data[t] if t < len(demand_data) else 0.0
-        spot_price = spot_data[t] if t < len(spot_data) else 50.0  # Default price
+        
+        # CRITICAL: No fallback spot prices allowed
+        if t >= len(spot_data):
+            raise IndexError(
+                f"CRITICAL: Spot price index {t} out of bounds (data length: {len(spot_data)}). "
+                f"Cannot use fallback price as it would falsify costs. "
+                f"Ensure spot price data covers all simulation timesteps."
+            )
+        spot_price = spot_data[t]
         
         # ===== WATER INFLOW TO LAKE =====
         # Add precipitation-based water inflow to Lake storage
@@ -1399,7 +1407,8 @@ def compute_scenario_cost(
                 continue
             
             # Get cost per MWh for this PPU
-            cost_per_mwh = 50.0  # Default fallback (CHF/MWh)
+            # CRITICAL: No fallback prices allowed - must find actual cost
+            cost_per_mwh = None
             
             # Try to get accurate cost from ppu_definitions first
             if ppu_definitions is not None:
@@ -1411,11 +1420,19 @@ def compute_scenario_cost(
                     elif isinstance(ppu_def, dict) and 'cost_per_mwh' in ppu_def:
                         cost_per_mwh = ppu_def['cost_per_mwh'] * CHF_KWH_TO_CHF_MWH
             
-            # Fallback: try to get from ppu_dictionary DataFrame
-            if cost_per_mwh == 50.0 and not ppu_dictionary.empty:
+            # Try to get from ppu_dictionary DataFrame if not found yet
+            if cost_per_mwh is None and not ppu_dictionary.empty:
                 ppu_rows = ppu_dictionary[ppu_dictionary['PPU_Name'] == ppu_name]
                 if not ppu_rows.empty and 'Cost_CHF_per_MWh' in ppu_rows.columns:
                     cost_per_mwh = ppu_rows['Cost_CHF_per_MWh'].values[0]
+            
+            # CRITICAL: Raise error if cost not found - no fallback allowed
+            if cost_per_mwh is None:
+                raise ValueError(
+                    f"CRITICAL: Cannot find cost_per_mwh for PPU '{ppu_name}'. "
+                    f"Cannot use fallback price as it would falsify costs. "
+                    f"Please ensure PPU cost is defined in ppu_definitions or ppu_dictionary."
+                )
         
             # Add production cost
             ppu_cost += total_production_mwh * cost_per_mwh

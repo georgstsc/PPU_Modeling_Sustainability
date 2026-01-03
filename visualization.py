@@ -2041,16 +2041,30 @@ def calculate_hourly_production_cost(
     CHF_KWH_TO_CHF_MWH = 1000.0
     
     def get_ppu_cost(ppu_name: str) -> float:
+        """Get PPU cost in CHF/MWh. CRITICAL: No fallback prices allowed."""
         ppu_def = ppu_definitions.get(ppu_name)
         if ppu_def is None:
-            return 50.0  # Default fallback (already in CHF/MWh)
+            raise ValueError(
+                f"CRITICAL: PPU '{ppu_name}' not found in ppu_definitions. "
+                f"Cannot use fallback price as it would falsify costs. "
+                f"Please ensure all PPUs are properly defined."
+            )
         elif hasattr(ppu_def, 'cost_per_mwh'):
             # Convert from CHF/kWh to CHF/MWh
             return ppu_def.cost_per_mwh * CHF_KWH_TO_CHF_MWH
         elif isinstance(ppu_def, dict):
+            if 'cost_per_mwh' not in ppu_def:
+                raise ValueError(
+                    f"CRITICAL: PPU '{ppu_name}' missing 'cost_per_mwh' in definition. "
+                    f"Cannot use fallback price as it would falsify costs."
+                )
             # Convert from CHF/kWh to CHF/MWh
-            return ppu_def.get('cost_per_mwh', 0.05) * CHF_KWH_TO_CHF_MWH
-        return 50.0
+            return ppu_def['cost_per_mwh'] * CHF_KWH_TO_CHF_MWH
+        else:
+            raise ValueError(
+                f"CRITICAL: Cannot extract cost from PPU '{ppu_name}' definition. "
+                f"Cannot use fallback price as it would falsify costs."
+            )
     
     if has_arrays:
         # Original logic: use hourly arrays directly
@@ -2100,7 +2114,11 @@ def calculate_hourly_production_cost(
         if total_energy > 0:
             dispatchable_avg_cost = weighted_cost / total_energy
         else:
-            dispatchable_avg_cost = 50.0  # Fallback
+            # CRITICAL: Cannot calculate average without data - raise error
+            raise ValueError(
+                "CRITICAL: Cannot calculate dispatchable average cost - no dispatchable production data. "
+                "Cannot use fallback price as it would falsify costs."
+            )
         
         # Calculate average renewable cost (typically lower)
         renewable_cost = 0.0
