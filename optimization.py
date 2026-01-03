@@ -853,6 +853,13 @@ class FullYearResults:
     aviation_fuel_consumed_series: np.ndarray = field(default_factory=lambda: np.array([]))
     aviation_fuel_shortfall_series: np.ndarray = field(default_factory=lambda: np.array([]))
     
+    # =========================================================================
+    # FINAL STORAGE CONSTRAINT (must end ±5% of initial SoC)
+    # =========================================================================
+    storage_constraint_met: bool = False
+    storage_constraint_violations: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    storage_constraint_penalty: float = 0.0
+    
     # Monthly breakdowns
     monthly_production: Optional[np.ndarray] = None
     monthly_demand: Optional[np.ndarray] = None
@@ -984,6 +991,49 @@ def evaluate_portfolio_full_year(
     full_year.monthly_production = np.array(monthly_prod)
     full_year.monthly_demand = np.array(monthly_dem)
     
+    # =========================================================================
+    # FINAL STORAGE CONSTRAINT CHECK
+    # =========================================================================
+    # System must end with storage levels within ±5% of initial levels
+    # This prevents "cheating" by depleting storage over the simulation year
+    tolerance = config.storage.FINAL_SOC_TOLERANCE
+    initial_soc = config.storage.INITIAL_SOC_FRACTION
+    
+    violations = {}
+    all_met = True
+    total_penalty = 0.0
+    
+    for storage_name, soc_series in full_year.storage_soc.items():
+        if len(soc_series) == 0:
+            continue
+        
+        # Get initial and final SoC (as fractions)
+        initial_soc_val = soc_series[0] if len(soc_series) > 0 else initial_soc
+        final_soc_val = soc_series[-1] if len(soc_series) > 0 else initial_soc
+        
+        # Check if final SoC is within tolerance of initial SoC
+        soc_deviation = abs(final_soc_val - initial_soc_val)
+        max_allowed_deviation = tolerance * initial_soc_val  # ±5% of initial
+        
+        if soc_deviation > max_allowed_deviation:
+            all_met = False
+            # Calculate penalty proportional to deviation
+            deviation_ratio = soc_deviation / max(initial_soc_val, 0.01)
+            penalty = config.storage.FINAL_SOC_PENALTY_MULTIPLIER * deviation_ratio
+            total_penalty += penalty
+            
+            violations[storage_name] = {
+                'initial_soc': initial_soc_val,
+                'final_soc': final_soc_val,
+                'deviation': soc_deviation,
+                'max_allowed': max_allowed_deviation,
+                'penalty': penalty,
+            }
+    
+    full_year.storage_constraint_met = all_met
+    full_year.storage_constraint_violations = violations
+    full_year.storage_constraint_penalty = total_penalty
+    
     if verbose:
         print()
         print("=" * 60)
@@ -1014,6 +1064,21 @@ def evaluate_portfolio_full_year(
         if not full_year.aviation_fuel_constraint_met:
             hours_short = np.sum(full_year.aviation_fuel_shortfall_series > 0)
             print(f"  ⚠️  {hours_short} hours with aviation fuel shortfall")
+        
+        # Final storage constraint report
+        print()
+        print(f"Final Storage Constraint (±{tolerance*100:.0f}% of initial SoC):")
+        print(f"  Constraint Met: {'✅ YES' if full_year.storage_constraint_met else '❌ NO'}")
+        if not full_year.storage_constraint_met:
+            print(f"  Total Penalty: {full_year.storage_constraint_penalty:,.0f}")
+            for name, v in full_year.storage_constraint_violations.items():
+                print(f"  ⚠️  {name}: initial={v['initial_soc']:.2%} → final={v['final_soc']:.2%} "
+                      f"(deviation: {v['deviation']:.2%}, max allowed: {v['max_allowed']:.2%})")
+        else:
+            # Show final SoC for all storages even if constraint is met
+            for storage_name, soc_series in full_year.storage_soc.items():
+                if len(soc_series) > 0:
+                    print(f"  ✓ {storage_name}: {soc_series[0]:.1%} → {soc_series[-1]:.1%}")
     
     return full_year
 
