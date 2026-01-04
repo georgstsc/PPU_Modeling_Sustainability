@@ -57,6 +57,11 @@ class Individual:
     annual_production_twh: float = 0.0
     is_sovereign: bool = False
     
+    # Penalty tracking
+    progressive_penalty: float = 0.0
+    soc_penalty: float = 0.0  # Penalty for depleting storage below initial SoC
+    penalty_breakdown: Dict[str, Any] = field(default_factory=dict)
+    
     # Scenario results (for debugging)
     scenario_costs: List[float] = field(default_factory=list)
     
@@ -415,7 +420,32 @@ def evaluate_individual(
     individual.mean_cost = metrics['mean_cost']
     individual.cvar = metrics['cvar']
     
-    # --- STEP 4: Add progressive cost penalty for exceeding soft caps ---
+    # --- STEP 4: Check final storage SoC constraint ---
+    # Portfolios must not deplete storage below initial levels
+    # This prevents "cheating" by consuming initial reserves without replenishing
+    initial_soc = config.storage.INITIAL_SOC_FRACTION
+    tolerance = config.storage.FINAL_SOC_TOLERANCE
+    soc_penalty = 0.0
+    
+    for result in scenario_results:
+        final_socs = result.get('final_storage_soc', {})
+        for storage_name, final_soc in final_socs.items():
+            # Check if final SoC dropped below (initial - tolerance)
+            min_allowed = initial_soc * (1 - tolerance)  # e.g., 0.60 - 5% = 0.57
+            if final_soc < min_allowed:
+                # Penalty proportional to how much below min allowed
+                deficit_fraction = (min_allowed - final_soc) / initial_soc
+                soc_penalty += config.storage.FINAL_SOC_PENALTY_MULTIPLIER * deficit_fraction
+    
+    # Average penalty across scenarios
+    if len(scenario_results) > 0:
+        soc_penalty /= len(scenario_results)
+    
+    # Add SoC penalty to mean cost
+    individual.mean_cost += soc_penalty
+    individual.soc_penalty = soc_penalty
+    
+    # --- STEP 5: Add progressive cost penalty for exceeding soft caps ---
     progressive_penalty, penalty_breakdown = calculate_progressive_cost_penalty(
         portfolio, ppu_definitions, config
     )
@@ -432,13 +462,19 @@ def evaluate_individual(
         for ppu, info in penalty_breakdown.items():
             print(f"    {ppu}: {info['count']} units (cap: {info['soft_cap']}, +{info['excess']} excess)")
     
+    if verbose and soc_penalty > 0:
+        print(f"  ⚠️  Storage SoC penalty: {soc_penalty:,.0f} (storage depleted below initial)")
+    
+    # Total penalty
+    total_penalty = progressive_penalty + soc_penalty
+    
     # Fitness: use combined cost (harmonic mean approach optional)
     if config.fitness.COST_AGGREGATION == 'harmonic_mean':
         # Harmonic mean is more sensitive to high costs
-        costs = [max(c + progressive_penalty, 1e-6) for c in individual.scenario_costs]
+        costs = [max(c + total_penalty, 1e-6) for c in individual.scenario_costs]
         individual.fitness = len(costs) / sum(1/c for c in costs)
     else:
-        individual.fitness = metrics['combined_cost'] + progressive_penalty
+        individual.fitness = metrics['combined_cost'] + total_penalty
     
     return individual
 

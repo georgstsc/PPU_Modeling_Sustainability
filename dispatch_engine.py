@@ -159,18 +159,23 @@ def _calculate_solar_power_distributed(
     irradiance_all_locations: np.ndarray,
     n_ppu: int,
     area_per_location_m2: float,
-    chain_efficiency: float,
+    chain_efficiency: float,  # NOTE: Not used - see below
 ) -> float:
     """Distributed solar power calculation - sums across ALL locations.
     
     DISTRIBUTED MODEL: Each PPU adds area_per_location_m2 to EVERY location.
     Total area = n_ppu × area_per_location_m2 × n_locations
     
+    IMPORTANT: We use DIRECT-TO-GRID efficiency (PV → Inverter → Grid ≈ 0.95)
+    NOT the full chain efficiency which includes Battery (0.795).
+    Storage efficiency is applied separately by the dispatch engine when
+    charging/discharging to avoid DOUBLE-COUNTING losses.
+    
     Args:
         irradiance_all_locations: Solar irradiance at ALL locations (1D array)
         n_ppu: Number of PV PPU units
         area_per_location_m2: Panel area per PPU per location (1000 m²)
-        chain_efficiency: PPU chain efficiency
+        chain_efficiency: PPU chain efficiency (IGNORED to prevent double-counting)
         
     Returns:
         Total power in MW
@@ -179,15 +184,19 @@ def _calculate_solar_power_distributed(
         return 0.0
     
     efficiency_pv = 0.20  # 20% PV panel efficiency
+    efficiency_inverter = 0.95  # 95% inverter efficiency (PV → Grid direct)
+    # NOTE: Storage efficiency (Battery ~0.88 round-trip) is NOT applied here
+    # It's applied by dispatch_engine when charging/discharging storage
+    
     total_power = 0.0
     
     # Sum production across ALL locations
     for i in range(len(irradiance_all_locations)):
         # Total area at this location = n_ppu × area_per_location
         total_area_at_loc = n_ppu * area_per_location_m2
-        # P = irradiance × area × PV_efficiency × chain_efficiency
+        # P = irradiance × area × PV_efficiency × inverter_efficiency
         # Units: kWh/m²/h × m² × efficiency = kW → /1000 = MW
-        power = irradiance_all_locations[i] * total_area_at_loc * efficiency_pv * chain_efficiency / 1000.0
+        power = irradiance_all_locations[i] * total_area_at_loc * efficiency_pv * efficiency_inverter / 1000.0
         total_power += power
     
     return total_power
@@ -198,7 +207,7 @@ def _calculate_wind_power_distributed(
     wind_speeds_all_locations: np.ndarray,
     n_ppu: int,
     turbines_per_location: int,
-    chain_efficiency: float,
+    chain_efficiency: float,  # NOTE: Not used - see below
     rated_power: float = 3.0,
     cut_in: float = 3.0,
     rated_speed: float = 12.0,
@@ -209,11 +218,16 @@ def _calculate_wind_power_distributed(
     DISTRIBUTED MODEL: Each PPU adds turbines_per_location to EVERY location.
     Total turbines = n_ppu × turbines_per_location × n_locations
     
+    IMPORTANT: We use DIRECT-TO-GRID efficiency (Wind → Inverter → Grid ≈ 0.95)
+    NOT the full chain efficiency which includes Battery (0.795).
+    Storage efficiency is applied separately by the dispatch engine when
+    charging/discharging to avoid DOUBLE-COUNTING losses.
+    
     Args:
         wind_speeds_all_locations: Wind speed at ALL locations (1D array)
         n_ppu: Number of wind PPU units
         turbines_per_location: Turbines per PPU per location (1)
-        chain_efficiency: PPU chain efficiency
+        chain_efficiency: PPU chain efficiency (IGNORED to prevent double-counting)
         rated_power: Rated power per turbine (MW)
         cut_in: Cut-in wind speed (m/s)
         rated_speed: Rated wind speed (m/s)
@@ -224,6 +238,10 @@ def _calculate_wind_power_distributed(
     """
     if n_ppu == 0:
         return 0.0
+    
+    # Direct-to-grid efficiency (no storage in path)
+    # Storage efficiency is applied by dispatch_engine when charging/discharging
+    efficiency_direct_to_grid = 0.95  # Wind turbine → Grid (generator + transformer)
     
     total_power = 0.0
     
@@ -243,7 +261,7 @@ def _calculate_wind_power_distributed(
             ratio = (ws - cut_in) / (rated_speed - cut_in)
             power = rated_power * total_turbines_at_loc * (ratio ** 3)
         
-        total_power += power * chain_efficiency
+        total_power += power * efficiency_direct_to_grid
     
     return total_power
 
