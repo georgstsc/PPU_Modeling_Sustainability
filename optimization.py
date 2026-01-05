@@ -329,6 +329,32 @@ def evaluate_individual(
         individual.cvar = penalty
         return individual
     
+    # --- STEP 1.5: Aviation compliance check ---
+    # Portfolios MUST include aviation-compliant storage PPUs to meet 23 TWh/year requirement
+    # Aviation fuel comes from Fuel Tank, which is charged by SYN_FT or SYN_CRACK
+    aviation_ppus = ['SYN_FT', 'SYN_CRACK']
+    has_aviation = any(portfolio.ppu_counts.get(ppu, 0) > 0 for ppu in aviation_ppus)
+    
+    if not has_aviation:
+        # Heavy penalty: cannot meet 23 TWh/year aviation fuel requirement
+        # Use 50% of sovereignty penalty as this is a critical requirement
+        penalty = config.fitness.SOVEREIGNTY_PENALTY_MULTIPLIER * 0.5
+        individual.fitness = penalty
+        individual.mean_cost = penalty
+        individual.cvar = penalty
+        individual.penalty_breakdown = {
+            'aviation_compliance': {
+                'missing': True,
+                'penalty': penalty,
+                'required_ppus': aviation_ppus,
+                'message': 'Portfolio must include SYN_FT or SYN_CRACK for aviation fuel'
+            }
+        }
+        if verbose:
+            print(f"  ❌ Aviation compliance FAILED: No {aviation_ppus} in portfolio")
+            print(f"     Penalty: {penalty:,.0f} CHF/year")
+        return individual
+    
     # --- STEP 2: Cumulative energy balance check (using real incidence data) ---
     # This ensures total renewable production >= total demand (with storage losses)
     # NOTE: This check is expensive! Disabled by default (config.fitness.CHECK_CUMULATIVE_BALANCE)
@@ -421,21 +447,39 @@ def evaluate_individual(
     individual.cvar = metrics['cvar']
     
     # --- STEP 4: Check final storage SoC constraint ---
-    # Portfolios must not deplete storage below initial levels
-    # This prevents "cheating" by consuming initial reserves without replenishing
-    initial_soc = config.storage.INITIAL_SOC_FRACTION
+    # CYCLIC CONSTRAINT: Storage must end at same level as it started (±tolerance)
+    # This prevents "cheating" by either depleting OR overcharging initial reserves
+    # Ensures sustainable year-over-year operation
+    initial_soc_default = config.storage.INITIAL_SOC_FRACTION
     tolerance = config.storage.FINAL_SOC_TOLERANCE
     soc_penalty = 0.0
+    soc_violations = []
     
     for result in scenario_results:
+        initial_socs = result.get('initial_storage_soc', {})
         final_socs = result.get('final_storage_soc', {})
+        
         for storage_name, final_soc in final_socs.items():
-            # Check if final SoC dropped below (initial - tolerance)
-            min_allowed = initial_soc * (1 - tolerance)  # e.g., 0.60 - 5% = 0.57
-            if final_soc < min_allowed:
-                # Penalty proportional to how much below min allowed
-                deficit_fraction = (min_allowed - final_soc) / initial_soc
-                soc_penalty += config.storage.FINAL_SOC_PENALTY_MULTIPLIER * deficit_fraction
+            # Get initial SoC for this storage (use default if not provided)
+            initial_soc = initial_socs.get(storage_name, initial_soc_default)
+            
+            # CYCLIC CONSTRAINT: Check absolute deviation from initial
+            soc_deviation = abs(final_soc - initial_soc)
+            max_allowed_deviation = tolerance * initial_soc  # ±5% of initial
+            
+            if soc_deviation > max_allowed_deviation:
+                # Penalty proportional to deviation magnitude
+                deviation_ratio = soc_deviation / max(initial_soc, 0.01)
+                penalty_amount = config.storage.FINAL_SOC_PENALTY_MULTIPLIER * deviation_ratio
+                soc_penalty += penalty_amount
+                
+                soc_violations.append({
+                    'storage': storage_name,
+                    'initial_soc': initial_soc,
+                    'final_soc': final_soc,
+                    'deviation': soc_deviation,
+                    'direction': 'depleted' if final_soc < initial_soc else 'overcharged'
+                })
     
     # Average penalty across scenarios
     if len(scenario_results) > 0:
@@ -463,7 +507,10 @@ def evaluate_individual(
             print(f"    {ppu}: {info['count']} units (cap: {info['soft_cap']}, +{info['excess']} excess)")
     
     if verbose and soc_penalty > 0:
-        print(f"  ⚠️  Storage SoC penalty: {soc_penalty:,.0f} (storage depleted below initial)")
+        print(f"  ⚠️  Storage SoC penalty: {soc_penalty:,.0f} CHF/year (storage cyclic constraint violated)")
+        for violation in soc_violations[:3]:  # Show first 3 violations
+            direction = violation['direction']
+            print(f"     {violation['storage']}: {violation['initial_soc']:.2%} → {violation['final_soc']:.2%} ({direction})")
     
     # Total penalty
     total_penalty = progressive_penalty + soc_penalty

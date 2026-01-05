@@ -277,6 +277,12 @@ class PortfolioMetrics3D:
     total_energy_twh: float
     annual_production_twh: float
     
+    # === CONSTRAINT COMPLIANCE FIELDS ===
+    # These are CRITICAL for filtering portfolios in the notebook
+    storage_constraint_met: bool = False  # Cyclic SOC constraint (±5% of initial)
+    total_domestic_production_twh: float = 0.0  # Electrical sovereignty (≥113 TWh/year)
+    aviation_fuel_constraint_met: bool = False  # Aviation fuel requirement (23 TWh/year)
+    
     # Weekly breakdowns (for analysis)
     weekly_returns: Optional[np.ndarray] = None
     weekly_volatilities: Optional[np.ndarray] = None
@@ -373,6 +379,10 @@ def calculate_portfolio_metrics_3d(
         print(f"  X (RoT):       {portfolio_rot:.4f}")
         print(f"  Y (Volatility): {annual_volatility:.2f} CHF/MWh")
         print(f"  Z (Return):     {annual_return:.2f}%")
+        print(f"\n[DEBUG] Constraints:")
+        print(f"  Storage (SOC): {'✅' if full_year_results.storage_constraint_met else '❌'}")
+        print(f"  Aviation fuel: {'✅' if full_year_results.aviation_fuel_constraint_met else '❌'}")
+        print(f"  Electrical sovereignty: {full_year_results.total_production_twh:.1f} TWh (need ≥113)")
     
     return PortfolioMetrics3D(
         x_rot=portfolio_rot,
@@ -381,6 +391,11 @@ def calculate_portfolio_metrics_3d(
         portfolio_counts=individual.portfolio.ppu_counts.copy(),
         total_energy_twh=total_energy / 1e6,
         annual_production_twh=full_year_results.total_production_twh,
+        # CONSTRAINT FIELDS - CRITICAL for notebook filtering
+        storage_constraint_met=full_year_results.storage_constraint_met,
+        total_domestic_production_twh=full_year_results.total_production_twh,
+        aviation_fuel_constraint_met=full_year_results.aviation_fuel_constraint_met,
+        # Weekly analysis
         weekly_returns=weekly_returns,
         weekly_volatilities=weekly_volatilities
     )

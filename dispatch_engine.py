@@ -632,7 +632,8 @@ DISPATCHABLE_GENERATORS = {
 # Higher cost = more reluctant to discharge (save for peak demand)
 # This cost should include the OPEX of the extraction PPU (e.g. SOL_SALT)
 STORAGE_DISCHARGE_COSTS = {
-    'Lake': 150,          # HYD_S extraction
+    'Lake': 90,           # HYD_S extraction - FIXED: Reduced from 150 to be competitive
+                          # Hydropower should be flexible and dispatchable, not premium reserve
     'Solar salt': 40,     # SOL_SALT / SOL_STEAM extraction
     'Biogas': 50,         # IMP_BIOG extraction
     'H2 UG 200bar': 80,   # H2P_G extraction
@@ -641,7 +642,6 @@ STORAGE_DISCHARGE_COSTS = {
     'Fuel Tank': 60,      # THERM extraction (also supplies aviation fuel)
     'Ammonia': 85,        # NH3_P extraction
     'Palm oil': 55,       # PALM_ICE extraction (only imported bio-fuel)
-    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
 }
 
 # Mapping from storage name to the PPU(s) that extract from it
@@ -976,6 +976,9 @@ def run_dispatch_simulation(
     # Initialize storage states
     storages = initialize_storage_state(portfolio_counts, config)
     
+    # Store initial SoC for cyclic constraint checking
+    initial_storage_soc = {name: s.soc for name, s in storages.items()}
+    
     # Initialize dispatchable generators
     dispatchers = initialize_dispatchable_generators(portfolio_counts, config)
     
@@ -1110,15 +1113,26 @@ def run_dispatch_simulation(
                 # Disposition penalty: if SoC < target, increase effective cost
                 # d_stor ranges from -1 (empty) to +1 (full)
                 # When d_stor < 0 (below target), add penalty to discourage discharge
-                if d_stor < 0:
-                    disposition_penalty = abs(d_stor) * 200  # Big penalty when low
+                # EXCEPTION: Lake gets reduced penalty because it's replenished by precipitation
+                if storage_name == 'Lake':
+                    # Lake should be more flexible - smaller penalty when below target
+                    if d_stor < 0:
+                        disposition_penalty = abs(d_stor) * 50  # Reduced penalty (was 200)
+                    else:
+                        disposition_penalty = 0
                 else:
-                    disposition_penalty = 0  # No penalty when above target
+                    if d_stor < 0:
+                        disposition_penalty = abs(d_stor) * 200  # Big penalty when low
+                    else:
+                        disposition_penalty = 0  # No penalty when above target
                 
                 effective_cost = base_cost + disposition_penalty
                 
-                # Only add if storage has energy and is willing (d_stor > -0.8)
-                if storage.current_mwh > 0 and d_stor > -0.8:
+                # Only add if storage has energy and is willing
+                # FIXED: Relaxed threshold from -0.8 to -0.95 to allow discharge when slightly below target
+                # Lake especially should discharge when needed, even if below target
+                threshold = -0.95 if storage_name == 'Lake' else -0.8
+                if storage.current_mwh > 0 and d_stor > threshold:
                     supply_options.append({
                         'type': 'storage',
                         'name': storage_name,
@@ -1332,6 +1346,7 @@ def run_dispatch_simulation(
         'total_spot_sell_revenue_chf': state.total_spot_sell_revenue,
         'net_spot_cost_chf': state.total_spot_buy_cost - state.total_spot_sell_revenue,
         'overflow_series': np.array(state.overflow_series),
+        'initial_storage_soc': initial_storage_soc,  # For cyclic constraint checking
         'final_storage_soc': {name: s.soc for name, s in state.storages.items()},
         # Time series data for full year evaluation
         'total_production': total_production_series,

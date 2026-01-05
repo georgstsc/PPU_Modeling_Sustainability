@@ -115,37 +115,70 @@ class ObjectiveConfig:
 
 
 def get_objective_configs() -> List[ObjectiveConfig]:
-    """Get predefined objective configurations for exploration."""
+    """
+    Get predefined objective configurations for exploration.
+    
+    Returns objectives that optimize across all 3 dimensions:
+    - RoT (Risk of Technology - supply chain risk)
+    - Volatility (cost stability)
+    - Return (economic efficiency)
+    """
     return [
+        # =====================================================================
+        # 3D MULTI-OBJECTIVE FITNESS FUNCTIONS (Primary)
+        # =====================================================================
         ObjectiveConfig(
-            name="cost",
+            name="3d_balanced",
+            fitness_fn=lambda m: fitness_all_objectives(m, w_rot=0.33, w_vol=0.33, w_return=0.34),
+            description="3D Balanced: Equal weights (RoT, Vol, Return)"
+        ),
+        ObjectiveConfig(
+            name="3d_stability",
+            fitness_fn=lambda m: fitness_all_objectives(m, w_rot=0.4, w_vol=0.4, w_return=0.2),
+            description="3D Stability: 40% RoT + 40% Vol + 20% Return"
+        ),
+        ObjectiveConfig(
+            name="3d_return",
+            fitness_fn=lambda m: fitness_all_objectives(m, w_rot=0.2, w_vol=0.2, w_return=0.6),
+            description="3D Return: 60% Return + 20% RoT + 20% Vol"
+        ),
+        ObjectiveConfig(
+            name="3d_rot_focus",
+            fitness_fn=lambda m: fitness_all_objectives(m, w_rot=0.6, w_vol=0.2, w_return=0.2),
+            description="3D RoT Focus: 60% RoT + 20% Vol + 20% Return"
+        ),
+        ObjectiveConfig(
+            name="3d_vol_focus",
+            fitness_fn=lambda m: fitness_all_objectives(m, w_rot=0.2, w_vol=0.6, w_return=0.2),
+            description="3D Vol Focus: 60% Vol + 20% RoT + 20% Return"
+        ),
+        
+        # =====================================================================
+        # SINGLE-OBJECTIVE FITNESS FUNCTIONS (For comparison)
+        # =====================================================================
+        ObjectiveConfig(
+            name="cost_only",
             fitness_fn=fitness_cost_only,
-            description="Minimize cost (maximize return)"
+            description="1D: Minimize cost (maximize return only)"
         ),
         ObjectiveConfig(
-            name="rot",
+            name="rot_only",
             fitness_fn=fitness_rot_only,
-            description="Minimize Risk of Technology"
+            description="1D: Minimize Risk of Technology only"
         ),
         ObjectiveConfig(
-            name="volatility",
+            name="volatility_only",
             fitness_fn=fitness_volatility_only,
-            description="Minimize Volatility"
+            description="1D: Minimize Volatility only"
         ),
+        
+        # =====================================================================
+        # 2D COMBINED FITNESS FUNCTIONS (Legacy)
+        # =====================================================================
         ObjectiveConfig(
-            name="rot_vol_balanced",
+            name="rot_vol_50_50",
             fitness_fn=lambda m: fitness_rot_volatility(m, w_rot=0.5),
-            description="Balanced RoT and Volatility"
-        ),
-        ObjectiveConfig(
-            name="rot_heavy",
-            fitness_fn=lambda m: fitness_rot_volatility(m, w_rot=0.8),
-            description="Heavy RoT weight (80%)"
-        ),
-        ObjectiveConfig(
-            name="vol_heavy",
-            fitness_fn=lambda m: fitness_rot_volatility(m, w_rot=0.2),
-            description="Heavy Volatility weight (80%)"
+            description="2D: 50% RoT + 50% Vol (no Return)"
         ),
     ]
 
@@ -621,6 +654,10 @@ class MultiObjectiveGA:
                 'z_return': metrics.z_return,
                 'total_energy_twh': metrics.total_energy_twh,
                 'annual_production_twh': metrics.annual_production_twh,
+                # CONSTRAINT FIELDS - Required for compliance filtering in notebook
+                'storage_constraint_met': metrics.storage_constraint_met,
+                'total_domestic_production_twh': metrics.total_domestic_production_twh,
+                'aviation_fuel_constraint_met': metrics.aviation_fuel_constraint_met,
             })
         
         df = pd.DataFrame(rows)
