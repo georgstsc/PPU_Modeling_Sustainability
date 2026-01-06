@@ -911,7 +911,7 @@ def create_ppu_dictionary(
                 'Cost_CHF_per_kWh': cost_per_mwh,  # cost_per_mwh is actually in CHF/kWh
                 'Cost_CHF_per_MWh': cost_per_mwh * 1000,  # Convert CHF/kWh to CHF/MWh
                 'Cost_CHF_per_Quarter_Hour': cost_per_mwh * 0.25,
-                'Components': ppu_def.components.copy(),
+                'Components': ppu_def.components.copy() if isinstance(ppu_def.components, list) else ppu_def.components,
                 'Location_Rank': np.nan,  # Set for renewables
                 'Unit_Index': i,
             })

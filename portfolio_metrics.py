@@ -359,15 +359,29 @@ def calculate_portfolio_metrics_3d(
     
     # Calculate Risk of Technology (X-axis)
     # Need energy volumes per PPU
+    # For production PPUs: use ppu_production (energy produced)
+    # For storage INPUT PPUs: use ppu_consumption (energy handled/absorbed)
     ppu_energy_volumes = {}
     total_energy = 0.0
     
+    # Add production from INCIDENCE and FLEX PPUs
     for ppu_name, production_array in full_year_results.ppu_production.items():
         if isinstance(production_array, np.ndarray):
             # Sum over all hours to get total MWh
             ppu_energy = np.sum(production_array)
             ppu_energy_volumes[ppu_name] = ppu_energy
             total_energy += ppu_energy
+    
+    # Add consumption from STORAGE INPUT PPUs (energy they handled)
+    # This is separate from production - storage INPUT PPUs consume electricity to charge storage
+    if hasattr(full_year_results, 'ppu_consumption') and full_year_results.ppu_consumption:
+        for ppu_name, consumption_array in full_year_results.ppu_consumption.items():
+            if isinstance(consumption_array, np.ndarray):
+                ppu_energy = np.sum(consumption_array)
+                if ppu_energy > 0:
+                    # Add to existing or create new entry
+                    ppu_energy_volumes[ppu_name] = ppu_energy_volumes.get(ppu_name, 0) + ppu_energy
+                    total_energy += ppu_energy
     
     portfolio_rot = risk_calculator.get_portfolio_risk(
         individual.portfolio.ppu_counts,

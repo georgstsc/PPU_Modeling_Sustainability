@@ -1229,6 +1229,8 @@ def plot_full_year_production_by_ppu(
     n_days = n_hours // 24
     
     # Get all unique PPU names that actually produced something
+    # Note: Storage INPUT PPUs (PHS, H2_G, etc.) consume energy to charge storage,
+    # they are NOT included here because they don't produce energy to grid
     active_ppus = {}
     for ppu_name, prod in r.ppu_production.items():
         if isinstance(prod, (int, float, np.number)):
@@ -1358,6 +1360,8 @@ def plot_full_year_production_by_source(
         'Biomass', 'Synthetic Fuels', 'Other'
     ]
     
+    # Note: Only production PPUs are shown here. Storage INPUT PPUs (PHS, H2_G, etc.)
+    # consume energy to charge storage - they are tracked in ppu_consumption separately
     for ppu_name, prod in r.ppu_production.items():
         # Check if prod is an array or scalar
         if isinstance(prod, (int, float, np.number)):

@@ -1032,6 +1032,10 @@ class FullYearResults:
     # Per-PPU production (dict: ppu_name -> total MWh or hourly array)
     ppu_production: Dict[str, Any] = field(default_factory=dict)
     
+    # Per-PPU consumption (dict: ppu_name -> hourly array) - for storage INPUT PPUs
+    # Shows how much energy each storage INPUT PPU absorbed for charging
+    ppu_consumption: Dict[str, Any] = field(default_factory=dict)
+    
     # Storage states (dict: storage_name -> hourly SoC array)
     storage_soc: Dict[str, np.ndarray] = field(default_factory=dict)
     
@@ -1150,6 +1154,7 @@ def evaluate_portfolio_full_year(
         renewable_production=results.get('renewable_production', np.zeros(n_hours)),
         dispatchable_production=results.get('dispatchable_production', np.zeros(n_hours)),
         ppu_production=results.get('ppu_production', {}),
+        ppu_consumption=results.get('ppu_consumption', {}),  # Energy consumed by storage INPUT PPUs
         storage_soc=results.get('storage_soc', {}),
         # Aviation fuel metrics
         aviation_fuel_consumed_mwh=results.get('aviation_fuel_consumed_mwh', 0.0),

@@ -52,10 +52,16 @@ class PrecomputedRenewables:
     
     # River: PPU indices and monthly production
     river_indices: List[int] = field(default_factory=list)
+    river_unit_count: int = 0  # Total HYD_R units (FIX: was counting rows, not units)
     ror_production_monthly: np.ndarray = field(default_factory=lambda: np.zeros(12)) # MWh per month
+    
+    # BIO_WOOD: constant biomass import (Flex PPU)
+    bio_wood_count: int = 0  # Total BIO_WOOD units
+    bio_wood_efficiency: float = 0.38  # Chain efficiency from CSV
     
     # Solar Thermal: PPU indices
     sol_store_indices: List[int] = field(default_factory=list)
+    sol_store_unit_count: int = 0  # Total SOL_SALT_STORE units
     
     mw_per_unit: float = 10.0
 
@@ -101,9 +107,15 @@ def precompute_renewable_indices(
     
     # Extract river units
     river_indices = []
+    river_unit_count = 0  # FIX: Track actual unit count, not just row indices
+    
+    # BIO_WOOD tracking
+    bio_wood_count = 0
+    bio_wood_efficiency_sum = 0.0
     
     # Extract solar thermal store units
     sol_store_indices = []
+    sol_store_unit_count = 0  # FIX: Track actual unit count
     
     for i, row in ppu_dictionary.iterrows():
         ppu_name = row['PPU_Name']
@@ -112,14 +124,22 @@ def precompute_renewable_indices(
         # Get PPU unit count from row (critical for correct production!)
         unit_count = row.get('Count', 1)
         
-        # River hydro (incidence)
+        # River hydro (incidence) - FIX: track unit count properly
         if 'River' in components or ppu_name == 'HYD_R':
             river_indices.append(i)
+            river_unit_count += unit_count  # FIX: Add actual units, not 1
+            continue
+        
+        # BIO_WOOD (constant biomass import - treated as dispatchable with constant fuel)
+        if ppu_name == 'BIO_WOOD' or 'Wood' in str(components):
+            bio_wood_count += unit_count
+            bio_wood_efficiency_sum += (efficiency if not pd.isna(efficiency) else 0.38) * unit_count
             continue
             
-        # Solar thermal store (incidence -> storage)
+        # Solar thermal store (incidence -> storage) - FIX: track unit count
         if 'Solar concentrator' in str(components) or 'SOL_SALT_STORE' in ppu_name:
             sol_store_indices.append(i)
+            sol_store_unit_count += unit_count
         
         # Solar PV - count UNITS (not rows!)
         if 'PV' in components:
@@ -140,6 +160,7 @@ def precompute_renewable_indices(
     pv_efficiency = pv_efficiency_sum / pv_count if pv_count > 0 else 0.84
     total_wind = wind_onshore_count + wind_offshore_count
     wind_efficiency = wind_efficiency_sum / total_wind if total_wind > 0 else 0.84
+    bio_wood_efficiency = bio_wood_efficiency_sum / bio_wood_count if bio_wood_count > 0 else 0.38
     
     return PrecomputedRenewables(
         pv_count=pv_count,
@@ -150,8 +171,12 @@ def precompute_renewable_indices(
         wind_efficiency=wind_efficiency,
         turbines_per_location=1,  # 1 turbine per PPU per location
         river_indices=river_indices,
+        river_unit_count=river_unit_count,  # FIX: actual unit count for HYD_R
         ror_production_monthly=ror_production if ror_production is not None else np.zeros(12),
+        bio_wood_count=bio_wood_count,
+        bio_wood_efficiency=bio_wood_efficiency,
         sol_store_indices=sol_store_indices,
+        sol_store_unit_count=sol_store_unit_count,  # FIX: actual unit count
         mw_per_unit=mw_per_unit
     )
 
@@ -320,10 +345,11 @@ def calculate_renewable_production_fast(
         breakdown['PV'] = pv_mw
     
     # =================================================================
-    # RIVER HYDRO (HYD_R) - Incidence based (unchanged)
+    # RIVER HYDRO (HYD_R) - Incidence based
+    # FIX: Use river_unit_count instead of len(river_indices)
     # =================================================================
-    if len(precomputed.river_indices) > 0:
-        n_units = len(precomputed.river_indices)
+    if precomputed.river_unit_count > 0:
+        n_units = precomputed.river_unit_count  # FIX: actual unit count
         monthly_mwh = precomputed.ror_production_monthly[month_idx]
         hourly_mw_total = monthly_mwh / (30 * 24)
         
@@ -333,10 +359,27 @@ def calculate_renewable_production_fast(
         breakdown['HYD_R'] = river_mw
     
     # =================================================================
-    # SOLAR THERMAL STORAGE (SOL_SALT_STORE) - Incidence based
+    # BIO_WOOD - Constant biomass import (dispatchable baseload)
+    # Swiss biomass potential: ~3.5 TWh/year = ~400 MW constant
+    # Scales with number of BIO_WOOD PPU units (10 MW per unit)
     # =================================================================
-    if len(precomputed.sol_store_indices) > 0 and t < len(solar_data):
-        n_units = len(precomputed.sol_store_indices)
+    if precomputed.bio_wood_count > 0:
+        # Each BIO_WOOD unit can process ~10 MW of biomass input
+        # After chain efficiency (~38%), output is lower
+        n_units = precomputed.bio_wood_count
+        mw_per_unit = precomputed.mw_per_unit  # 10 MW
+        
+        # Biomass is constant (not weather-dependent), apply efficiency
+        bio_wood_mw = n_units * mw_per_unit * precomputed.bio_wood_efficiency
+        total_mw += bio_wood_mw
+        breakdown['BIO_WOOD'] = bio_wood_mw
+    
+    # =================================================================
+    # SOLAR THERMAL STORAGE (SOL_SALT_STORE) - Incidence based
+    # FIX: Use sol_store_unit_count instead of len(sol_store_indices)
+    # =================================================================
+    if precomputed.sol_store_unit_count > 0 and t < len(solar_data):
+        n_units = precomputed.sol_store_unit_count  # FIX: actual unit count
         
         # Use mean irradiance across all locations for thermal
         if solar_data.ndim > 1:
@@ -816,14 +859,26 @@ def initialize_storage_state(
             charge_power_mw = min(charge_power_mw, physical_cap)
             discharge_power_mw = min(discharge_power_mw, physical_cap)
         
-        # Scale capacity by input PPU count (minimum 1 for base capacity)
-        # Special handling: Lake and ghost PPU storages don't scale capacity
-        if storage_name == 'Lake' or storage_name in GHOST_PPU_STORAGES:
-            capacity_scale = 1
-        else:
-            capacity_scale = max(1, input_ppu_count)
+        # =================================================================
+        # STORAGE CAPACITY SCALING
+        # =================================================================
+        # Each INPUT PPU adds MWH_CAPACITY_PER_PPU (25 MWh) to the storage
+        # Formula: capacity = base_capacity + (input_ppu_count × 25 MWh)
+        # 
+        # Example: 500 H2_G units + 500 H2_GL units = 1000 INPUT PPUs
+        #          H2 UG 200bar: 700 GWh + (1000 × 25 MWh) = 725 GWh
+        #
+        # Special handling: Lake and Palm oil have FIXED capacity (no scaling)
+        # =================================================================
+        mwh_per_ppu = config.ppu.MWH_CAPACITY_PER_PPU  # 25 MWh per INPUT PPU
+        base_capacity = storage_def['capacity_MWh']
         
-        capacity = storage_def['capacity_MWh'] * capacity_scale
+        if storage_name == 'Lake' or storage_name in GHOST_PPU_STORAGES:
+            # Fixed capacity - no scaling from PPUs
+            capacity = base_capacity
+        else:
+            # Additive scaling: base + (input_ppu_count × 25 MWh)
+            capacity = base_capacity + (input_ppu_count * mwh_per_ppu)
         
         # Apply maximum capacity cap if defined
         max_cap = storage_def.get('max_capacity_cap_MWh')
@@ -1111,6 +1166,10 @@ def run_dispatch_simulation(
     # Initialize with arrays of zeros
     ppu_production_hourly = {name: np.zeros(n_timesteps) for name in portfolio_counts.keys() if portfolio_counts[name] > 0}
     
+    # Track hourly consumption (charging) per INPUT PPU
+    # This shows how much energy each storage INPUT PPU handled
+    ppu_consumption_hourly = {name: np.zeros(n_timesteps) for name in portfolio_counts.keys() if portfolio_counts[name] > 0}
+    
     # Track storage SoC over time
     storage_soc_series = {name: np.zeros(n_timesteps) for name in storages.keys()}
     
@@ -1322,23 +1381,32 @@ def run_dispatch_simulation(
             # Only storages with available capacity participate in charging
             FULL_THRESHOLD = 0.9999  # Consider full if SoC >= 99.99%
             
+            # =================================================================
+            # FIX: Only include storages that CAN be charged (have input PPUs)
+            # This ensures weights are calculated correctly and surplus is
+            # distributed ONLY among chargeable storages, not lost to spot.
+            # =================================================================
             available_storages = {}
             for name, storage in state.storages.items():
                 available_capacity = storage.capacity_mwh - storage.current_mwh
                 if storage.soc < FULL_THRESHOLD and available_capacity > 0:
-                    available_storages[name] = storage
+                    # Check if this storage has input PPUs OR is Palm oil (ghost PPU)
+                    input_ppus = STORAGE_INPUT_PPUS.get(name, [])
+                    if input_ppus or name == 'Palm oil':
+                        available_storages[name] = storage
             
-            # If ALL storages are full → sell everything to spot market
+            # If ALL chargeable storages are full → sell everything to spot market
             if not available_storages:
                 surplus_series[i] = remaining_surplus_mwh / timestep_h
                 state.spot_sold.append((i, remaining_surplus_mwh / timestep_h))
                 state.total_spot_sell_mwh += remaining_surplus_mwh
                 state.total_spot_sell_revenue += remaining_surplus_mwh * spot_price
             else:
-                # Calculate weights only for non-full storages (prioritize low SoC)
+                # Calculate weights only for CHARGEABLE storages (prioritize low SoC)
                 weights = calculate_storage_weights(available_storages, for_discharge=False)
                 
                 # Distribute energy across available storages by weight
+                # NOTE: available_storages already filtered to only chargeable storages
                 for storage_name, weight in weights.items():
                     if remaining_surplus_mwh <= 0:
                         break
@@ -1347,10 +1415,6 @@ def run_dispatch_simulation(
                     
                     storage = state.storages[storage_name]
                     input_ppus = STORAGE_INPUT_PPUS.get(storage_name, [])
-                    
-                    # Skip if no input PPUs (except Palm oil which uses ghost mechanism)
-                    if not input_ppus and storage_name != 'Palm oil':
-                        continue
                     
                     # Energy this storage should handle = total × weight
                     storage_energy_mwh = remaining_surplus_mwh * weight
@@ -1399,6 +1463,18 @@ def run_dispatch_simulation(
                     
                     remaining_surplus_mwh -= actual_charge_mwh
                     storage_charged_mw += actual_charge_mwh / timestep_h
+                    
+                    # Track consumption (charging) by INPUT PPUs
+                    # Distribute charged energy proportionally across input PPUs
+                    total_ppu_count = sum(p['count'] for p in input_ppus)
+                    if total_ppu_count > 0:
+                        for ppu_info in input_ppus:
+                            ppu_share = ppu_info['count'] / total_ppu_count
+                            ppu_charge_mw = (actual_charge_mwh / timestep_h) * ppu_share
+                            
+                            if ppu_info['ppu_name'] not in ppu_consumption_hourly:
+                                ppu_consumption_hourly[ppu_info['ppu_name']] = np.zeros(n_timesteps)
+                            ppu_consumption_hourly[ppu_info['ppu_name']][i] += ppu_charge_mw
                 
                 # Sell remaining surplus to spot market ONLY if couldn't fit in any storage
                 # (due to power limits, not capacity - capacity was filtered above)
@@ -1497,6 +1573,7 @@ def run_dispatch_simulation(
         'surplus': surplus_series,
         'storage_soc': storage_soc_series,
         'ppu_production': ppu_production_hourly,
+        'ppu_consumption': ppu_consumption_hourly,  # Energy consumed by storage INPUT PPUs
         # Summary stats
         'total_renewable_mwh': total_renewable_mwh,
         # =====================================================================

@@ -355,7 +355,7 @@ class PPUConfig:
         'WD_ON': (0, 2000),       # Up to 20 GW
         'WD_OFF': (0, 2000),      # Up to 20 GW
         'HYD_R': (0, 300),        # Up to 3 GW (300 × 10 MW) - physical hard cap (limited sites)
-        'BIO_WOOD': (0, 2000),    # Up to 20 GW
+        'BIO_WOOD': (0, 100),     # Max ~1 TWh/year (Swiss biomass potential limit)
         
         # Flex PPUs (extraction from storage) - hard cap: 2000
         'HYD_S': (0, 300),        # Up to 3 GW (300 × 10 MW) - physical hard cap (Lake 2 GW)
@@ -385,6 +385,11 @@ class PPUConfig:
     # Capacity per unit (MW per portfolio unit)
     # Each PPU unit = 10 MW power flow capacity
     MW_PER_UNIT: float = 10.0  # 10 MW per unit (100 units = 1 GW)
+    
+    # Storage capacity added per INPUT PPU (MWh)
+    # Each INPUT PPU unit adds this much storage capacity
+    # Example: 100 H2_G units = 100 × 25 MWh = 2.5 GWh added to H2 UG 200bar
+    MWH_CAPACITY_PER_PPU: float = 10.0  # 25 MWh per INPUT PPU unit
     
     # ==========================================================================
     # COMPOUNDING COST ESCALATION (for PV and Wind)
@@ -420,11 +425,11 @@ class PPUConfig:
         # =======================================================================
         # INCIDENCE PPUs: Use COMPOUNDING_COST_ESCALATION instead (factor=0 here)
         # =======================================================================
-        'PV': {'soft_cap': 2000, 'factor': 0.0},        # Uses compounding escalation
-        'WD_ON': {'soft_cap': 2000, 'factor': 0.0},     # Uses compounding escalation
-        'WD_OFF': {'soft_cap': 2000, 'factor': 0.0},    # Uses compounding escalation
-        'HYD_R': {'soft_cap': 300, 'factor': 0.0},      # No escalation (physical cap)
-        'BIO_WOOD': {'soft_cap': 2000, 'factor': 0.0},  # No escalation (incidence-like)
+        'PV': {'soft_cap': 2000, 'factor': 0.0001},        # Uses compounding escalation
+        'WD_ON': {'soft_cap': 2000, 'factor': 0.0001},     # Uses compounding escalation
+        'WD_OFF': {'soft_cap': 2000, 'factor': 0.0001},    # Uses compounding escalation
+        'HYD_R': {'soft_cap': 300, 'factor': 0.0001},      # No escalation (physical cap)
+        'BIO_WOOD': {'soft_cap': 100, 'factor': 0.0001},   # No escalation (hard cap at Swiss biomass potential)
         
         # =======================================================================
         # FLEX PPUs: soft_cap = 50% of hard_cap (1000 units = 10 GW)
