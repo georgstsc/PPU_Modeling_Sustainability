@@ -63,6 +63,10 @@ class CachedData:
     n_solar_locations: int = 0
     n_wind_locations: int = 0
     
+    # Demand scenario multiplier (1.0 for 2024, 1.6 for 2050)
+    demand_multiplier: float = 1.0
+    demand_scenario: str = "2024"
+    
     # PRE-COMPUTED SUMS for fast cumulative calculations (computed once on load)
     _solar_location_sums: Optional[np.ndarray] = None  # Sum over hours per location
     _wind_location_production: Optional[np.ndarray] = None  # Wind production per location
@@ -113,7 +117,18 @@ class CachedData:
         return self.spot_prices.copy() if copy else self.spot_prices
     
     def get_demand(self, copy: bool = True) -> np.ndarray:
-        """Return demand data. Set copy=False for read-only operations."""
+        """Return demand data with scenario multiplier applied.
+        
+        The stored demand is the 2024 base curve. This method applies
+        the demand_multiplier (1.0 for 2024, 1.6 for 2050).
+        
+        Set copy=False for read-only operations (but note that multiplier is always applied).
+        """
+        scaled_demand = self.demand * self.demand_multiplier
+        return scaled_demand.copy() if copy else scaled_demand
+    
+    def get_raw_demand(self, copy: bool = True) -> np.ndarray:
+        """Return raw 2024 demand data without scenario multiplier."""
         return self.demand.copy() if copy else self.demand
     
     def get_cost_table(self) -> pd.DataFrame:
@@ -652,12 +667,16 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
     # Align water inflow to same length
     water_inflow_mwh = water_inflow_mwh[:n_hours]
     
+    # Get demand scenario multiplier from config
+    demand_multiplier = config.energy_system.DEMAND_MULTIPLIER
+    demand_scenario = config.energy_system.DEMAND_SCENARIO
+    
     # Create cached data object
     _DATA_CACHE = CachedData(
         solar_incidence=solar_incidence,
         wind_incidence=wind_incidence,
         spot_prices=spot_prices,
-        demand=demand,
+        demand=demand,  # Raw 2024 demand - multiplier applied in get_demand()
         solar_ranking=solar_ranking,
         wind_ranking=wind_ranking,
         reservoir_levels=reservoir,
@@ -672,9 +691,11 @@ def load_all_data(config: Config = DEFAULT_CONFIG, force_reload: bool = False) -
         n_hours=n_hours,
         n_solar_locations=solar_incidence.shape[1] if solar_incidence.ndim > 1 else 1,
         n_wind_locations=wind_incidence.shape[1] if wind_incidence.ndim > 1 else 1,
+        demand_multiplier=demand_multiplier,
+        demand_scenario=demand_scenario,
     )
     
-    print("Data loading complete!")
+    print(f"Data loading complete! (Demand scenario: {demand_scenario}, multiplier: {demand_multiplier}x)")
     return _DATA_CACHE
 
 

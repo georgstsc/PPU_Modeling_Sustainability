@@ -154,7 +154,103 @@ def generate_initial_population(
 
 
 # =============================================================================
-# PROGRESSIVE COST CALCULATION
+# COMPOUNDING COST ESCALATION (for PV and Wind)
+# =============================================================================
+
+def calculate_compounding_escalation_cost(
+    ppu_name: str,
+    unit_count: int,
+    base_cost_per_mwh: float,
+    config: Config,
+) -> Tuple[float, float]:
+    """
+    Calculate the total and average cost for units with compounding escalation.
+    
+    After threshold, each unit costs: base × rate^(unit_index - threshold)
+    - Unit 1 above threshold: base × rate^1
+    - Unit 2 above threshold: base × rate^2
+    - etc.
+    
+    Args:
+        ppu_name: Name of PPU type
+        unit_count: Total number of units
+        base_cost_per_mwh: Base cost per MWh (CHF/MWh)
+        config: Configuration with escalation parameters
+        
+    Returns:
+        Tuple of (total_cost_multiplier, average_cost_multiplier)
+        Multiply these by base_cost to get actual costs.
+    """
+    escalation_config = config.ppu.COMPOUNDING_COST_ESCALATION
+    
+    if ppu_name not in escalation_config:
+        # No escalation for this PPU type
+        return float(unit_count), 1.0
+    
+    params = escalation_config[ppu_name]
+    threshold = params.get('threshold', 9999)
+    rate = params.get('rate', 1.0)
+    
+    if unit_count <= threshold or rate <= 1.0:
+        # Below threshold or no escalation
+        return float(unit_count), 1.0
+    
+    # Units at base cost (below threshold)
+    base_units = threshold
+    base_cost_multiplier = float(base_units)
+    
+    # Units with escalation (above threshold)
+    escalated_units = unit_count - threshold
+    
+    # Sum of geometric series: rate^1 + rate^2 + ... + rate^n = rate * (rate^n - 1) / (rate - 1)
+    if rate == 1.0:
+        escalated_cost_multiplier = float(escalated_units)
+    else:
+        escalated_cost_multiplier = rate * (rate ** escalated_units - 1) / (rate - 1)
+    
+    total_cost_multiplier = base_cost_multiplier + escalated_cost_multiplier
+    average_cost_multiplier = total_cost_multiplier / unit_count if unit_count > 0 else 1.0
+    
+    return total_cost_multiplier, average_cost_multiplier
+
+
+def get_escalated_cost_per_mwh(
+    ppu_name: str,
+    unit_index: int,
+    base_cost_per_mwh: float,
+    config: Config,
+) -> float:
+    """
+    Get the cost per MWh for a specific unit index (1-based).
+    
+    Args:
+        ppu_name: Name of PPU type
+        unit_index: Which unit number (1-based, e.g., unit 501 for the 501st PV)
+        base_cost_per_mwh: Base cost per MWh (CHF/MWh)
+        config: Configuration with escalation parameters
+        
+    Returns:
+        Cost per MWh for this specific unit
+    """
+    escalation_config = config.ppu.COMPOUNDING_COST_ESCALATION
+    
+    if ppu_name not in escalation_config:
+        return base_cost_per_mwh
+    
+    params = escalation_config[ppu_name]
+    threshold = params.get('threshold', 9999)
+    rate = params.get('rate', 1.0)
+    
+    if unit_index <= threshold:
+        return base_cost_per_mwh
+    
+    # Units above threshold have escalated cost
+    escalation_power = unit_index - threshold
+    return base_cost_per_mwh * (rate ** escalation_power)
+
+
+# =============================================================================
+# PROGRESSIVE COST CALCULATION (for non-incidence PPUs)
 # =============================================================================
 
 def calculate_progressive_cost_penalty(
@@ -249,9 +345,14 @@ def get_portfolio_cost_multiplier(
     """
     Get cost multipliers for each PPU type based on current counts.
     
-    Returns dictionary of {ppu_name: multiplier} where multiplier >= 1.0
+    Includes:
+    - Compounding escalation for PV, WD_ON, WD_OFF (rate^(units-threshold))
+    - Progressive linear escalation for other PPUs
+    
+    Returns dictionary of {ppu_name: average_multiplier} where multiplier >= 1.0
     """
     progressive_caps = config.ppu.PROGRESSIVE_COST_CAPS
+    compounding_escalation = config.ppu.COMPOUNDING_COST_ESCALATION
     multipliers = {}
     
     for ppu_name, count in portfolio.ppu_counts.items():
@@ -259,6 +360,24 @@ def get_portfolio_cost_multiplier(
             multipliers[ppu_name] = 1.0
             continue
         
+        # Check for compounding escalation first (PV, WD_ON, WD_OFF)
+        if ppu_name in compounding_escalation:
+            params = compounding_escalation[ppu_name]
+            threshold = params.get('threshold', 9999)
+            rate = params.get('rate', 1.0)
+            
+            if count <= threshold or rate <= 1.0:
+                multipliers[ppu_name] = 1.0
+            else:
+                # Calculate average cost multiplier with compounding
+                # Base units cost 1.0, escalated units cost rate^i
+                _, avg_multiplier = calculate_compounding_escalation_cost(
+                    ppu_name, count, 1.0, config
+                )
+                multipliers[ppu_name] = avg_multiplier
+            continue
+        
+        # Fall back to progressive linear escalation
         if ppu_name not in progressive_caps:
             multipliers[ppu_name] = 1.0
             continue

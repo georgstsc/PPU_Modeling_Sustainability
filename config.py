@@ -59,9 +59,32 @@ class RunModeConfig:
 class EnergySystemConfig:
     """Physical parameters of the Swiss energy system."""
     
+    # ==========================================================================
+    # DEMAND SCENARIO SELECTION (2024 vs 2050)
+    # ==========================================================================
+    # "2024": Current demand curve (base scenario)
+    # "2050": 1.6× demand curve (future growth scenario)
+    DEMAND_SCENARIO: str = "2024"
+    
+    # Multipliers for each scenario
+    DEMAND_MULTIPLIERS: Dict[str, float] = field(default_factory=lambda: {
+        "2024": 1.0,    # Base 2024 demand
+        "2050": 1.6,    # 60% growth by 2050
+    })
+    
+    @property
+    def DEMAND_MULTIPLIER(self) -> float:
+        """Get the demand multiplier for the current scenario."""
+        return self.DEMAND_MULTIPLIERS.get(self.DEMAND_SCENARIO, 1.0)
+    
     # Target annual energy demand (TWh/year)
-    # Switzerland's 2050 target is ~113 TWh
-    TARGET_ANNUAL_DEMAND_TWH: float = 113.0
+    # Switzerland's 2050 target is ~113 TWh (base scenario)
+    TARGET_ANNUAL_DEMAND_TWH_BASE: float = 113.0
+    
+    @property
+    def TARGET_ANNUAL_DEMAND_TWH(self) -> float:
+        """Adjusted target demand based on scenario."""
+        return self.TARGET_ANNUAL_DEMAND_TWH_BASE * self.DEMAND_MULTIPLIER
     
     # Conversion to MWh (used internally)
     @property
@@ -77,8 +100,14 @@ class EnergySystemConfig:
     # Aviation requires 23 TWh/year of biooil fuel (CO2-neutral synthetic fuel)
     # This is a HARD constraint: biooil must be discharged every hour
     # Reference: Züttel et al. (2024) - Swiss energy transition pathway
+    # Note: Aviation fuel scales with demand scenario (1.6× for 2050)
     
-    AVIATION_FUEL_DEMAND_TWH_YEAR: float = 23.0
+    AVIATION_FUEL_DEMAND_TWH_YEAR_BASE: float = 23.0
+    
+    @property
+    def AVIATION_FUEL_DEMAND_TWH_YEAR(self) -> float:
+        """Adjusted aviation fuel demand based on scenario."""
+        return self.AVIATION_FUEL_DEMAND_TWH_YEAR_BASE * self.DEMAND_MULTIPLIER
     
     # Hourly biooil discharge requirement (MWh/hour)
     # 23 TWh/year = 23,000,000 MWh/year ÷ 8760 hours ≈ 2625.57 MWh/hour
@@ -358,25 +387,43 @@ class PPUConfig:
     MW_PER_UNIT: float = 10.0  # 10 MW per unit (100 units = 1 GW)
     
     # ==========================================================================
-    # PROGRESSIVE COST CAPS
+    # COMPOUNDING COST ESCALATION (for PV and Wind)
+    # ==========================================================================
+    # After 'threshold' units, each additional unit's cost is multiplied by:
+    #   cost_multiplier = rate ^ (unit_number - threshold)
+    # Example: PV unit 501 = base × 1.001^1, unit 502 = base × 1.001^2, etc.
+    #
+    # This reflects increasing marginal costs due to:
+    # - Land scarcity and more expensive locations
+    # - Grid integration costs
+    # - Environmental/permitting constraints
+    
+    COMPOUNDING_COST_ESCALATION: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        'PV': {'threshold': 500, 'rate': 1.001},        # 0.1% per unit after 500
+        'WD_ON': {'threshold': 200, 'rate': 1.001},     # 0.1% per unit after 200 (onshore)
+        'WD_OFF': {'threshold': 200, 'rate': 1.001},    # 0.1% per unit after 200 (offshore)
+    })
+    
+    # ==========================================================================
+    # PROGRESSIVE COST CAPS (for non-incidence PPUs)
     # ==========================================================================
     # After 'soft_cap' units, each additional unit increases cost by 'factor'
     # Formula: cost_multiplier = 1 + factor * max(0, units - soft_cap)
     # Example: factor=0.1, soft_cap=100, units=150 → multiplier = 1 + 0.1*50 = 6x
     #
-    # INCIDENCE PPUs: soft_cap = 100% of hard cap → NO price escalation
+    # INCIDENCE PPUs: Now use COMPOUNDING_COST_ESCALATION above
     # NON-INCIDENCE PPUs: soft_cap = 50% of hard cap → price escalation after 50%
     #
     # Set factor=0 to disable progressive cost for a PPU type
     
     PROGRESSIVE_COST_CAPS: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         # =======================================================================
-        # INCIDENCE PPUs: soft_cap = hard_cap (NO progressive cost penalty)
+        # INCIDENCE PPUs: Use COMPOUNDING_COST_ESCALATION instead (factor=0 here)
         # =======================================================================
-        'PV': {'soft_cap': 2000, 'factor': 0.0},        # No escalation (incidence)
-        'WD_ON': {'soft_cap': 2000, 'factor': 0.0},     # No escalation (incidence)
-        'WD_OFF': {'soft_cap': 2000, 'factor': 0.0},    # No escalation (incidence)
-        'HYD_R': {'soft_cap': 300, 'factor': 0.0},      # No escalation (incidence, physical cap)
+        'PV': {'soft_cap': 2000, 'factor': 0.0},        # Uses compounding escalation
+        'WD_ON': {'soft_cap': 2000, 'factor': 0.0},     # Uses compounding escalation
+        'WD_OFF': {'soft_cap': 2000, 'factor': 0.0},    # Uses compounding escalation
+        'HYD_R': {'soft_cap': 300, 'factor': 0.0},      # No escalation (physical cap)
         'BIO_WOOD': {'soft_cap': 2000, 'factor': 0.0},  # No escalation (incidence-like)
         
         # =======================================================================
