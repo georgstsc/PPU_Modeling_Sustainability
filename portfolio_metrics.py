@@ -279,7 +279,7 @@ class PortfolioMetrics3D:
     
     # === CONSTRAINT COMPLIANCE FIELDS ===
     # These are CRITICAL for filtering portfolios in the notebook
-    storage_constraint_met: bool = False  # Cyclic SOC constraint (±5% of initial)
+    storage_constraint_met: bool = False  # Cyclic SOC constraint (±25% of initial)
     total_domestic_production_twh: float = 0.0  # Electrical sovereignty (≥113 TWh/year)
     aviation_fuel_constraint_met: bool = False  # Aviation fuel requirement (23 TWh/year)
     

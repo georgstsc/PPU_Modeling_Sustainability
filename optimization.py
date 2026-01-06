@@ -1134,34 +1134,61 @@ def evaluate_portfolio_full_year(
         print(f"Deficit Analysis:")
         print(f"  Hours in deficit: {full_year.hours_in_deficit} ({full_year.hours_in_deficit/n_hours*100:.1f}%)")
         print(f"  Peak deficit: {full_year.peak_deficit_mw:,.0f} MW")
+        
+        # ===== CONSTRAINT COMPLIANCE SUMMARY =====
         print()
-        print(f"Aviation Fuel (from Fuel Tank - Synthetic):")
+        print("=" * 60)
+        print("CONSTRAINT COMPLIANCE (3 Hard Constraints)")
+        print("=" * 60)
+        
+        # 1. Electrical Sovereignty
+        min_production_required = 113.0  # TWh/year
+        electrical_met = full_year.total_production_twh >= min_production_required
+        print(f"\n1️⃣  Electrical Sovereignty (≥113 TWh/year):")
+        print(f"   Production: {full_year.total_production_twh:,.1f} TWh")
+        print(f"   Required:   {min_production_required:,.1f} TWh")
+        print(f"   Constraint: {'✅ YES' if electrical_met else '❌ NO'}")
+        if not electrical_met:
+            shortfall = min_production_required - full_year.total_production_twh
+            print(f"   ⚠️  Shortfall: {shortfall:.1f} TWh")
+        
+        # 2. Aviation Fuel (23 TWh/year synthetic fuel)
+        print(f"\n2️⃣  Aviation Fuel (23 TWh/year synthetic):")
         required_twh = config.energy_system.AVIATION_FUEL_DEMAND_TWH_YEAR
         consumed_twh = full_year.aviation_fuel_consumed_mwh / 1e6
         shortfall_twh = full_year.aviation_fuel_shortfall_mwh / 1e6
-        print(f"  Required: {required_twh:,.1f} TWh/year")
-        print(f"  Consumed: {consumed_twh:,.2f} TWh ({consumed_twh/required_twh*100:.1f}%)")
-        print(f"  Shortfall: {shortfall_twh:,.2f} TWh")
-        print(f"  Production Cost: {full_year.aviation_fuel_import_cost_chf/1e6:,.1f} M CHF")
-        print(f"  Constraint Met: {'✅ YES' if full_year.aviation_fuel_constraint_met else '❌ NO'}")
+        print(f"   Required:  {required_twh:,.1f} TWh/year")
+        print(f"   Consumed:  {consumed_twh:,.2f} TWh ({consumed_twh/required_twh*100:.1f}%)")
+        print(f"   Shortfall: {shortfall_twh:,.2f} TWh")
+        print(f"   Import Cost: {full_year.aviation_fuel_import_cost_chf/1e6:,.1f} M CHF")
+        print(f"   Constraint: {'✅ YES' if full_year.aviation_fuel_constraint_met else '❌ NO'}")
         if not full_year.aviation_fuel_constraint_met:
             hours_short = np.sum(full_year.aviation_fuel_shortfall_series > 0)
-            print(f"  ⚠️  {hours_short} hours with aviation fuel shortfall")
+            print(f"   ⚠️  {hours_short} hours with shortfall")
         
-        # Final storage constraint report
-        print()
-        print(f"Final Storage Constraint (±{tolerance*100:.0f}% of initial SoC):")
-        print(f"  Constraint Met: {'✅ YES' if full_year.storage_constraint_met else '❌ NO'}")
+        # 3. Cyclic State of Charge (storage returns to initial)
+        print(f"\n3️⃣  Cyclic State of Charge (±{tolerance*100:.0f}% of initial):")
+        print(f"   Constraint: {'✅ YES' if full_year.storage_constraint_met else '❌ NO'}")
         if not full_year.storage_constraint_met:
-            print(f"  Total Penalty: {full_year.storage_constraint_penalty:,.0f}")
+            print(f"   Penalty: {full_year.storage_constraint_penalty:,.0f} CHF")
             for name, v in full_year.storage_constraint_violations.items():
-                print(f"  ⚠️  {name}: initial={v['initial_soc']:.2%} → final={v['final_soc']:.2%} "
-                      f"(deviation: {v['deviation']:.2%}, max allowed: {v['max_allowed']:.2%})")
+                print(f"   ⚠️  {name}: {v['initial_soc']:.1%} → {v['final_soc']:.1%} "
+                      f"(deviation: {v['deviation']:.1%}, max: {v['max_allowed']:.1%})")
         else:
             # Show final SoC for all storages even if constraint is met
             for storage_name, soc_series in full_year.storage_soc.items():
                 if len(soc_series) > 0:
-                    print(f"  ✓ {storage_name}: {soc_series[0]:.1%} → {soc_series[-1]:.1%}")
+                    print(f"   ✓ {storage_name}: {soc_series[0]:.1%} → {soc_series[-1]:.1%}")
+        
+        # Overall compliance
+        print()
+        all_constraints_met = (
+            electrical_met and 
+            full_year.aviation_fuel_constraint_met and 
+            full_year.storage_constraint_met
+        )
+        print(f"Overall Portfolio: {'✅ FULLY COMPLIANT' if all_constraints_met else '❌ NON-COMPLIANT'}")
+        print("=" * 60)
     
     return full_year
 

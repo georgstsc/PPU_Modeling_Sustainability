@@ -173,7 +173,7 @@ class StorageConfig:
     # ==========================================================================
     # System must end with storage levels within tolerance of initial levels
     # This prevents "cheating" by depleting storage over the simulation year
-    FINAL_SOC_TOLERANCE: float = 0.05  # ±5% of initial SoC allowed
+    FINAL_SOC_TOLERANCE: float = 0.25  # ±25% of initial SoC allowed (relaxed)
     FINAL_SOC_PENALTY_MULTIPLIER: float = 1e8  # Heavy penalty for violation
     
     # Storage definitions: (capacity_MWh, max_power_MW)

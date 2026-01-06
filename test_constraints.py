@@ -198,6 +198,11 @@ if __name__ == "__main__":
     print("╔" + "="*68 + "╗")
     print("║" + " "*15 + "PORTFOLIO CONSTRAINTS TEST SUITE" + " "*21 + "║")
     print("╚" + "="*68 + "╝")
+    print("\n" + "Testing implementation of 3 hard constraints:")
+    print("  1️⃣  Electrical Sovereignty (≥113 TWh/year)")
+    print("  2️⃣  Aviation Fuel (23 TWh/year synthetic)")
+    print("  3️⃣  Cyclic State of Charge (storage returns to initial ±5%)")
+    print()
     
     try:
         # Test 1: Aviation compliance (fast)
@@ -216,10 +221,13 @@ if __name__ == "__main__":
         print("\n\n" + "="*70)
         print("ALL TESTS COMPLETE")
         print("="*70)
-        print("\n✅ Implementation verified!")
+        print("\n✅ All 3 constraints implementation verified!")
         print("\nNext steps:")
         print("  1. Run genetic algorithm optimization")
-        print("  2. Verify best portfolio meets both constraints")
+        print("  2. Verify portfolios meet ALL 3 constraints:")
+        print("     - Electrical sovereignty (≥113 TWh/year)")
+        print("     - Aviation fuel (23 TWh/year)")
+        print("     - Cyclic SOC (±5% tolerance)")
         print("  3. Compare results with previous optimization")
         
     except Exception as e:

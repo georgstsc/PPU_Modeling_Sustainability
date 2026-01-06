@@ -109,6 +109,8 @@ def precompute_renewable_indices(
         ppu_name = row['PPU_Name']
         components = row['Components']
         efficiency = row.get('Chain_Efficiency', 0.84)
+        # Get PPU unit count from row (critical for correct production!)
+        unit_count = row.get('Count', 1)
         
         # River hydro (incidence)
         if 'River' in components or ppu_name == 'HYD_R':
@@ -119,20 +121,20 @@ def precompute_renewable_indices(
         if 'Solar concentrator' in str(components) or 'SOL_SALT_STORE' in ppu_name:
             sol_store_indices.append(i)
         
-        # Solar PV - count units
+        # Solar PV - count UNITS (not rows!)
         if 'PV' in components:
-            pv_count += 1
-            pv_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
+            pv_count += unit_count
+            pv_efficiency_sum += (efficiency if not pd.isna(efficiency) else 0.84) * unit_count
         
-        # Wind onshore
+        # Wind onshore - count UNITS (not rows!)
         elif 'Wind (onshore)' in components:
-            wind_onshore_count += 1
-            wind_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
+            wind_onshore_count += unit_count
+            wind_efficiency_sum += (efficiency if not pd.isna(efficiency) else 0.84) * unit_count
             
-        # Wind offshore
+        # Wind offshore - count UNITS (not rows!)
         elif 'Wind (offshore)' in components:
-            wind_offshore_count += 1
-            wind_efficiency_sum += efficiency if not pd.isna(efficiency) else 0.84
+            wind_offshore_count += unit_count
+            wind_efficiency_sum += (efficiency if not pd.isna(efficiency) else 0.84) * unit_count
     
     # Calculate average efficiencies
     pv_efficiency = pv_efficiency_sum / pv_count if pv_count > 0 else 0.84
@@ -479,7 +481,8 @@ class DispatchState:
                 name=storage.name,
                 capacity_mwh=storage.capacity_mwh,
                 current_mwh=storage.current_mwh,
-                max_power_mw=storage.max_power_mw,
+                max_charge_power_mw=storage.max_charge_power_mw,
+                max_discharge_power_mw=storage.max_discharge_power_mw,
                 efficiency_charge=storage.efficiency_charge,
                 efficiency_discharge=storage.efficiency_discharge,
                 import_price_chf_per_mwh=storage.import_price_chf_per_mwh,
@@ -488,75 +491,97 @@ class DispatchState:
 
 
 # =============================================================================
-# DISPATCH INDICES (Decision Support)
+# DISPATCH INDICES (Simplified Disposition-Based)
 # =============================================================================
+
+# Smoothing parameter Δ_s for nearly linear behavior between SoC 0.4 and 0.8
+# With Δ_s = 0.20: tanh(-1) ≈ -0.76 at SoC=0.4, tanh(1) ≈ 0.76 at SoC=0.8
+DELTA_S_SMOOTHING = 0.20
+SOC_TARGET = 0.60
+
 
 @njit(cache=True)
 def calculate_disposition_index(
     soc: float,
-    soc_target: float = 0.60,
-    deadband: float = 0.05,
-    alpha: float = 1.0
+    soc_target: float = SOC_TARGET,
+    delta_s: float = DELTA_S_SMOOTHING
 ) -> float:
     """
-    Calculate disposition index for storage willingness to discharge.
+    Calculate disposition index for storage.
     
-    Returns value in [-1, 1]:
-    - +1: Storage full → wants to discharge
-    - -1: Storage empty → wants to charge
-    -  0: At target → neutral
-    """
-    if soc > soc_target + deadband:
-        delta = soc - (soc_target + deadband)
-    elif soc < soc_target - deadband:
-        delta = soc - (soc_target - deadband)
-    else:
-        delta = 0.0
+    Simple formula: d_s = tanh((SoC - SoC_target) / Δ_s)
     
-    max_excursion = max(1.0 - soc_target - deadband, soc_target - deadband)
-    if max_excursion > 0:
-        delta_norm = delta / max_excursion
-    else:
-        delta_norm = 0.0
-    
-    return np.tanh(delta_norm / alpha)
-
-
-@njit(cache=True)
-def calculate_utility_indices(
-    phi_t: float,
-    phi_smoothed: float,
-    alpha_u: float = 1000.0
-) -> Tuple[float, float]:
-    """
-    Calculate utility indices for system-wide dispatch context.
+    Result is normalized to [0, 1] range:
+    - 1.0: Storage full (SoC=1) → wants to discharge
+    - 0.5: At target (SoC=0.6) → neutral
+    - 0.0: Storage empty (SoC=0) → wants to charge
     
     Args:
-        phi_t: Net system shortfall (MW). >0 means deficit.
-        phi_smoothed: Smoothed shortfall (EMA)
-        alpha_u: Scaling parameter
+        soc: State of charge [0, 1]
+        soc_target: Target SoC (default 0.60)
+        delta_s: Smoothing parameter for linear behavior (default 0.20)
         
     Returns:
-        (u_dis, u_chg): Discharge and charge utility indices in [-1, 1]
+        Disposition index in [0, 1]
     """
-    u_dis = np.tanh(phi_smoothed / alpha_u)
+    # Raw tanh in [-1, 1]
+    raw = np.tanh((soc - soc_target) / delta_s)
+    # Transform to [0, 1]: (raw + 1) / 2
+    return (raw + 1.0) / 2.0
+
+
+def calculate_storage_weights(
+    storages: Dict[str, Any],
+    for_discharge: bool
+) -> Dict[str, float]:
+    """
+    Calculate dispatch weights for all storages based on disposition indices.
     
-    if phi_t < 0:
-        u_chg = np.tanh(-phi_smoothed / alpha_u)
+    Weight formula:
+    - For discharge (deficit): weight_s = d_s / sum(d_s)  [prioritize high SoC]
+    - For charge (surplus):    weight_s = (1-d_s) / sum(1-d_s)  [prioritize low SoC]
+    
+    Args:
+        storages: Dictionary of objects with 'soc' attribute (StorageState or similar)
+        for_discharge: True for deficit (discharge), False for surplus (charge)
+        
+    Returns:
+        Dictionary mapping storage name to weight [0, 1], weights sum to 1
+    """
+    # Calculate disposition index for each storage
+    dispositions = {}
+    for name, storage in storages.items():
+        d = calculate_disposition_index(storage.soc)
+        dispositions[name] = d
+    
+    # Calculate weights
+    weights = {}
+    
+    if for_discharge:
+        # For discharge: use d directly (higher SoC = higher priority)
+        total = sum(dispositions.values())
+        if total > 1e-9:
+            for name, d in dispositions.items():
+                weights[name] = d / total
+        else:
+            # All at zero → equal weights
+            n = len(storages)
+            for name in storages:
+                weights[name] = 1.0 / n if n > 0 else 0.0
     else:
-        u_chg = 0.0
+        # For charge: use (1 - d) (lower SoC = higher priority)
+        inverted = {name: 1.0 - d for name, d in dispositions.items()}
+        total = sum(inverted.values())
+        if total > 1e-9:
+            for name, inv_d in inverted.items():
+                weights[name] = inv_d / total
+        else:
+            # All at one → equal weights
+            n = len(storages)
+            for name in storages:
+                weights[name] = 1.0 / n if n > 0 else 0.0
     
-    return u_dis, u_chg
-
-
-@njit(cache=True)
-def exponential_moving_average(
-    current: float,
-    previous_ema: float,
-    beta: float = 0.2
-) -> float:
-    """Calculate EMA for smoothing."""
-    return (1.0 - beta) * current + beta * previous_ema
+    return weights
 
 
 # =============================================================================
@@ -614,38 +639,24 @@ def wind_power_mw(
 
 
 # =============================================================================
-# DISPATCHABLE GENERATOR SUPPORT
+# STORAGE-BASED SYSTEM ONLY
+# =============================================================================
+# ALL PPUs must extract from storage - no direct fuel generation
+# Energy flow: Incidence/Import → Storage → Extract → Grid
+# 
+# Examples:
+#   - BIO_WOOD: Wood → Wood Storage → Pyrolysis → ... → Grid
+#   - IMP_BIOG: Biogas → Biogas Storage → Purification → ... → Grid
+#   - THERM: Fuel Tank storage → Transport → CCPP → Grid
+#
+# If storage is empty and demand exceeds renewable production:
+#   → Buy electricity from spot market (LAST RESORT ONLY)
 # =============================================================================
 
-# PPUs that are standalone dispatchable generators (fuel-based, no dedicated storage)
-# These can dispatch without drawing from storage - they use direct fuel input
-DISPATCHABLE_GENERATORS = {
-    'THERM_M': {'capacity_factor': 0.95, 'cost_per_mwh': 85},   # Methane thermal (direct import)
-    'THERM_G': {'capacity_factor': 0.95, 'cost_per_mwh': 23},   # Gas thermal (direct import)
-    # BIO_WOOD: Wood → Pyrolysis → Bio-based fuel → Steam reforming → CCPP → Grid
-    # This is a flexible generator that uses biomass as direct input (not storage-backed)
-    # Note: Intermediate fuel is produced in-line, not from external storage
-    'BIO_WOOD': {'capacity_factor': 0.70, 'cost_per_mwh': 215}, # Wood biomass (215 CHF/MWh from PPU costs)
-}
-
-# Storage discharge costs (opportunity cost - value of stored energy)
-# Higher cost = more reluctant to discharge (save for peak demand)
-# This cost should include the OPEX of the extraction PPU (e.g. SOL_SALT)
-STORAGE_DISCHARGE_COSTS = {
-    'Lake': 90,           # HYD_S extraction - FIXED: Reduced from 150 to be competitive
-                          # Hydropower should be flexible and dispatchable, not premium reserve
-    'Solar salt': 40,     # SOL_SALT / SOL_STEAM extraction
-    'Biogas': 50,         # IMP_BIOG extraction
-    'H2 UG 200bar': 80,   # H2P_G extraction
-    'CH4 200bar': 70,     # THERM_CH4 extraction
-    'Liquid H2': 90,      # H2P_L extraction
-    'Fuel Tank': 60,      # THERM extraction (also supplies aviation fuel)
-    'Ammonia': 85,        # NH3_P extraction
-    'Palm oil': 55,       # PALM_ICE extraction (only imported bio-fuel)
-}
-
 # Mapping from storage name to the PPU(s) that extract from it
-# Used to attribute storage discharge production to the correct PPU for RoT calculation
+# Used to:
+# 1. Attribute storage discharge production to the correct PPU for RoT calculation
+# 2. Look up the extracting PPU's LCOE for discharge cost
 STORAGE_TO_EXTRACTING_PPU = {
     'Lake': 'HYD_S',
     'Solar salt': 'SOL_SALT',  # Could also be SOL_STEAM, using primary
@@ -656,62 +667,81 @@ STORAGE_TO_EXTRACTING_PPU = {
     'Fuel Tank': 'THERM',  # Also provides aviation fuel
     'Ammonia': 'NH3_P',
     'Palm oil': 'PALM_ICE',  # Only imported bio-fuel
-    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
 }
 
 
-@dataclass
-class DispatchableCapacity:
-    """Tracks available dispatchable generation capacity."""
-    
-    ppu_name: str
-    max_power_mw: float
-    capacity_factor: float
-    cost_per_mwh: float
-    
-    # Track utilization
-    energy_produced_mwh: float = 0.0
-    
-    def available_power(self) -> float:
-        """Available power considering capacity factor."""
-        return self.max_power_mw * self.capacity_factor
-    
-    def dispatch(self, requested_mwh: float, timestep_h: float = 0.25) -> float:
-        """Dispatch up to requested amount, return actual dispatch."""
-        available_mwh = self.available_power() * timestep_h
-        dispatched = min(requested_mwh, available_mwh)
-        self.energy_produced_mwh += dispatched
-        return dispatched
-
-
-def initialize_dispatchable_generators(
-    portfolio_counts: Dict[str, int],
-    config: Config = DEFAULT_CONFIG
-) -> Dict[str, DispatchableCapacity]:
+def get_storage_discharge_cost(
+    storage_name: str,
+    ppu_definitions: Optional[Dict] = None,
+    default_cost: float = 50.0
+) -> float:
     """
-    Initialize dispatchable generator capacities.
+    Get discharge cost for a storage based on its extracting PPU's LCOE.
+    
+    The discharge cost = LCOE of the extracting PPU (in CHF/MWh).
+    This ensures costs are consistent with PPU definitions.
+    
+    Default LCOE values (from ppu_efficiency_lcoe_analysis.csv):
+    - HYD_S: ~4 CHF/MWh (very cheap hydro)
+    - THERM: ~82 CHF/MWh (CCPP)
+    - H2P_G/H2P_L: ~150 CHF/MWh (fuel cells)
+    - THERM_CH4: ~95 CHF/MWh (gas turbine)
+    - NH3_P: ~160 CHF/MWh (ammonia power)
+    - IMP_BIOG: ~70 CHF/MWh (biogas)
+    - PALM_ICE: ~180 CHF/MWh (palm oil ICE)
     
     Args:
-        portfolio_counts: PPU counts from portfolio
-        config: Configuration
+        storage_name: Name of the storage
+        ppu_definitions: Dictionary of PPUDefinition objects
+        default_cost: Default cost if PPU not found (CHF/MWh)
         
     Returns:
-        Dictionary of DispatchableCapacity objects
+        Discharge cost in CHF/MWh
     """
-    mw_per_unit = config.ppu.MW_PER_UNIT
-    dispatchers = {}
+    # Default LCOE values based on extracting PPU (from ppu_efficiency_lcoe_analysis.csv)
+    # These are used for ordering storages - cheapest dispatched first
+    DEFAULT_LCOE_BY_STORAGE = {
+        'Lake': 4,           # HYD_S - very cheap hydro turbine
+        'Solar salt': 90,    # SOL_SALT - thermal extraction
+        'Biogas': 70,        # IMP_BIOG - biogas CHP
+        'H2 UG 200bar': 150, # H2P_G - hydrogen fuel cell
+        'CH4 200bar': 95,    # THERM_CH4 - methane gas turbine
+        'Liquid H2': 150,    # H2P_L - hydrogen fuel cell
+        'Fuel Tank': 82,     # THERM - CCPP synthetic fuel
+        'Ammonia': 160,      # NH3_P - ammonia to power
+        'Palm oil': 180,     # PALM_ICE - palm oil ICE generator
+    }
     
-    for ppu_name, gen_def in DISPATCHABLE_GENERATORS.items():
-        count = portfolio_counts.get(ppu_name, 0)
-        if count > 0:
-            dispatchers[ppu_name] = DispatchableCapacity(
-                ppu_name=ppu_name,
-                max_power_mw=count * mw_per_unit,
-                capacity_factor=gen_def['capacity_factor'],
-                cost_per_mwh=gen_def['cost_per_mwh'],
-            )
+    # First try to get from default lookup
+    if storage_name in DEFAULT_LCOE_BY_STORAGE:
+        base_cost = DEFAULT_LCOE_BY_STORAGE[storage_name]
+    else:
+        base_cost = default_cost
     
-    return dispatchers
+    # Override with PPU definitions if available
+    extracting_ppu = STORAGE_TO_EXTRACTING_PPU.get(storage_name)
+    
+    if extracting_ppu is not None and ppu_definitions is not None:
+        ppu_def = ppu_definitions.get(extracting_ppu)
+        if ppu_def is not None:
+            # cost_per_mwh is actually in CHF/kWh (historical naming), convert to CHF/MWh
+            if hasattr(ppu_def, 'cost_per_mwh'):
+                base_cost = ppu_def.cost_per_mwh * 1000  # CHF/kWh → CHF/MWh
+            elif isinstance(ppu_def, dict) and 'cost_per_mwh' in ppu_def:
+                base_cost = ppu_def['cost_per_mwh'] * 1000
+    
+    return base_cost
+
+
+# =============================================================================
+# REMOVED: Dispatchable generators (THERM_G, THERM_M, BIO_WOOD as direct generators)
+# =============================================================================
+# These were removed because:
+# 1. THERM_G and THERM_M don't exist in ppu_constructs_components.csv
+# 2. BIO_WOOD requires Wood Storage (not direct input)
+# 3. All PPUs must follow storage-based energy flow
+# 4. Shortfalls are covered by spot market, not direct fuel import
+# =============================================================================
 
 
 # =============================================================================
@@ -729,7 +759,11 @@ def initialize_storage_state(
     - Charge power = MW_PER_UNIT × count of input PPUs
     - Discharge power = MW_PER_UNIT × count of extraction PPUs
     
-    Capacity is scaled by input PPUs (more storage input = more capacity needed).
+    ACTIVE REGULATION: All storages need charge power to participate in
+    SoC regulation (buy from spot when below target). If no input PPUs,
+    use discharge power or max_power_MW as fallback.
+    
+    Capacity is scaled by input PPUs (minimum 1 for base capacity).
     
     Args:
         portfolio_counts: PPU counts from portfolio
@@ -741,6 +775,9 @@ def initialize_storage_state(
     storage_defs = config.storage.STORAGE_DEFINITIONS
     initial_soc = config.storage.INITIAL_SOC_FRACTION
     mw_per_unit = config.ppu.MW_PER_UNIT  # 10 MW per PPU unit
+    
+    # Storages that use ghost PPU mechanism (sell electricity → buy fuel)
+    GHOST_PPU_STORAGES = {'Palm oil'}
     
     storages = {}
     
@@ -758,6 +795,21 @@ def initialize_storage_state(
         charge_power_mw = input_ppu_count * mw_per_unit
         discharge_power_mw = extract_ppu_count * mw_per_unit
         
+        # =====================================================================
+        # PPU-ONLY CHARGING: No fallback - only INPUT PPUs can charge storage
+        # =====================================================================
+        # If no INPUT PPUs in portfolio, charge_power_mw stays 0
+        # This ensures storages can ONLY be charged by their designated PPUs
+        # No artificial regulation via spot market
+        #
+        # EXCEPTION: Ghost PPU storages (Palm oil) use spot market to buy fuel
+        # They need charge power > 0 for the ghost mechanism to work
+        # =====================================================================
+        if storage_name in GHOST_PPU_STORAGES and charge_power_mw == 0:
+            # Ghost PPU storages: allow unlimited charging via spot market
+            # Use the storage's max_power_MW as the charge limit
+            charge_power_mw = storage_def.get('max_power_MW', 5000)
+        
         # Apply physical power cap if defined (e.g., Lake = 2 GW)
         physical_cap = storage_def.get('physical_power_cap_MW')
         if physical_cap is not None:
@@ -765,8 +817,8 @@ def initialize_storage_state(
             discharge_power_mw = min(discharge_power_mw, physical_cap)
         
         # Scale capacity by input PPU count (minimum 1 for base capacity)
-        # Special handling: Lake doesn't scale capacity
-        if storage_name == 'Lake':
+        # Special handling: Lake and ghost PPU storages don't scale capacity
+        if storage_name == 'Lake' or storage_name in GHOST_PPU_STORAGES:
             capacity_scale = 1
         else:
             capacity_scale = max(1, input_ppu_count)
@@ -805,7 +857,15 @@ def run_dispatch_timestep(
     phi_smoothed: float,
 ) -> Tuple[DispatchState, float]:
     """
-    Run dispatch for a single timestep.
+    Run dispatch for a single timestep (simplified disposition-based).
+    
+    Uses disposition index d_s = (tanh((SoC - 0.6) / Δ_s) + 1) / 2
+    with weight-based energy distribution across storages.
+    
+    Special cases:
+    - Empty storages are excluded from discharge
+    - Full storages are excluded from charge
+    - Spot market is last resort (only when all storages are empty/full)
     
     Args:
         t: Timestep index
@@ -815,40 +875,53 @@ def run_dispatch_timestep(
         state: Current dispatch state
         ppu_dictionary: PPU dictionary DataFrame
         config: Configuration
-        phi_smoothed: Smoothed shortfall (EMA)
+        phi_smoothed: Smoothed shortfall (unused, kept for API compatibility)
         
     Returns:
-        Tuple of (updated_state, new_phi_smoothed)
+        Tuple of (updated_state, phi_smoothed)
     """
     timestep_h = 0.25  # 15 minutes
     epsilon = 1e-6  # Tolerance
+    EMPTY_THRESHOLD = 0.0001  # Consider empty if SoC <= 0.01%
+    FULL_THRESHOLD = 0.9999   # Consider full if SoC >= 99.99%
     
     # Net system balance
     overflow_mw = demand_mw - renewable_production_mw
     state.overflow_series.append(overflow_mw)
     
-    # Update EMA
-    phi_smoothed = exponential_moving_average(overflow_mw, phi_smoothed, beta=0.2)
-    
-    # Calculate utility indices
-    u_dis, u_chg = calculate_utility_indices(overflow_mw, phi_smoothed)
-    
     if overflow_mw > epsilon:
-        # DEFICIT: Need more energy
+        # DEFICIT: Need more energy - discharge storages
         remaining_deficit = overflow_mw * timestep_h  # MWh
         state.total_deficit_mwh += remaining_deficit
         
-        # Try to discharge from storages (priority order)
-        for storage_name in config.dispatch.DISCHARGE_PRIORITY:
-            if storage_name not in state.storages:
-                continue
+        # Filter out EMPTY storages
+        available_storages = {
+            name: s for name, s in state.storages.items()
+            if s.soc > EMPTY_THRESHOLD and s.current_mwh > 0
+        }
+        
+        if not available_storages:
+            # All storages empty → buy from spot
+            state.spot_bought.append((t, remaining_deficit / timestep_h))
+            state.total_spot_buy_mwh += remaining_deficit
+            state.total_spot_buy_cost += remaining_deficit * spot_price
+        else:
+            # Calculate weights for non-empty storages (prioritize high SoC)
+            weights = calculate_storage_weights(available_storages, for_discharge=True)
             
-            storage = state.storages[storage_name]
-            d_stor = calculate_disposition_index(storage.soc)
-            
-            # Only discharge if storage is willing (d_stor > -0.5)
-            if d_stor > -0.5 and remaining_deficit > 0:
-                discharged = storage.discharge(remaining_deficit)
+            for storage_name, weight in weights.items():
+                if remaining_deficit <= 0:
+                    break
+                if weight <= 0:
+                    continue
+                
+                storage = state.storages[storage_name]
+                
+                # Energy this storage should handle
+                storage_energy = remaining_deficit * weight
+                
+                # Discharge (limited by storage)
+                discharged = storage.discharge(storage_energy)
                 remaining_deficit -= discharged
                 
                 # Track production
@@ -856,36 +929,53 @@ def run_dispatch_timestep(
                 if ppu_name not in state.production_by_ppu:
                     state.production_by_ppu[ppu_name] = []
                 state.production_by_ppu[ppu_name].append((t, discharged / timestep_h))
-        
-        # Buy remaining from spot market
-        if remaining_deficit > 0:
-            state.spot_bought.append((t, remaining_deficit / timestep_h))
-            state.total_spot_buy_mwh += remaining_deficit
-            state.total_spot_buy_cost += remaining_deficit * spot_price
+            
+            # Buy remaining from spot market (last resort - power limits hit)
+            if remaining_deficit > 0:
+                state.spot_bought.append((t, remaining_deficit / timestep_h))
+                state.total_spot_buy_mwh += remaining_deficit
+                state.total_spot_buy_cost += remaining_deficit * spot_price
     
     elif overflow_mw < -epsilon:
-        # SURPLUS: Excess energy
+        # SURPLUS: Excess energy - charge storages
         remaining_surplus = abs(overflow_mw) * timestep_h  # MWh
         state.total_surplus_mwh += remaining_surplus
         
-        # Try to charge storages (priority order)
-        for storage_name in config.dispatch.CHARGE_PRIORITY:
-            if storage_name not in state.storages:
-                continue
-            
-            storage = state.storages[storage_name]
-            d_stor = calculate_disposition_index(storage.soc)
-            
-            # Only charge if storage is willing (d_stor < 0.5)
-            if d_stor < 0.5 and remaining_surplus > 0:
-                charged = storage.charge(remaining_surplus)
-                remaining_surplus -= charged
+        # Filter out FULL storages
+        available_storages = {
+            name: s for name, s in state.storages.items()
+            if s.soc < FULL_THRESHOLD and (s.capacity_mwh - s.current_mwh) > 0
+        }
         
-        # Sell remaining to spot market
-        if remaining_surplus > 0:
+        if not available_storages:
+            # All storages full → sell to spot
             state.spot_sold.append((t, remaining_surplus / timestep_h))
             state.total_spot_sell_mwh += remaining_surplus
             state.total_spot_sell_revenue += remaining_surplus * spot_price
+        else:
+            # Calculate weights for non-full storages (prioritize low SoC)
+            weights = calculate_storage_weights(available_storages, for_discharge=False)
+            
+            for storage_name, weight in weights.items():
+                if remaining_surplus <= 0:
+                    break
+                if weight <= 0:
+                    continue
+                
+                storage = state.storages[storage_name]
+                
+                # Energy this storage should handle
+                storage_energy = remaining_surplus * weight
+                
+                # Charge (limited by storage)
+                charged = storage.charge(storage_energy)
+                remaining_surplus -= charged
+            
+            # Sell remaining to spot market (power limits hit)
+            if remaining_surplus > 0:
+                state.spot_sold.append((t, remaining_surplus / timestep_h))
+                state.total_spot_sell_mwh += remaining_surplus
+                state.total_spot_sell_revenue += remaining_surplus * spot_price
     
     return state, phi_smoothed
 
@@ -979,8 +1069,9 @@ def run_dispatch_simulation(
     # Store initial SoC for cyclic constraint checking
     initial_storage_soc = {name: s.soc for name, s in storages.items()}
     
-    # Initialize dispatchable generators
-    dispatchers = initialize_dispatchable_generators(portfolio_counts, config)
+    # Pure storage-based system - no direct fuel generators
+    # All power comes from: renewable incidence → storage → extraction → grid
+    # Shortfalls are covered by spot market purchases
     
     state = DispatchState(storages=storages)
     phi_smoothed = 0.0
@@ -1033,12 +1124,9 @@ def run_dispatch_simulation(
             ppu_dictionary, config, ror_production=cached_data.ror_production
         )
     
-    # Calculate total dispatchable capacity
-    total_dispatchable_mw = sum(d.available_power() for d in dispatchers.values())
-    
     if verbose:
         print(f"Running dispatch simulation for {n_timesteps} timesteps...")
-        print(f"  Dispatchable capacity: {total_dispatchable_mw:,.0f} MW")
+        print(f"  Storage-based system: All power from renewables + storage")
     
     # Load water inflow data for Lake (if available)
     from data_loader import load_all_data
@@ -1058,13 +1146,14 @@ def run_dispatch_simulation(
             )
         spot_price = spot_data[t]
         
+        # Configuration parameters
+        target_soc = config.storage.TARGET_SOC_FRACTION  # 0.60
+        soc_deadband = 0.05  # ±5% deadband around target
+        
         # ===== WATER INFLOW TO LAKE =====
-        # Add precipitation-based water inflow to Lake storage
-        # Source: Swiss_Water_Hourly_2024.csv (0.9 kWh/m³ conversion)
         if 'Lake' in state.storages:
             lake = state.storages['Lake']
             water_inflow_mwh = water_inflow_data[t] if t < len(water_inflow_data) else 0.0
-            # Add inflow to Lake (capped at capacity)
             if water_inflow_mwh > 0:
                 space_available = lake.capacity_mwh - lake.current_mwh
                 actual_inflow = min(water_inflow_mwh, space_available)
@@ -1076,7 +1165,6 @@ def run_dispatch_simulation(
         )
         renewable_production_series[i] = renewable_mw
         
-        # Track renewable production hourly
         for name, prod in renewable_breakdown.items():
             if name in ppu_production_hourly:
                 ppu_production_hourly[name][i] = prod
@@ -1088,181 +1176,237 @@ def run_dispatch_simulation(
         storage_charged_mw = 0.0
         dispatchable_mw = 0.0
         
+        # =========================================================================
+        # STEP 2: SIMPLIFIED DISPOSITION-BASED DISPATCH
+        # =========================================================================
+        # Uses disposition index d_s = (tanh((SoC - 0.6) / Δ_s) + 1) / 2
+        # 
+        # Weight calculation:
+        # - Discharge: weight_s = d_s / sum(d_s)  [prioritize high SoC]
+        # - Charge:    weight_s = (1-d_s) / sum(1-d_s)  [prioritize low SoC]
+        #
+        # PPU distribution within storage:
+        # - PPU_energy = storage_energy × (PPU_count / total_PPUs_for_storage)
+        #
+        # Palm oil special case: sell electricity → buy palm oil
+        # Last resort: spot market
+        # =========================================================================
+        
+        mw_per_unit = config.ppu.MW_PER_UNIT  # 10 MW per PPU unit
+        
+        # Build storage → PPU mappings
+        STORAGE_INPUT_PPUS = {}   # storage_name → list of {ppu_name, count, max_power}
+        STORAGE_EXTRACT_PPUS = {} # storage_name → list of {ppu_name, count, max_power}
+        
+        for storage_name, storage_def in config.storage.STORAGE_DEFINITIONS.items():
+            if storage_name not in state.storages:
+                continue
+            
+            # INPUT PPUs for this storage
+            input_list = []
+            for ppu_name in storage_def.get('input_by', []):
+                ppu_count = portfolio_counts.get(ppu_name, 0)
+                if ppu_count > 0:
+                    input_list.append({
+                        'ppu_name': ppu_name,
+                        'count': ppu_count,
+                        'max_power_mw': ppu_count * mw_per_unit,
+                        'efficiency': storage_def['efficiency_charge'],
+                    })
+            STORAGE_INPUT_PPUS[storage_name] = input_list
+            
+            # EXTRACT PPUs for this storage
+            extract_list = []
+            for ppu_name in storage_def.get('extracted_by', []):
+                ppu_count = portfolio_counts.get(ppu_name, 0)
+                if ppu_count > 0:
+                    extract_list.append({
+                        'ppu_name': ppu_name,
+                        'count': ppu_count,
+                        'max_power_mw': ppu_count * mw_per_unit,
+                        'efficiency': storage_def['efficiency_discharge'],
+                    })
+            STORAGE_EXTRACT_PPUS[storage_name] = extract_list
+        
+        # =========================================================================
+        # HANDLE DEFICIT (demand > renewable): Discharge storages
+        # =========================================================================
         if balance_mw < 0:
-            # ===== STEP 2: DEFICIT - Use cost-based dispatch with disposition index =====
             remaining_deficit_mwh = abs(balance_mw) * timestep_h
             
-            # Build unified supply options: generators + willing storages
-            supply_options = []
+            # SPECIAL CASE: Filter out EMPTY storages before calculating weights
+            # Only storages with available energy participate in discharging
+            EMPTY_THRESHOLD = 0.0001  # Consider empty if SoC <= 0.01%
             
-            # Add dispatchable generators
-            for dispatcher in dispatchers.values():
-                if dispatcher.available_power() > 0:
-                    supply_options.append({
-                        'type': 'generator',
-                        'name': dispatcher.ppu_name,
-                        'cost': dispatcher.cost_per_mwh,
-                        'object': dispatcher,
-                    })
+            available_storages = {}
+            for name, storage in state.storages.items():
+                if storage.soc > EMPTY_THRESHOLD and storage.current_mwh > 0:
+                    available_storages[name] = storage
             
-            # Add storages (only if willing to discharge based on disposition index)
-            for storage_name, storage in state.storages.items():
-                d_stor = calculate_disposition_index(storage.soc, soc_target=0.60)
-                base_cost = STORAGE_DISCHARGE_COSTS.get(storage_name, 50)
+            # If ALL storages are empty → buy everything from spot market
+            if not available_storages:
+                buy_mwh = remaining_deficit_mwh
+                state.spot_bought.append((i, buy_mwh / timestep_h))
+                state.total_spot_buy_mwh += buy_mwh
+                state.total_spot_buy_cost += buy_mwh * spot_price
+                state.total_deficit_mwh += buy_mwh
+                deficit_series[i] = buy_mwh / timestep_h
+            else:
+                # Calculate weights only for non-empty storages (prioritize high SoC)
+                weights = calculate_storage_weights(available_storages, for_discharge=True)
                 
-                # Disposition penalty: if SoC < target, increase effective cost
-                # d_stor ranges from -1 (empty) to +1 (full)
-                # When d_stor < 0 (below target), add penalty to discourage discharge
-                # EXCEPTION: Lake gets reduced penalty because it's replenished by precipitation
-                if storage_name == 'Lake':
-                    # Lake should be more flexible - smaller penalty when below target
-                    if d_stor < 0:
-                        disposition_penalty = abs(d_stor) * 50  # Reduced penalty (was 200)
-                    else:
-                        disposition_penalty = 0
-                else:
-                    if d_stor < 0:
-                        disposition_penalty = abs(d_stor) * 200  # Big penalty when low
-                    else:
-                        disposition_penalty = 0  # No penalty when above target
-                
-                effective_cost = base_cost + disposition_penalty
-                
-                # Only add if storage has energy and is willing
-                # FIXED: Relaxed threshold from -0.8 to -0.95 to allow discharge when slightly below target
-                # Lake especially should discharge when needed, even if below target
-                threshold = -0.95 if storage_name == 'Lake' else -0.8
-                if storage.current_mwh > 0 and d_stor > threshold:
-                    supply_options.append({
-                        'type': 'storage',
-                        'name': storage_name,
-                        'cost': effective_cost,
-                        'object': storage,
-                        'd_stor': d_stor,
-                    })
-            
-            # Sort by cost (cheapest first)
-            supply_options.sort(key=lambda x: x['cost'])
-            
-            # Dispatch in cost order
-            for option in supply_options:
-                if remaining_deficit_mwh <= 0:
-                    break
-                    
-                if option['type'] == 'generator':
-                    dispatcher = option['object']
-                    available = dispatcher.available_power() * timestep_h
-                    dispatch = min(available, remaining_deficit_mwh)
-                    dispatcher.energy_produced_mwh += dispatch
-                    dispatch_mw = dispatch / timestep_h
-                    dispatchable_mw += dispatch_mw
-                    remaining_deficit_mwh -= dispatch
-                    
-                    # Track hourly
-                    if dispatcher.ppu_name in ppu_production_hourly:
-                        ppu_production_hourly[dispatcher.ppu_name][i] += dispatch_mw
-                    
-                elif option['type'] == 'storage':
-                    storage = option['object']
-                    discharged = storage.discharge(remaining_deficit_mwh)
-                    remaining_deficit_mwh -= discharged
-                    dis_mw = discharged / timestep_h
-                    storage_discharged_mw += dis_mw
-                    
-                    # Track hourly under the EXTRACTING PPU name (not storage name)
-                    # This ensures RoT calculation uses correct PPU production volumes
-                    storage_name = option['name']
-                    extracting_ppu = STORAGE_TO_EXTRACTING_PPU.get(storage_name, storage_name)
-                    if extracting_ppu not in ppu_production_hourly:
-                        ppu_production_hourly[extracting_ppu] = np.zeros(n_timesteps)
-                    ppu_production_hourly[extracting_ppu][i] += dis_mw
-            
-            # Track any remaining deficit
-            if remaining_deficit_mwh > 0:
-                remaining_mw = remaining_deficit_mwh / timestep_h
-                state.total_deficit_mwh += remaining_deficit_mwh
-                deficit_series[i] = remaining_mw
-                # Buy from spot market
-                state.spot_bought.append((i, remaining_mw))
-                state.total_spot_buy_mwh += remaining_deficit_mwh
-                state.total_spot_buy_cost += remaining_deficit_mwh * spot_price
-        
-        else:
-            # ===== STEP 4: SURPLUS - Utility-Based Proportional Storage Charging =====
-            # All storages self-regulate around their target SoC (60%)
-            # Distribution is proportional to: charge_willingness × efficiency
-            
-            surplus_mwh = balance_mw * timestep_h
-            state.total_surplus_mwh += surplus_mwh
-            
-            # Calculate charge willingness for each storage
-            # disposition_index: -1 (empty, wants charge) to +1 (full, wants discharge)
-            # charge_willingness = how much storage wants to charge (0 to 1)
-            target_soc = config.storage.TARGET_SOC_FRACTION
-            
-            charge_weights = {}
-            total_charge_weight = 0.0
-            
-            for storage_name, storage in state.storages.items():
-                d_stor = calculate_disposition_index(storage.soc, soc_target=target_soc)
-                # Charge willingness: stronger when below target (d_stor < 0)
-                # Also consider available capacity
-                available_capacity = storage.capacity_mwh * (1.0 - storage.soc)
-                if available_capacity > 0 and d_stor < 0.5:  # Only charge if below ~target+deadband
-                    # Weight = willingness × efficiency × available capacity factor
-                    willingness = max(0.0, 0.5 - d_stor)  # 0 to 1
-                    weight = willingness * storage.efficiency_charge
-                    charge_weights[storage_name] = weight
-                    total_charge_weight += weight
-            
-            # Distribute surplus proportionally
-            remaining_surplus_mwh = surplus_mwh
-            
-            if total_charge_weight > 0:
-                for storage_name, weight in charge_weights.items():
-                    if remaining_surplus_mwh <= 0:
+                # Distribute energy across available storages by weight
+                for storage_name, weight in weights.items():
+                    if remaining_deficit_mwh <= 0:
                         break
+                    if weight <= 0:
+                        continue
                     
                     storage = state.storages[storage_name]
-                    proportion = weight / total_charge_weight
-                    allocated_mwh = surplus_mwh * proportion
+                    extract_ppus = STORAGE_EXTRACT_PPUS.get(storage_name, [])
                     
-                    # Ghost PPU mechanism for Palm oil (only imported bio-fuel)
-                    # They sell surplus electricity on spot → import fuel
-                    # NOTE: Biooil removed - Palm oil is the only imported bio-fuel
-                    if storage_name == 'Palm oil':
-                        # Palm oil price is DYNAMIC (from rea_holdings_share_prices.csv)
-                        # Get daily price - t is the timestep index, convert to day of year
-                        day_of_year = t // 24  # Convert hour to day
-                        import_price = cached_data.get_palm_oil_price(day_of_year)
+                    # Skip if no extracting PPUs
+                    if not extract_ppus:
+                        continue
+                    
+                    # Energy this storage should handle = total × weight
+                    storage_energy_mwh = remaining_deficit_mwh * weight
+                    
+                    # Check constraints: storage available and power capacity
+                    total_extract_power = sum(p['max_power_mw'] for p in extract_ppus)
+                    max_from_power = total_extract_power * timestep_h
+                    max_from_storage = storage.current_mwh * storage.efficiency_discharge
+                    
+                    # Actual energy this storage can provide
+                    actual_discharge_mwh = min(storage_energy_mwh, max_from_power, max_from_storage)
+                    
+                    if actual_discharge_mwh <= 0:
+                        continue
+                    
+                    # Discharge from storage
+                    fuel_withdrawn = actual_discharge_mwh / storage.efficiency_discharge
+                    storage.current_mwh = max(0, storage.current_mwh - fuel_withdrawn)
+                    
+                    remaining_deficit_mwh -= actual_discharge_mwh
+                    dis_mw = actual_discharge_mwh / timestep_h
+                    storage_discharged_mw += dis_mw
+                    
+                    # Distribute among EXTRACT PPUs proportionally
+                    total_ppu_count = sum(p['count'] for p in extract_ppus)
+                    for ppu_info in extract_ppus:
+                        ppu_share = ppu_info['count'] / total_ppu_count if total_ppu_count > 0 else 0
+                        ppu_energy_mw = dis_mw * ppu_share
                         
-                        # Sell allocated surplus on spot market
-                        spot_revenue = allocated_mwh * spot_price
-                        
-                        # Buy fuel with revenue (convert electricity value to fuel)
-                        fuel_mwh = spot_revenue / import_price
-                        
-                        # Charge storage with imported fuel
-                        actually_charged = storage.charge(fuel_mwh)
-                        
-                        if actually_charged > 0:
-                            # Track spot sale (electricity sold by ghost PPU)
-                            actual_elec_sold = actually_charged * import_price / spot_price if spot_price > 0 else 0
-                            state.total_spot_sell_mwh += actual_elec_sold
-                            state.total_spot_sell_revenue += actual_elec_sold * spot_price
-                            remaining_surplus_mwh -= actual_elec_sold
-                    else:
-                        # Regular storage: charge directly with electricity
-                        charged = storage.charge(allocated_mwh)
-                remaining_surplus_mwh -= charged
-                storage_charged_mw += charged / timestep_h
+                        if ppu_info['ppu_name'] not in ppu_production_hourly:
+                            ppu_production_hourly[ppu_info['ppu_name']] = np.zeros(n_timesteps)
+                        ppu_production_hourly[ppu_info['ppu_name']][i] += ppu_energy_mw
             
-            # Any remaining surplus is sold on spot market
-            if remaining_surplus_mwh > 0:
+                # SPOT MARKET: Last resort if still deficit (power limits hit)
+            if remaining_deficit_mwh > 0:
+                buy_mwh = remaining_deficit_mwh
+                state.spot_bought.append((i, buy_mwh / timestep_h))
+                state.total_spot_buy_mwh += buy_mwh
+                state.total_spot_buy_cost += buy_mwh * spot_price
+                state.total_deficit_mwh += buy_mwh
+                deficit_series[i] = buy_mwh / timestep_h
+        
+        # =========================================================================
+        # HANDLE SURPLUS (renewable > demand): Charge storages
+        # =========================================================================
+        else:
+            surplus_mwh = balance_mw * timestep_h
+            state.total_surplus_mwh += surplus_mwh
+            remaining_surplus_mwh = surplus_mwh
+            
+            # SPECIAL CASE: Filter out FULL storages before calculating weights
+            # Only storages with available capacity participate in charging
+            FULL_THRESHOLD = 0.9999  # Consider full if SoC >= 99.99%
+            
+            available_storages = {}
+            for name, storage in state.storages.items():
+                available_capacity = storage.capacity_mwh - storage.current_mwh
+                if storage.soc < FULL_THRESHOLD and available_capacity > 0:
+                    available_storages[name] = storage
+            
+            # If ALL storages are full → sell everything to spot market
+            if not available_storages:
                 surplus_series[i] = remaining_surplus_mwh / timestep_h
                 state.spot_sold.append((i, remaining_surplus_mwh / timestep_h))
                 state.total_spot_sell_mwh += remaining_surplus_mwh
                 state.total_spot_sell_revenue += remaining_surplus_mwh * spot_price
+            else:
+                # Calculate weights only for non-full storages (prioritize low SoC)
+                weights = calculate_storage_weights(available_storages, for_discharge=False)
+                
+                # Distribute energy across available storages by weight
+                for storage_name, weight in weights.items():
+                    if remaining_surplus_mwh <= 0:
+                        break
+                    if weight <= 0:
+                        continue
+                    
+                    storage = state.storages[storage_name]
+                    input_ppus = STORAGE_INPUT_PPUS.get(storage_name, [])
+                    
+                    # Skip if no input PPUs (except Palm oil which uses ghost mechanism)
+                    if not input_ppus and storage_name != 'Palm oil':
+                        continue
+                    
+                    # Energy this storage should handle = total × weight
+                    storage_energy_mwh = remaining_surplus_mwh * weight
+                    
+                    # PALM OIL SPECIAL CASE: Sell electricity → buy palm oil
+                    if storage_name == 'Palm oil':
+                        available_capacity = storage.capacity_mwh - storage.current_mwh
+                        if available_capacity <= 0:
+                            continue
+                        
+                        # Sell electricity on spot market
+                        elec_to_sell = min(storage_energy_mwh, available_capacity)
+                        spot_revenue = elec_to_sell * spot_price
+                        
+                        # Buy palm oil with revenue
+                        day_of_year = t // 24
+                        import_price = cached_data.get_palm_oil_price(day_of_year)
+                        
+                        if import_price > 0:
+                            fuel_mwh = spot_revenue / import_price
+                            fuel_stored = min(fuel_mwh, available_capacity)
+                            storage.current_mwh += fuel_stored
+                            
+                            if fuel_stored > 0:
+                                actual_elec_sold = fuel_stored * import_price / spot_price
+                                remaining_surplus_mwh -= actual_elec_sold
+                                storage_charged_mw += actual_elec_sold / timestep_h
+                                state.total_spot_sell_mwh += actual_elec_sold
+                                state.total_spot_sell_revenue += actual_elec_sold * spot_price
+                        continue
+                    
+                    # Regular storage charging via INPUT PPUs
+                    total_input_power = sum(p['max_power_mw'] for p in input_ppus)
+                    max_from_power = total_input_power * timestep_h
+                    available_capacity = storage.capacity_mwh - storage.current_mwh
+                    
+                    # Actual energy we can charge
+                    actual_charge_mwh = min(storage_energy_mwh, max_from_power, available_capacity)
+                    
+                    if actual_charge_mwh <= 0:
+                        continue
+                    
+                    # Charge storage (apply efficiency)
+                    fuel_stored = actual_charge_mwh * storage.efficiency_charge
+                    storage.current_mwh = min(storage.capacity_mwh, storage.current_mwh + fuel_stored)
+                    
+                    remaining_surplus_mwh -= actual_charge_mwh
+                    storage_charged_mw += actual_charge_mwh / timestep_h
+                
+                # Sell remaining surplus to spot market ONLY if couldn't fit in any storage
+                # (due to power limits, not capacity - capacity was filtered above)
+                if remaining_surplus_mwh > 0:
+                    surplus_series[i] = remaining_surplus_mwh / timestep_h
+                    state.spot_sold.append((i, remaining_surplus_mwh / timestep_h))
+                    state.total_spot_sell_mwh += remaining_surplus_mwh
+                    state.total_spot_sell_revenue += remaining_surplus_mwh * spot_price
         
         # Track total production
         dispatchable_production_series[i] = dispatchable_mw
@@ -1327,12 +1471,7 @@ def run_dispatch_simulation(
         aviation_fuel_import_cost_series[i] = production_cost
         total_aviation_fuel_import_cost_chf += production_cost
     
-    # Compile dispatchable production summary
-    dispatchable_summary = {
-        name: d.energy_produced_mwh 
-        for name, d in dispatchers.items()
-    }
-    total_dispatchable_mwh = sum(dispatchable_summary.values())
+    # Calculate total renewable production
     total_renewable_mwh = np.sum(renewable_production_series) * timestep_h
     
     # Compile results
@@ -1360,8 +1499,6 @@ def run_dispatch_simulation(
         'ppu_production': ppu_production_hourly,
         # Summary stats
         'total_renewable_mwh': total_renewable_mwh,
-        'total_dispatchable_mwh': total_dispatchable_mwh,
-        'dispatchable_capacity_mw': total_dispatchable_mw,
         # =====================================================================
         # AVIATION FUEL RESULTS
         # =====================================================================
@@ -1518,9 +1655,57 @@ def compute_portfolio_metrics(
 if __name__ == "__main__":
     # Basic test
     print("Dispatch engine loaded successfully")
+    print("\n" + "="*60)
+    print("SIMPLIFIED DISPOSITION INDEX TEST")
+    print("="*60)
+    print(f"SoC_target = {SOC_TARGET}, Δ_s = {DELTA_S_SMOOTHING}")
+    print("\nDisposition index d_s in [0, 1]:")
+    print("  - d_s = 1.0 → full storage, wants to discharge")
+    print("  - d_s = 0.5 → at target, neutral")
+    print("  - d_s = 0.0 → empty storage, wants to charge")
+    print()
     
-    # Test disposition index
-    for soc in [0.2, 0.5, 0.6, 0.8, 0.95]:
+    # Test disposition index across SoC range
+    print(f"{'SoC':>6} | {'d_s':>6} | Interpretation")
+    print("-" * 40)
+    for soc in [0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
         d = calculate_disposition_index(soc)
-        print(f"SoC={soc:.2f} -> d_stor={d:.3f}")
+        if d > 0.6:
+            interp = "wants to discharge"
+        elif d < 0.4:
+            interp = "wants to charge"
+        else:
+            interp = "neutral"
+        print(f"{soc:>6.2f} | {d:>6.3f} | {interp}")
+    
+    # Test weight calculation
+    print("\n" + "="*60)
+    print("WEIGHT CALCULATION TEST")
+    print("="*60)
+    
+    # Create mock storages with different SoC
+    class MockStorage:
+        def __init__(self, name, soc):
+            self.name = name
+            self.soc = soc
+    
+    mock_storages = {
+        'Battery': MockStorage('Battery', 0.3),  # Low - wants to charge
+        'H2': MockStorage('H2', 0.7),            # High - wants to discharge
+        'Lake': MockStorage('Lake', 0.6),         # At target - neutral
+    }
+    
+    print("\nMock storages: Battery(SoC=0.3), H2(SoC=0.7), Lake(SoC=0.6)")
+    
+    # Test discharge weights
+    dis_weights = calculate_storage_weights(mock_storages, for_discharge=True)
+    print("\nDischarge weights (prioritize high SoC):")
+    for name, w in sorted(dis_weights.items(), key=lambda x: -x[1]):
+        print(f"  {name}: {w:.3f}")
+    
+    # Test charge weights
+    chg_weights = calculate_storage_weights(mock_storages, for_discharge=False)
+    print("\nCharge weights (prioritize low SoC):")
+    for name, w in sorted(chg_weights.items(), key=lambda x: -x[1]):
+        print(f"  {name}: {w:.3f}")
 
