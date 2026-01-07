@@ -3416,7 +3416,7 @@ def plot_energy_balance_distribution(
         ax4.set_ylabel('Energy (TWh)', fontsize=11, fontweight='bold')
         ax4.set_title('Monthly Energy Surplus/Deficit', fontsize=11, fontweight='bold')
         ax4.set_xticks(x)
-        ax4.set_xticklabels(month_names)
+        ax4.set_xticklabels(month_names, rotation=45, ha='right')
         ax4.legend(loc='upper right', fontsize=9)
         ax4.grid(True, alpha=0.3, axis='y')
     else:

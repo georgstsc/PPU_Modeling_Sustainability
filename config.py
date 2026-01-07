@@ -100,14 +100,27 @@ class EnergySystemConfig:
     # Aviation requires 23 TWh/year of biooil fuel (CO2-neutral synthetic fuel)
     # This is a HARD constraint: biooil must be discharged every hour
     # Reference: Züttel et al. (2024) - Swiss energy transition pathway
-    # Note: Aviation fuel scales with demand scenario (1.6× for 2050)
+    # Note: Aviation fuel can have different multipliers than electric demand
     
     AVIATION_FUEL_DEMAND_TWH_YEAR_BASE: float = 23.0
+    
+    # Multipliers for aviation fuel by scenario (can differ from demand multipliers)
+    # Note: User specified 30 TWh for 2050, which is 30/23 = 1.304x base (not 0.25x)
+    # The "25%" mentioned may refer to a different calculation, but 30 TWh absolute is implemented
+    AVIATION_MULTIPLIERS: Dict[str, float] = field(default_factory=lambda: {
+        "2024": 1.0,    # Base 2024 aviation fuel (23 TWh)
+        "2050": 30.0 / 23.0,  # 30 TWh for 2050 (30/23 = 1.304x)
+    })
+    
+    @property
+    def AVIATION_MULTIPLIER(self) -> float:
+        """Get the aviation multiplier for the current scenario."""
+        return self.AVIATION_MULTIPLIERS.get(self.DEMAND_SCENARIO, 1.0)
     
     @property
     def AVIATION_FUEL_DEMAND_TWH_YEAR(self) -> float:
         """Adjusted aviation fuel demand based on scenario."""
-        return self.AVIATION_FUEL_DEMAND_TWH_YEAR_BASE * self.DEMAND_MULTIPLIER
+        return self.AVIATION_FUEL_DEMAND_TWH_YEAR_BASE * self.AVIATION_MULTIPLIER
     
     # Hourly biooil discharge requirement (MWh/hour)
     # 23 TWh/year = 23,000,000 MWh/year ÷ 8760 hours ≈ 2625.57 MWh/hour
