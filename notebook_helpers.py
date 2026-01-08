@@ -209,6 +209,7 @@ def calculate_energy_flows(
         'total_demand_twh': total_demand_twh,
         'total_production_twh': total_production_twh,
         'energy_delivered_twh': energy_delivered_twh,
+        'renewable_direct_to_demand_twh': renewable_direct_to_demand_twh,
         'storage_charged_twh': storage_charged,
         'storage_discharged_twh': storage_discharged,
         'storage_to_flexible_twh': storage_to_flexible_twh,
@@ -225,6 +226,7 @@ def calculate_energy_flows(
         'storage_rt_efficiency': storage_rt_efficiency,
         'flexible_efficiency': flexible_efficiency,
         'overall_efficiency': overall_efficiency,
+        'spot_bought_twh': full_year_results.total_spot_bought_mwh / 1e6,
     }
 
 
@@ -283,16 +285,16 @@ def get_frontier_file_paths(scenario: str) -> Tuple[Path, Path]:
     """
     Get file paths for frontier results based on scenario.
     
+    Args:
+        scenario: "2024" or "2050"
+    
     Returns:
         (all_results_path, frontier_path)
     """
     base_path = Path('data/result_plots')
-    if scenario == "2050":
-        all_path = base_path / 'multi_objective_results_2050.csv'
-        frontier_path = base_path / 'multi_objective_results_2050_frontier_3d.csv'
-    else:  # 2024
-        all_path = base_path / 'multi_objective_results.csv'
-        frontier_path = base_path / 'multi_objective_results_frontier_3d.csv'
+    # Ensure scenario is in filename for both 2024 and 2050
+    all_path = base_path / f'multi_objective_results_{scenario}.csv'
+    frontier_path = base_path / f'multi_objective_results_{scenario}_frontier_3d.csv'
     
     return all_path, frontier_path
 
@@ -797,3 +799,604 @@ def plot_correlation_analysis(
     
     return fig
 
+
+# =============================================================================
+# COMPREHENSIVE PORTFOLIO ANALYSIS FUNCTIONS
+# =============================================================================
+
+def analyze_incidence_vs_demand(
+    full_year_results: FullYearResults,
+    portfolio_idx: int = 0
+) -> Dict[str, Any]:
+    """
+    Analyze renewable incidence vs demand (before storage).
+    
+    Returns dictionary with statistics and creates plots.
+    """
+    dem = np.array(full_year_results.demand)
+    ren = np.array(full_year_results.renewable_production)
+    balance = ren - dem
+    
+    # Statistics
+    total_demand_twh = np.sum(dem) / 1e6
+    total_renewable_twh = np.sum(ren) / 1e6
+    coverage = (total_renewable_twh / total_demand_twh) * 100
+    surplus_h = np.sum(balance > 0)
+    deficit_h = np.sum(balance < 0)
+    total_surplus_twh = np.sum(balance[balance > 0]) / 1e6
+    total_deficit_twh = np.sum(balance[balance < 0]) / 1e6
+    
+    # Create plots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+    hours = np.arange(len(dem))
+    days = hours / 24
+    
+    # Plot 1: Incidence vs Demand
+    ax1 = axes[0]
+    ax1.fill_between(days, dem/1e3, alpha=0.3, label='Demand', color='red')
+    ax1.fill_between(days, ren/1e3, alpha=0.5, label='Incidence (Renewable)', color='green')
+    ax1.set_ylabel('Power (GW)')
+    ax1.set_title(f'Portfolio #{portfolio_idx+1}: Incidence Production vs Demand (Before Storage)')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Balance (Surplus/Deficit)
+    ax2 = axes[1]
+    balance_gw = balance / 1e3
+    ax2.fill_between(days, balance_gw, where=balance_gw >= 0, alpha=0.7, 
+                      label='Surplus (storable)', color='green', interpolate=True)
+    ax2.fill_between(days, balance_gw, where=balance_gw < 0, alpha=0.7, 
+                      label='Deficit (need storage/dispatch)', color='red', interpolate=True)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.set_ylabel('Balance (GW)')
+    ax2.set_title('Hourly Balance: Incidence - Demand')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Cumulative Energy Balance
+    ax3 = axes[2]
+    cumulative_balance = np.cumsum(balance) / 1e6  # TWh cumulative
+    ax3.plot(days, cumulative_balance, 'b-', linewidth=1.5, label='Cumulative Balance')
+    ax3.fill_between(days, cumulative_balance, where=cumulative_balance >= 0, 
+                      alpha=0.3, color='green')
+    ax3.fill_between(days, cumulative_balance, where=cumulative_balance < 0, 
+                      alpha=0.3, color='red')
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax3.set_xlabel('Day of Year')
+    ax3.set_ylabel('Cumulative Balance (TWh)')
+    ax3.set_title('Cumulative Energy Balance (shows seasonal storage need)')
+    ax3.legend(loc='upper right')
+    ax3.grid(True, alpha=0.3)
+    
+    # Add month labels
+    month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    ax3.set_xticks(month_starts)
+    ax3.set_xticklabels(month_labels)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    seasonal_storage_need = -np.min(cumulative_balance) if len(cumulative_balance) > 0 else 0
+    
+    return {
+        'total_demand_twh': total_demand_twh,
+        'total_renewable_twh': total_renewable_twh,
+        'coverage': coverage,
+        'surplus_hours': surplus_h,
+        'deficit_hours': deficit_h,
+        'total_surplus_twh': total_surplus_twh,
+        'total_deficit_twh': total_deficit_twh,
+        'seasonal_storage_need_twh': seasonal_storage_need
+    }
+
+def plot_ppu_decomposition(
+    portfolio_dict: Dict[str, int],
+    full_year_results: FullYearResults,
+    portfolio_idx: int = 0
+) -> None:
+    """
+    Plot PPU decomposition by category (INCIDENCE, FLEX, STORAGE).
+    """
+    decomposition = analyze_portfolio_decomposition(portfolio_dict, full_year_results)
+    
+    inc_data = decomposition['incidence']
+    flex_data = decomposition['flex']
+    stor_data = decomposition['storage']
+    
+    grand_total_units = inc_data['total_units'] + flex_data['total_units'] + stor_data['total_units']
+    grand_total_twh = inc_data['total_twh'] + flex_data['total_twh'] + stor_data['total_twh']
+    
+    # Print numerical decomposition
+    print("\n📊 NUMERICAL DECOMPOSITION (Unit Counts):")
+    print(f"   {'Category':<12} | {'Units':>8} | {'% of Total':>10} | {'Energy (TWh)':>12} | {'% of Energy':>11}")
+    print(f"   {'-'*12}-+-{'-'*8}-+-{'-'*10}-+-{'-'*12}-+-{'-'*11}")
+    print(f"   {'INCIDENCE':<12} | {inc_data['total_units']:>8} | {inc_data['total_units']/grand_total_units*100 if grand_total_units else 0:>9.1f}% | {inc_data['total_twh']:>12.2f} | {inc_data['total_twh']/grand_total_twh*100 if grand_total_twh else 0:>10.1f}%")
+    print(f"   {'FLEX':<12} | {flex_data['total_units']:>8} | {flex_data['total_units']/grand_total_units*100 if grand_total_units else 0:>9.1f}% | {flex_data['total_twh']:>12.2f} | {flex_data['total_twh']/grand_total_twh*100 if grand_total_twh else 0:>10.1f}%")
+    print(f"   {'STORAGE':<12} | {stor_data['total_units']:>8} | {stor_data['total_units']/grand_total_units*100 if grand_total_units else 0:>9.1f}% | {stor_data['total_twh']:>12.2f} | {stor_data['total_twh']/grand_total_twh*100 if grand_total_twh else 0:>10.1f}%")
+    print(f"   {'-'*12}-+-{'-'*8}-+-{'-'*10}-+-{'-'*12}-+-{'-'*11}")
+    print(f"   {'TOTAL':<12} | {grand_total_units:>8} | {'100.0':>9}% | {grand_total_twh:>12.2f} | {'100.0':>10}%")
+    print("\n   ℹ️  Note: STORAGE energy shows electricity consumed for charging (not produced)")
+    
+    # Detailed breakdown
+    def print_category_detail(cat_name, counts, energy, total_units, total_twh, is_storage=False):
+        energy_label = "absorbed" if is_storage else "produced"
+        print(f"\n   🔹 {cat_name} PPUs ({energy_label}):")
+        if not counts:
+            print(f"      (none in portfolio)")
+            return
+        for ppu in sorted(counts.keys(), key=lambda x: -counts[x]):
+            unit_pct = counts[ppu] / total_units * 100 if total_units else 0
+            energy_twh = energy.get(ppu, 0)
+            energy_pct = energy_twh / total_twh * 100 if total_twh else 0
+            print(f"      {ppu:<15}: {counts[ppu]:>5} units ({unit_pct:>5.1f}%) | {energy_twh:>6.2f} TWh ({energy_pct:>5.1f}%)")
+    
+    print_category_detail("INCIDENCE", inc_data['counts'], inc_data['energy'], 
+                         inc_data['total_units'], inc_data['total_twh'], is_storage=False)
+    print_category_detail("FLEX (Dispatchable)", flex_data['counts'], flex_data['energy'], 
+                         flex_data['total_units'], flex_data['total_twh'], is_storage=False)
+    print_category_detail("STORAGE (Input)", stor_data['counts'], stor_data['energy'], 
+                         stor_data['total_units'], stor_data['total_twh'], is_storage=True)
+    
+    # Visualization
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    
+    # Pie chart: Units by Category
+    ax1 = axes[0]
+    cat_units = [inc_data['total_units'], flex_data['total_units'], stor_data['total_units']]
+    cat_labels = ['INCIDENCE', 'FLEX', 'STORAGE']
+    cat_colors = ['#2ecc71', '#e67e22', '#3498db']
+    if sum(cat_units) > 0:
+        wedges, texts, autotexts = ax1.pie(cat_units, labels=cat_labels, autopct='%1.1f%%',
+                                           colors=cat_colors, explode=[0.02]*3)
+        ax1.set_title('Unit Distribution by Category')
+    
+    # Pie chart: Energy by Category
+    ax2 = axes[1]
+    cat_twh = [inc_data['total_twh'], flex_data['total_twh'], stor_data['total_twh']]
+    if sum(cat_twh) > 0:
+        wedges, texts, autotexts = ax2.pie(cat_twh, labels=cat_labels, autopct='%1.1f%%',
+                                           colors=cat_colors, explode=[0.02]*3)
+        ax2.set_title('Energy Production by Category (TWh)')
+    
+    # Bar chart: Top 10 PPUs by Energy
+    ax3 = axes[2]
+    all_energy = {**inc_data['energy'], **flex_data['energy'], **stor_data['energy']}
+    sorted_energy = sorted(all_energy.items(), key=lambda x: -x[1])[:10]
+    if sorted_energy:
+        INCIDENCE_PPUS = ['PV', 'WD_ON', 'WD_OFF', 'HYD_R', 'BIO_WOOD']
+        FLEX_PPUS = ['HYD_S', 'THERM', 'H2P_G', 'H2P_L', 'SOL_SALT', 'SOL_STEAM', 
+                     'PALM_ICE', 'IMP_BIOG', 'THERM_CH4', 'NH3_P']
+        ppus = [x[0] for x in sorted_energy]
+        twhs = [x[1] for x in sorted_energy]
+        colors_bar = []
+        for p in ppus:
+            if p in INCIDENCE_PPUS: colors_bar.append('#2ecc71')
+            elif p in FLEX_PPUS: colors_bar.append('#e67e22')
+            else: colors_bar.append('#3498db')
+        ax3.barh(range(len(ppus)), twhs, color=colors_bar)
+        ax3.set_yticks(range(len(ppus)))
+        ax3.set_yticklabels(ppus)
+        ax3.invert_yaxis()
+        ax3.set_xlabel('Energy (TWh)')
+        ax3.set_title('Top 10 PPUs by Energy Production')
+        ax3.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def analyze_hourly_energy_mix(
+    full_year_results: FullYearResults,
+    portfolio_dict: Dict[str, int],
+    portfolio_idx: int = 0
+) -> Dict[str, Any]:
+    """
+    Analyze hourly energy mix (daily average profile).
+    """
+    ppu_production = full_year_results.ppu_production
+    n_hours = len(full_year_results.demand)
+    n_days = n_hours // 24
+    demand_array = np.array(full_year_results.demand)
+    
+    # Get all PPUs with production
+    active_ppus = [p for p in ppu_production.keys() 
+                  if isinstance(ppu_production[p], np.ndarray) and len(ppu_production[p]) == n_hours]
+    
+    # Calculate average production by hour of day for each PPU
+    hourly_avg_by_ppu = {}
+    for ppu in active_ppus:
+        prod = np.array(ppu_production[ppu])[:n_days*24]
+        prod_reshaped = prod.reshape(n_days, 24)
+        hourly_avg_by_ppu[ppu] = np.mean(prod_reshaped, axis=0)
+    
+    # Sort PPUs by total daily production
+    ppu_daily_totals = {p: np.sum(hourly_avg_by_ppu[p]) for p in hourly_avg_by_ppu}
+    sorted_ppus = sorted(ppu_daily_totals.keys(), key=lambda x: -ppu_daily_totals[x])
+    
+    # Print hourly mix table
+    print("\n📊 AVERAGE HOURLY ENERGY MIX (MW by PPU):")
+    key_hours = [0, 6, 8, 12, 14, 18, 20, 22]
+    
+    header = f"   {'PPU':<15}"
+    for h in key_hours:
+        header += f" | {h:02d}:00"
+    print(header)
+    print(f"   {'-'*15}" + "-+-" + "-+-".join(["-"*6]*len(key_hours)))
+    
+    for ppu in sorted_ppus[:12]:
+        row = f"   {ppu:<15}"
+        for h in key_hours:
+            val = hourly_avg_by_ppu[ppu][h]
+            if val >= 1000:
+                row += f" | {val/1e3:5.1f}k"
+            else:
+                row += f" | {val:6.0f}"
+        print(row)
+    
+    # Stacked area chart
+    fig, ax = plt.subplots(figsize=(14, 8))
+    hours_x = np.arange(24)
+    top_ppus = sorted_ppus[:8]
+    other_ppus = sorted_ppus[8:]
+    
+    bottom = np.zeros(24)
+    colors_hourly = plt.cm.tab20(np.linspace(0, 1, len(top_ppus) + 1))
+    
+    for i, ppu in enumerate(top_ppus):
+        values = hourly_avg_by_ppu[ppu] / 1e3  # GW
+        ax.fill_between(hours_x, bottom, bottom + values, 
+                       label=ppu, alpha=0.8, color=colors_hourly[i])
+        ax.plot(hours_x, bottom + values, color='white', linewidth=0.5)
+        bottom += values
+    
+    if other_ppus:
+        other_sum = np.sum([hourly_avg_by_ppu[p] for p in other_ppus], axis=0) / 1e3
+        ax.fill_between(hours_x, bottom, bottom + other_sum, 
+                       label='Other', alpha=0.6, color='gray')
+        bottom += other_sum
+    
+    demand_hourly_avg = np.array([np.mean(demand_array[h::24]) for h in range(24)]) / 1e3
+    ax.plot(hours_x, demand_hourly_avg, 'r--', linewidth=2.5, label='Avg Demand')
+    
+    ax.set_xlabel('Hour of Day', fontsize=12)
+    ax.set_ylabel('Power (GW)', fontsize=12)
+    ax.set_title(f'Portfolio #{portfolio_idx+1}: Average Daily Energy Mix by Source', fontsize=14)
+    ax.set_xticks(range(0, 24, 2))
+    ax.set_xlim(0, 23)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'hourly_avg_by_ppu': hourly_avg_by_ppu,
+        'sorted_ppus': sorted_ppus
+    }
+
+
+def analyze_production_concentration(
+    portfolio_dict: Dict[str, int],
+    cached_data: CachedData,
+    config: Config,
+    n_hours: int
+) -> Dict[str, Any]:
+    """
+    Analyze solar/wind production concentration across locations.
+    """
+    from mpl_toolkits.mplot3d import Axes3D
+    
+    solar_incidence = cached_data.get_solar_incidence(copy=False)
+    wind_incidence = cached_data.get_wind_incidence(copy=False)
+    
+    solar_units = portfolio_dict.get('PV', 0)
+    wind_on_units = portfolio_dict.get('WD_ON', 0)
+    wind_off_units = portfolio_dict.get('WD_OFF', 0)
+    
+    mw_per_unit = config.ppu.MW_PER_UNIT
+    
+    def compute_location_concentration(incidence_data, n_units, n_hours_data):
+        n_hours_inc, n_locations = incidence_data.shape
+        n_hours_use = min(n_hours_data, n_hours_inc)
+        n_locs_used = min(n_units, n_locations)
+        if n_locs_used == 0:
+            return None, None, None
+        
+        prod_per_loc = incidence_data[:n_hours_use, :n_locs_used] * mw_per_unit
+        productions = []
+        pct_for_90 = []
+        
+        for t in range(n_hours_use):
+            loc_prod = prod_per_loc[t, :]
+            total_prod = np.sum(loc_prod)
+            if total_prod < 1.0:
+                continue
+            
+            sorted_prod = np.sort(loc_prod)[::-1]
+            cumsum = np.cumsum(sorted_prod)
+            threshold_90 = 0.9 * total_prod
+            n_locs_for_90 = np.searchsorted(cumsum, threshold_90) + 1
+            pct_locs = (n_locs_for_90 / n_locs_used) * 100
+            
+            productions.append(total_prod)
+            pct_for_90.append(pct_locs)
+        
+        return np.array(productions), np.array(pct_for_90), True
+    
+    # Solar analysis
+    print("\n🔆 SOLAR PV CONCENTRATION:")
+    if solar_units > 0:
+        solar_prod_arr, solar_pct_90, solar_valid = compute_location_concentration(
+            solar_incidence, solar_units, n_hours)
+        if solar_valid and len(solar_prod_arr) > 0:
+            print(f"   Units: {solar_units} | Locations used: {min(solar_units, solar_incidence.shape[1])}")
+            print(f"   Hours with production: {len(solar_prod_arr):,}")
+            print(f"   Avg % locations for 90%: {np.mean(solar_pct_90):.1f}%")
+            print(f"   Min % locations for 90%: {np.min(solar_pct_90):.1f}% (most concentrated)")
+            print(f"   Max % locations for 90%: {np.max(solar_pct_90):.1f}% (most distributed)")
+    else:
+        print("   No Solar PV in portfolio")
+        solar_prod_arr, solar_pct_90 = None, None
+    
+    # Wind analysis
+    print("\n💨 WIND CONCENTRATION:")
+    wind_total_units = wind_on_units + wind_off_units
+    if wind_total_units > 0:
+        wind_prod_arr, wind_pct_90, wind_valid = compute_location_concentration(
+            wind_incidence, wind_total_units, n_hours)
+        if wind_valid and len(wind_prod_arr) > 0:
+            print(f"   Units: {wind_total_units} | Locations used: {min(wind_total_units, wind_incidence.shape[1])}")
+            print(f"   Hours with production: {len(wind_prod_arr):,}")
+            print(f"   Avg % locations for 90%: {np.mean(wind_pct_90):.1f}%")
+            print(f"   Min % locations for 90%: {np.min(wind_pct_90):.1f}% (most concentrated)")
+            print(f"   Max % locations for 90%: {np.max(wind_pct_90):.1f}% (most distributed)")
+    else:
+        print("   No Wind in portfolio")
+        wind_prod_arr, wind_pct_90 = None, None
+    
+    # 3D plots
+    fig_3d = plt.figure(figsize=(16, 6))
+    
+    def plot_3d_concentration(ax, prod_arr, pct_90_arr, title, color):
+        if prod_arr is None or len(prod_arr) == 0:
+            ax.text2D(0.5, 0.5, f'No data for {title}', ha='center', va='center', 
+                     transform=ax.transAxes, fontsize=12)
+            ax.set_title(title)
+            return
+        
+        n_bins_x, n_bins_y = 25, 20
+        x_edges = np.linspace(0, np.percentile(prod_arr, 99), n_bins_x + 1)
+        y_edges = np.linspace(0, 100, n_bins_y + 1)
+        
+        hist, x_edges, y_edges = np.histogram2d(
+            prod_arr / 1e3, pct_90_arr, bins=[x_edges / 1e3, y_edges])
+        
+        x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+        y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+        x_width = x_edges[1] - x_edges[0]
+        y_width = y_edges[1] - y_edges[0]
+        
+        xpos, ypos = np.meshgrid(x_centers, y_centers, indexing='ij')
+        xpos = xpos.flatten()
+        ypos = ypos.flatten()
+        zpos = np.zeros_like(xpos)
+        
+        dx = x_width * 0.8 * np.ones_like(xpos)
+        dy = y_width * 0.8 * np.ones_like(ypos)
+        dz = hist.flatten()
+        
+        mask = dz > 0
+        if np.sum(mask) > 0:
+            colors_3d = plt.cm.viridis(dz[mask] / np.max(dz[mask]))
+            ax.bar3d(xpos[mask], ypos[mask], zpos[mask], 
+                    dx[mask], dy[mask], dz[mask],
+                    color=colors_3d, alpha=0.8, edgecolor='white', linewidth=0.2)
+        
+        ax.set_xlabel('Production (GW)', fontsize=10)
+        ax.set_ylabel('% Locations for 90%', fontsize=10)
+        ax.set_zlabel('Hours (freq)', fontsize=10)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.view_init(elev=25, azim=45)
+    
+    ax1 = fig_3d.add_subplot(121, projection='3d')
+    plot_3d_concentration(ax1, solar_prod_arr, solar_pct_90, 'Solar PV: Production Concentration', 'gold')
+    
+    ax2 = fig_3d.add_subplot(122, projection='3d')
+    plot_3d_concentration(ax2, wind_prod_arr, wind_pct_90, 'Wind: Production Concentration', 'skyblue')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 2D heatmaps
+    fig_heat, axes_heat = plt.subplots(1, 2, figsize=(14, 5))
+    
+    def plot_2d_heatmap(ax, prod_arr, pct_90_arr, title):
+        if prod_arr is None or pct_90_arr is None or len(prod_arr) == 0:
+            ax.text(0.5, 0.5, 'No data available', ha='center', va='center', 
+                   transform=ax.transAxes, fontsize=12)
+            ax.set_title(title)
+            return
+        
+        max_prod = np.percentile(prod_arr, 99)
+        if max_prod <= 0 or not np.isfinite(max_prod):
+            ax.text(0.5, 0.5, 'No significant production', ha='center', va='center', 
+                   transform=ax.transAxes, fontsize=12)
+            ax.set_title(title)
+            return
+        
+        n_bins = 30
+        x_edges = np.linspace(0, max_prod, n_bins + 1)
+        y_edges = np.linspace(0, 100, n_bins + 1)
+        
+        hist, _, _ = np.histogram2d(prod_arr / 1e3, pct_90_arr, bins=[x_edges / 1e3, y_edges])
+        
+        im = ax.imshow(hist.T, origin='lower', aspect='auto',
+                      extent=[x_edges[0]/1e3, x_edges[-1]/1e3, 0, 100],
+                      cmap='YlOrRd')
+        plt.colorbar(im, ax=ax, label='Hours (frequency)')
+        ax.set_xlabel('Total Production (GW)')
+        ax.set_ylabel('% Locations for 90% of Production')
+        ax.set_title(title)
+        
+        avg_pct = np.mean(pct_90_arr)
+        if np.isfinite(avg_pct):
+            ax.axhline(avg_pct, color='cyan', linestyle='--', linewidth=2,
+                      label=f'Avg: {avg_pct:.0f}%')
+            ax.legend(loc='upper right')
+    
+    plot_2d_heatmap(axes_heat[0], solar_prod_arr, solar_pct_90, 'Solar PV: Concentration Heatmap')
+    plot_2d_heatmap(axes_heat[1], wind_prod_arr, wind_pct_90, 'Wind: Concentration Heatmap')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n📊 INTERPRETATION:")
+    print("   - Lower % = Production concentrated in fewer locations (some sites dominate)")
+    print("   - Higher % = Production distributed evenly across locations")
+    print("   - High production + Low % = Peak hours rely on best sites")
+    print("   - Low production + High % = Low-resource hours spread thin")
+    
+    return {
+        'solar': {'prod_arr': solar_prod_arr, 'pct_90': solar_pct_90},
+        'wind': {'prod_arr': wind_prod_arr, 'pct_90': wind_pct_90}
+    }
+
+
+def print_annual_performance_summary(
+    full_year_results: FullYearResults,
+    config: Config
+) -> None:
+    """
+    Print annual performance summary.
+    """
+    total_demand_twh = np.sum(full_year_results.demand) / 1e6
+    total_prod_twh = np.sum(full_year_results.total_production) / 1e6
+    total_ren_twh = np.sum(full_year_results.renewable_production) / 1e6
+    
+    print(f"\n📊 Energy Balance:")
+    print(f"   Total Demand:       {total_demand_twh:.2f} TWh")
+    print(f"   Total Production:   {total_prod_twh:.2f} TWh")
+    print(f"   Renewable Only:     {total_ren_twh:.2f} TWh")
+    print(f"   Spot Bought:        {full_year_results.total_spot_bought_mwh/1e6:.2f} TWh")
+    print(f"   Spot Sold:          {full_year_results.total_spot_sold_mwh/1e6:.2f} TWh")
+    
+    print(f"\n💰 Spot Market Financials:")
+    print(f"   Net Spot Cost:      {full_year_results.total_spot_cost_chf/1e9:.2f} B CHF")
+    
+    deficit_hours_count = np.sum(full_year_results.deficit > 0)
+    surplus_hours_count = np.sum(full_year_results.surplus > 0)
+    print(f"\n⚡ Grid Balance (after dispatch):")
+    print(f"   Hours in Deficit:   {deficit_hours_count} h ({deficit_hours_count/8760*100:.1f}%)")
+    print(f"   Hours in Surplus:   {surplus_hours_count} h ({surplus_hours_count/8760*100:.1f}%)")
+    
+    av_consumed = full_year_results.aviation_fuel_consumed_mwh / 1e6
+    av_target = config.energy_system.AVIATION_FUEL_DEMAND_TWH_YEAR
+    print(f"\n✈️  Aviation Fuel:")
+    print(f"   Consumed:           {av_consumed:.2f} TWh")
+    print(f"   Target:             {av_target:.2f} TWh")
+    print(f"   Constraint Met:     {'✅ Yes' if av_consumed >= av_target * 0.99 else '❌ No'}")
+
+
+def plot_end_to_end_effectiveness(
+    full_year_results: FullYearResults,
+    portfolio_dict: Dict[str, int],
+    config: Config
+) -> None:
+    """
+    Plot end-to-end effectiveness analysis with energy flows.
+    """
+    flows = calculate_energy_flows(full_year_results, portfolio_dict, config)
+    
+    # Print detailed summary
+    print(f"\n📊 ENERGY FLOW SUMMARY (From Raw Incidence to Final Demand):")
+    print(f"   {'Metric':<45} | {'Value (TWh)':>15} | {'% of Raw Incidence':>18}")
+    print(f"   {'-'*45}-+-{'-'*15}-+-{'-'*18}")
+    print(f"   {'Raw Incidence Energy':<45} | {flows['raw_incidence_twh']:>15.2f} | {'100.0':>18}%")
+    print(f"   {'  → After Production Conversion':<45} | {flows['renewable_production_twh']:>15.2f} | {flows['renewable_production_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'    → Direct to Demand':<45} | {flows['renewable_direct_to_demand_twh']:>15.2f} | {flows['renewable_direct_to_demand_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'    → Storage Charged':<45} | {flows['storage_charged_twh']:>15.2f} | {flows['storage_charged_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'      → Storage Discharged':<45} | {flows['storage_discharged_twh']:>15.2f} | {flows['storage_discharged_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'        → To Flexible PPUs':<45} | {flows['storage_to_flexible_twh']:>15.2f} | {flows['storage_to_flexible_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'        → Direct to Demand':<45} | {flows['storage_direct_to_demand_twh']:>15.2f} | {flows['storage_direct_to_demand_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'Flexible Production (from storage)':<45} | {flows['flexible_production_twh']:>15.2f} | {flows['flexible_production_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'Spot Market Purchases':<45} | {flows['spot_bought_twh']:>15.2f} | {'N/A':>18}")
+    print(f"   {'FINAL ENERGY DELIVERED (Demand)':<45} | {flows['energy_delivered_twh']:>15.2f} | {flows['energy_delivered_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    
+    print(f"\n📉 ENERGY LOSSES BREAKDOWN:")
+    print(f"   {'Loss Category':<45} | {'Value (TWh)':>15} | {'% of Raw Incidence':>18}")
+    print(f"   {'-'*45}-+-{'-'*15}-+-{'-'*18}")
+    print(f"   {'Production Losses (conversion)':<45} | {flows['production_losses_twh']:>15.2f} | {flows['production_losses_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'Storage Losses (round-trip)':<45} | {flows['storage_losses_twh']:>15.2f} | {flows['storage_losses_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'Flexible Production Losses':<45} | {flows['flexible_losses_twh']:>15.2f} | {flows['flexible_losses_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'Curtailment/Other Losses':<45} | {flows['renewable_curtailed_twh']:>15.2f} | {flows['renewable_curtailed_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    print(f"   {'TOTAL LOSSES':<45} | {flows['total_losses_twh']:>15.2f} | {flows['total_losses_twh']/flows['raw_incidence_twh']*100 if flows['raw_incidence_twh'] > 0 else 0:>17.1f}%")
+    
+    print(f"\n⚡ EFFECTIVENESS METRICS:")
+    print(f"   {'Metric':<50} | {'Value':>10}")
+    print(f"   {'-'*50}-+-{'-'*10}")
+    print(f"   {'Overall System Efficiency (Raw → Delivered)':<50} | {flows['overall_efficiency']:>9.2f}%")
+    print(f"   {'Renewable Utilization (% of demand)':<50} | {flows['renewable_utilization']:>9.2f}%")
+    print(f"   {'Storage Utilization (% of renewable)':<50} | {flows['storage_utilization']:>9.2f}%")
+    print(f"   {'Storage Round-Trip Efficiency':<50} | {flows['storage_rt_efficiency']:>9.2f}%")
+    print(f"   {'Flexible Production Efficiency':<50} | {flows['flexible_efficiency']:>9.2f}%")
+    
+    # Visualization
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # Pie chart
+    ax1 = axes[0]
+    pie_data = {
+        'Energy Delivered': flows['energy_delivered_twh'],
+        'Production Losses': flows['production_losses_twh'],
+        'Storage Losses': flows['storage_losses_twh'],
+        'Flexible Production Losses': flows['flexible_losses_twh'],
+        'Curtailment/Other': flows['renewable_curtailed_twh']
+    }
+    pie_data = {k: max(0, v) for k, v in pie_data.items() if v > 0.01}
+    
+    if pie_data:
+        colors_pie = ['#2ecc71', '#e67e22', '#3498db', '#9b59b6', '#95a5a6']
+        wedges, texts, autotexts = ax1.pie(
+            list(pie_data.values()),
+            labels=list(pie_data.keys()),
+            autopct=lambda pct: f'{pct:.1f}%\n({pct*flows["raw_incidence_twh"]/100:.1f} TWh)',
+            colors=colors_pie[:len(pie_data)],
+            startangle=90,
+            textprops={'fontsize': 10, 'fontweight': 'bold'}
+        )
+        ax1.set_title('Energy Breakdown: Delivered vs Losses\n(From Raw Incidence)', 
+                     fontsize=14, fontweight='bold')
+    
+    # Bar chart
+    ax2 = axes[1]
+    loss_categories = ['Production\nLosses', 'Storage\nLosses', 'Flexible\nLosses', 'Curtailment']
+    loss_values = [flows['production_losses_twh'], flows['storage_losses_twh'], 
+                   flows['flexible_losses_twh'], flows['renewable_curtailed_twh']]
+    loss_colors = ['#e67e22', '#3498db', '#9b59b6', '#95a5a6']
+    
+    bars = ax2.bar(loss_categories, loss_values, color=loss_colors, alpha=0.8, 
+                   edgecolor='black', linewidth=1.5)
+    ax2.set_ylabel('Energy Losses (TWh)', fontsize=12, fontweight='bold')
+    ax2.set_title('Energy Losses Breakdown by Category', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    for bar, val in zip(bars, loss_values):
+        if val > 0.01:
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.1f} TWh\n({val/flows["raw_incidence_twh"]*100:.1f}%)',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"\n💡 INTERPRETATION:")
+    print(f"   • Overall System Efficiency: {flows['overall_efficiency']:.1f}% of raw incidence energy reaches final demand")
+    print(f"   • Production Losses: {flows['production_losses_twh']:.1f} TWh ({flows['production_losses_twh']/flows['raw_incidence_twh']*100:.1f}%) lost during conversion")
+    if flows['storage_charged_twh'] > 0:
+        print(f"   • Storage Losses: {flows['storage_losses_twh']:.1f} TWh ({flows['storage_losses_twh']/flows['raw_incidence_twh']*100:.1f}%) lost in round-trip storage")
+        print(f"   • Storage Round-Trip Efficiency: {flows['storage_rt_efficiency']:.1f}%")
+    if flows['flexible_production_twh'] > 0:
+        print(f"   • Flexible Production Losses: {flows['flexible_losses_twh']:.1f} TWh ({flows['flexible_losses_twh']/flows['raw_incidence_twh']*100:.1f}%) lost in flexible PPU conversion")
+    if flows['renewable_curtailed_twh'] > 0:
+        print(f"   • Curtailment: {flows['renewable_curtailed_twh']:.1f} TWh ({flows['renewable_curtailed_twh']/flows['raw_incidence_twh']*100:.1f}%) of renewable energy curtailed")

@@ -688,7 +688,7 @@ def explore_and_find_frontier(
     objectives: Optional[List[ObjectiveConfig]] = None,
     n_generations: int = 15,
     pop_size: int = 25,
-    output_path: str = "data/result_plots/multi_objective_results.csv",
+    output_path: Optional[str] = None,
     verbose: bool = True,
     use_existing_as_seeds: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -712,6 +712,11 @@ def explore_and_find_frontier(
         Tuple of (all_results_df, pareto_frontier_df)
     """
     import os
+    
+    # Set default output path with scenario if not provided
+    if output_path is None:
+        scenario = config.energy_system.DEMAND_SCENARIO
+        output_path = f"data/result_plots/multi_objective_results_{scenario}.csv"
     
     # Check if we should continue from existing results
     seed_portfolios = None
@@ -824,12 +829,12 @@ def explore_and_find_frontier(
 
 def continue_exploration_3d_frontier(
     config: Config = DEFAULT_CONFIG,
-    existing_results_path: str = "data/result_plots/multi_objective_results.csv",
+    existing_results_path: Optional[str] = None,
     objectives: Optional[List[ObjectiveConfig]] = None,
     n_generations: int = 10,
     pop_size: int = 20,
     n_seed_portfolios: int = 20,
-    output_path: str = "data/result_plots/multi_objective_results_3d.csv",
+    output_path: Optional[str] = None,
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -852,6 +857,13 @@ def continue_exploration_3d_frontier(
         Tuple of (all_results_df, pareto_frontier_3d_df)
     """
     import os
+    
+    # Set default paths with scenario if not provided
+    scenario = config.energy_system.DEMAND_SCENARIO
+    if existing_results_path is None:
+        existing_results_path = f"data/result_plots/multi_objective_results_{scenario}.csv"
+    if output_path is None:
+        output_path = f"data/result_plots/multi_objective_results_{scenario}_3d.csv"
     
     if verbose:
         print("="*80)
@@ -1012,7 +1024,7 @@ if __name__ == "__main__":
         config=config,
         n_generations=10,  # Quick test
         pop_size=20,
-        output_path="data/result_plots/multi_objective_results.csv",
+        # output_path=None uses default with scenario from config
         verbose=True
     )
     
